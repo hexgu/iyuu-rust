@@ -17,8 +17,6 @@ import {
   type ApiTier,
   type PublicConfig,
   type QuotaResponse,
-  type SiteInfo,
-  type SiteCredentials,
 } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -34,9 +32,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Separator } from '@/components/ui/separator'
-import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Badge } from '@/components/ui/badge'
 import TierPicker from '@/components/iyuu/TierPicker.vue'
 import TierSetupDialog from '@/components/iyuu/TierSetupDialog.vue'
 
@@ -71,10 +67,6 @@ const form = reactive({
   cron: '0 4 * * *',
 })
 
-const sites = ref<SiteInfo[]>([])
-const sitesLoading = ref(false)
-const sitesError = ref<string | null>(null)
-const credDraft = reactive<Record<string, Required<SiteCredentials>>>({})
 
 const testingIyuu = ref(false)
 const iyuuResult = reactive<{ ok: boolean | null; text: string }>({ ok: null, text: '' })
@@ -174,40 +166,8 @@ async function loadConfig() {
 
 onMounted(async () => {
   await loadConfig()
-  // Load the site list opportunistically: without a token it will 502, which is
-  // fine — we just show a hint instead of an error.
-  loadSites()
   loadQuota()
 })
-
-async function loadSites() {
-  sitesLoading.value = true
-  sitesError.value = null
-  try {
-    const r = await api.sites()
-    sites.value = r.sites
-    for (const s of r.sites) {
-      if (!credDraft[String(s.id)]) {
-        // Seed the draft from what we know exists; secrets stay blank so an
-        // empty field means "unchanged".
-        const known = cfg.value?.credentials[String(s.id)]
-        credDraft[String(s.id)] = {
-          passkey: '',
-          uid: known?.uid ?? '',
-          cookie: '',
-          user_agent: known?.user_agent ?? '',
-          api_key: '',
-          rsskey: '',
-          torrent_key: '',
-        }
-      }
-    }
-  } catch (e) {
-    sitesError.value = e instanceof ApiError ? e.message : String(e)
-  } finally {
-    sitesLoading.value = false
-  }
-}
 
 function splitList(v: string): string[] {
   return v
@@ -237,20 +197,6 @@ async function save() {
 async function commitSave() {
   saving.value = true
   try {
-    const credentials: Record<string, SiteCredentials> = {}
-    for (const [sid, draft] of Object.entries(credDraft)) {
-      // Only send fields the user actually typed (or a known uid/ua). Sending
-      // empty strings would wipe stored secrets, so they are dropped.
-      const entry: SiteCredentials = {}
-      if (draft.passkey) entry.passkey = draft.passkey
-      if (draft.cookie) entry.cookie = draft.cookie
-      if (draft.api_key) entry.api_key = draft.api_key
-      if (draft.rsskey) entry.rsskey = draft.rsskey
-      if (draft.uid) entry.uid = draft.uid
-      if (draft.user_agent) entry.user_agent = draft.user_agent
-      if (Object.keys(entry).length) credentials[sid] = entry
-    }
-
     const patch: Record<string, unknown> = {
       downloader: {
         kind: form.dlKind,
@@ -264,7 +210,6 @@ async function commitSave() {
         min_size_gib: Number(form.minSize) || 0,
         exclude_tags: splitList(form.excludeTags),
         exclude_paths: splitList(form.excludePaths),
-        site_ids: cfg.value?.reseed.site_ids ?? [],
         reuse_category: form.reuseCategory,
         default_category: form.defaultCategory || null,
         tags: splitList(form.tags),
@@ -283,22 +228,13 @@ async function commitSave() {
       patch.iyuu = { token: form.token.trim(), tier: pendingTier.value }
     }
 
-    if (Object.keys(credentials).length) patch.credentials = credentials
-
     const r = await api.putConfig(patch)
     cfg.value = r.config
     seedForm(r.config)
-    // Clear the token field and the secret drafts: they are stored now.
+    // The token is stored now; a later save must not resend it.
     form.token = ''
-    for (const d of Object.values(credDraft)) {
-      d.passkey = ''
-      d.cookie = ''
-      d.api_key = ''
-      d.rsskey = ''
-    }
     saveMsg.kind = 'ok'
     saveMsg.text = '已保存'
-    loadSites()
     loadQuota()
   } catch (e) {
     saveMsg.kind = 'err'
@@ -325,7 +261,7 @@ async function testIyuu() {
     iyuuResult.ok = true
     iyuuResult.text = `连接成功：支持 ${r.site_count} 个站点，已绑定 ${r.bound_count} 个 · 本次消耗 2 次额度`
     quota.value = null
-    await Promise.all([loadSites(), loadQuota()])
+    await loadQuota()
   } catch (e) {
     iyuuResult.ok = false
     if (e instanceof ApiError && e.kind === 'rate_limited') {
@@ -366,42 +302,9 @@ const dlOptions = [
   { value: 'transmission', label: 'Transmission' },
 ]
 
-/** Which credential fields a site actually needs, from IYUU's own metadata. */
-function fieldsFor(site: SiteInfo) {
-  const check = site.reseed_check.toLowerCase()
-  const isMteam = site.base_url.includes('m-team')
-  const isMonika = site.base_url.includes('monikadesign')
-  return {
-    // A passkey (or the authkey/torrent_key aliases) is the default mechanism;
-    // sites whose `reseed_check` is blank are NexusPHP sites that still use one.
-    passkey:
-      check.includes('passkey') ||
-      check.includes('authkey') ||
-      check.includes('torrent_key') ||
-      check === '',
-    uid: check.includes('uid'),
-    // Cookie is only needed when IYUU flags it, but always offer it: a site can
-    // start requiring one without the metadata saying so.
-    cookie: site.cookie_required === 1,
-    apiKey: isMteam,
-    rsskey: isMonika,
-  }
-}
+/** How many sites are already added — a summary only, the list lives on /sites. */
+const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).length)
 
-const searchCred = ref('')
-const filteredSites = computed(() => {
-  const q = searchCred.value.trim().toLowerCase()
-  if (!q) return sites.value
-  return sites.value.filter(
-    (s) => s.nickname.toLowerCase().includes(q) || s.site.toLowerCase().includes(q),
-  )
-})
-
-const configuredCount = computed(
-  () => Object.values(cfg.value?.credentials ?? {}).filter(
-    (c) => c.has_passkey || c.has_cookie || c.has_api_key || c.has_rsskey,
-  ).length,
-)
 </script>
 
 <template>
@@ -686,112 +589,21 @@ const configuredCount = computed(
         </CardContent>
       </Card>
 
-      <!-- Per-site credentials -->
+      <!-- Per-site credentials live on their own page now: the settings page
+           must not carry a table of every site IYUU knows. -->
       <Card>
         <CardHeader>
-          <CardTitle class="text-sm">
-            站点凭据
-            <span class="text-muted-foreground ml-1 font-normal">
-              （已配置 {{ configuredCount }} / {{ sites.length || '—' }}）
-            </span>
-          </CardTitle>
+          <CardTitle class="text-sm">站点凭据</CardTitle>
           <CardDescription>
-            辅种需要能下载目标站的种子。passkey 与 cookie 至少填一项，特殊站点另有要求
+            已添加 {{ addedSiteCount }} 个辅种站点；站点的添加、凭据填写与移除都在独立页面
           </CardDescription>
         </CardHeader>
-        <CardContent class="space-y-3">
-          <Alert v-if="sitesError" variant="warning">
-            <AlertCircle />
-            <AlertDescription>
-              无法获取站点列表：{{ sitesError }}
-              <span v-if="!cfg?.iyuu.has_token">（先填写并保存 IYUU Token）</span>
-            </AlertDescription>
-          </Alert>
-
-          <div class="flex gap-2">
-            <Input v-model="searchCred" placeholder="筛选站点…" class="max-w-xs" />
-            <Button variant="outline" size="sm" :disabled="sitesLoading" @click="loadSites">
-              <Loader2 v-if="sitesLoading" class="animate-spin" />
-              <Download v-else />
-              重新获取
-            </Button>
-          </div>
-
-          <div v-if="sitesLoading && !sites.length" class="space-y-2">
-            <Skeleton v-for="i in 4" :key="i" class="h-12 w-full" />
-          </div>
-
-          <div v-else class="divide-y rounded-md border">
-            <div
-              v-for="s in filteredSites"
-              :key="s.id"
-              class="grid gap-2 p-3 sm:grid-cols-[10rem_1fr]"
-            >
-              <div class="min-w-0">
-                <div class="flex items-center gap-1.5">
-                  <span class="truncate text-xs font-medium">{{ s.nickname || s.site }}</span>
-                  <Badge
-                    v-if="cfg?.credentials[String(s.id)]?.has_passkey || cfg?.credentials[String(s.id)]?.has_cookie || cfg?.credentials[String(s.id)]?.has_api_key"
-                    variant="secondary"
-                    class="shrink-0 text-[10px]"
-                  >
-                    已配置
-                  </Badge>
-                </div>
-                <div class="text-muted-foreground truncate font-mono text-[10px]">
-                  {{ s.base_url }}
-                </div>
-                <div class="text-muted-foreground mt-0.5 text-[10px]">
-                  需要：{{ s.reseed_check || 'passkey' }}
-                  <span v-if="s.cookie_required === 1">· cookie</span>
-                </div>
-              </div>
-
-              <div class="grid gap-2 sm:grid-cols-3">
-                <Input
-                  v-if="fieldsFor(s).passkey"
-                  v-model="credDraft[String(s.id)].passkey"
-                  type="password"
-                  placeholder="passkey"
-                  autocomplete="off"
-                  class="h-8 text-xs"
-                />
-                <Input
-                  v-if="fieldsFor(s).uid"
-                  v-model="credDraft[String(s.id)].uid"
-                  placeholder="uid"
-                  class="h-8 text-xs"
-                />
-                <Input
-                  v-if="fieldsFor(s).cookie"
-                  v-model="credDraft[String(s.id)].cookie"
-                  type="password"
-                  placeholder="cookie"
-                  autocomplete="off"
-                  class="h-8 text-xs"
-                />
-                <Input
-                  v-if="fieldsFor(s).apiKey"
-                  v-model="credDraft[String(s.id)].api_key"
-                  type="password"
-                  placeholder="M-Team API Key"
-                  autocomplete="off"
-                  class="h-8 text-xs"
-                />
-                <Input
-                  v-if="fieldsFor(s).rsskey"
-                  v-model="credDraft[String(s.id)].rsskey"
-                  type="password"
-                  placeholder="RSS 链接或 rsskey"
-                  autocomplete="off"
-                  class="h-8 text-xs"
-                />
-              </div>
-            </div>
-            <div v-if="!filteredSites.length" class="text-muted-foreground p-6 text-center text-xs">
-              {{ sites.length ? '没有匹配的站点' : '暂无站点数据' }}
-            </div>
-          </div>
+        <CardContent>
+          <Button variant="outline" size="sm" as-child>
+            <RouterLink to="/sites">
+              管理站点凭据
+            </RouterLink>
+          </Button>
         </CardContent>
       </Card>
     </template>

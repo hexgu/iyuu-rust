@@ -983,6 +983,78 @@ pub struct SiteCredentials {
     pub api_key: Option<String>,
 }
 
+impl SiteCredentials {
+    /// Whether a patch carries no field at all.
+    ///
+    /// Used to refuse creating an entry out of nothing: an empty entry would be
+    /// indistinguishable from a configured site in the UI and would make the
+    /// engine try to fetch from a site it has no credentials for.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.passkey.is_none()
+            && self.uid.is_none()
+            && self.cookie.is_none()
+            && self.user_agent.is_none()
+            && self.torrent_key.is_none()
+            && self.rsskey.is_none()
+            && self.api_key.is_none()
+    }
+
+    /// Whether at least one credential IYUU/the fetcher can actually use is set.
+    ///
+    /// Distinct from [`Self::is_empty`]: an entry holding only a `user_agent` is
+    /// not empty, but it also cannot download anything.
+    #[must_use]
+    pub fn has_any_credential(&self) -> bool {
+        [
+            &self.passkey,
+            &self.cookie,
+            &self.torrent_key,
+            &self.rsskey,
+            &self.api_key,
+        ]
+        .iter()
+        .any(|f| f.as_deref().is_some_and(|v| !v.trim().is_empty()))
+    }
+
+    /// Merge a patch into these credentials.
+    ///
+    /// The two field groups behave differently on purpose:
+    ///
+    /// * **Secrets** (`passkey`, `cookie`, `torrent_key`, `rsskey`, `api_key`)
+    ///   are write-only — the API never returns them, so the browser cannot send
+    ///   the current value back. An empty string therefore has to mean
+    ///   "unchanged", otherwise editing one field in a per-site form would wipe
+    ///   every other stored secret.
+    /// * **Identity** (`uid`, `user_agent`) is echoed to the browser, so the form
+    ///   always knows the truth and may send it verbatim. An empty value here
+    ///   genuinely means "clear it".
+    ///
+    /// Clearing a whole site is a delete (`null` in the patch), not a blank
+    /// merge.
+    pub fn merge_from(&mut self, patch: Self) {
+        keep_secret(&mut self.passkey, patch.passkey);
+        keep_secret(&mut self.cookie, patch.cookie);
+        keep_secret(&mut self.torrent_key, patch.torrent_key);
+        keep_secret(&mut self.rsskey, patch.rsskey);
+        keep_secret(&mut self.api_key, patch.api_key);
+        replace_identity(&mut self.uid, patch.uid);
+        replace_identity(&mut self.user_agent, patch.user_agent);
+    }
+}
+
+fn keep_secret(dst: &mut Option<String>, src: Option<String>) {
+    if let Some(v) = src.filter(|v| !v.trim().is_empty()) {
+        *dst = Some(v);
+    }
+}
+
+fn replace_identity(dst: &mut Option<String>, src: Option<String>) {
+    if let Some(v) = src {
+        *dst = if v.trim().is_empty() { None } else { Some(v) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1101,94 @@ mod tests {
         assert_eq!(site_scheme(&s), "https");
         s.is_https = 2;
         assert_eq!(site_scheme(&s), "https", "both -> prefer https");
+    }
+
+    // ------------------------------------------------------- credential merge
+
+    #[test]
+    fn merging_a_blank_secret_keeps_the_stored_one() {
+        // The API never returns secrets, so a form re-submit always carries them
+        // blank. If blank meant "clear", editing a uid would silently wipe the
+        // passkey and every fetch for that site would start failing.
+        let mut stored = SiteCredentials {
+            passkey: Some("old".into()),
+            cookie: Some("c=1".into()),
+            api_key: Some("key".into()),
+            ..Default::default()
+        };
+        stored.merge_from(SiteCredentials {
+            passkey: Some(String::new()),
+            cookie: None,
+            api_key: Some("   ".into()),
+            uid: Some("42".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(stored.passkey.as_deref(), Some("old"));
+        assert_eq!(stored.cookie.as_deref(), Some("c=1"));
+        assert_eq!(stored.api_key.as_deref(), Some("key"));
+        assert_eq!(stored.uid.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn merging_a_new_secret_replaces_the_old_one() {
+        let mut stored = SiteCredentials {
+            passkey: Some("old".into()),
+            ..Default::default()
+        };
+        stored.merge_from(SiteCredentials {
+            passkey: Some("new".into()),
+            ..Default::default()
+        });
+        assert_eq!(stored.passkey.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn identity_fields_can_be_cleared() {
+        // `uid`/`user_agent` are echoed to the browser, so the form knows the
+        // real value and its blank genuinely means "remove it".
+        let mut stored = SiteCredentials {
+            uid: Some("42".into()),
+            user_agent: Some("UA".into()),
+            ..Default::default()
+        };
+        stored.merge_from(SiteCredentials {
+            uid: Some(String::new()),
+            user_agent: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(stored.uid.is_none());
+        assert!(stored.user_agent.is_none());
+    }
+
+    #[test]
+    fn a_user_agent_alone_is_not_a_usable_credential() {
+        let only_ua = SiteCredentials {
+            user_agent: Some("Mozilla/5.0".into()),
+            ..Default::default()
+        };
+        assert!(!only_ua.is_empty(), "it does hold a field");
+        assert!(
+            !only_ua.has_any_credential(),
+            "but nothing that can download a torrent"
+        );
+
+        let with_passkey = SiteCredentials {
+            passkey: Some("p".into()),
+            ..Default::default()
+        };
+        assert!(with_passkey.has_any_credential());
+    }
+
+    #[test]
+    fn blank_secrets_do_not_count_as_configured() {
+        // A cleared field must not make the UI claim the site is configured.
+        let blank = SiteCredentials {
+            passkey: Some("  ".into()),
+            cookie: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!blank.has_any_credential());
     }
 
     // ------------------------------------------------------------- quota

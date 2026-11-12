@@ -4,6 +4,7 @@ import { RouterLink, useRoute } from 'vue-router'
 import {
   Activity,
   Download,
+  Globe,
   LayoutDashboard,
   ListChecks,
   RefreshCw,
@@ -21,6 +22,7 @@ const NAV = [
   { to: '/', label: '概览', icon: LayoutDashboard },
   { to: '/attempts', label: '辅种记录', icon: ListChecks },
   { to: '/torrents', label: '下载器', icon: Download },
+  { to: '/sites', label: '站点凭据', icon: Globe },
   { to: '/settings', label: '设置', icon: Settings },
 ]
 

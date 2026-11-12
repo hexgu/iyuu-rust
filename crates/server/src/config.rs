@@ -148,8 +148,6 @@ pub struct ReseedConfig {
     pub exclude_tags: Vec<String>,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
-    #[serde(default)]
-    pub site_ids: Vec<i64>,
     #[serde(default = "default_true")]
     pub reuse_category: bool,
     #[serde(default)]
@@ -183,7 +181,6 @@ impl Default for ReseedConfig {
             min_size_gib: 0.0,
             exclude_tags: Vec::new(),
             exclude_paths: Vec::new(),
-            site_ids: Vec::new(),
             reuse_category: true,
             default_category: None,
             tags: Vec::new(),
@@ -201,7 +198,6 @@ impl From<&ReseedConfig> for DiscoveryConfig {
             min_size_gib: c.min_size_gib,
             exclude_tags: c.exclude_tags.clone(),
             exclude_paths: c.exclude_paths.clone(),
-            site_ids: c.site_ids.clone(),
             reuse_category: c.reuse_category,
             default_category: c.default_category.clone(),
             tags: c.tags.clone(),
@@ -363,6 +359,8 @@ pub struct PublicDownloader {
 #[derive(Debug, Serialize)]
 pub struct PublicCredentials {
     pub has_passkey: bool,
+    /// Some sites (TGG, `HDCity`) take an authkey instead of a passkey.
+    pub has_torrent_key: bool,
     pub uid: Option<String>,
     pub has_cookie: bool,
     pub user_agent: Option<String>,
@@ -408,6 +406,10 @@ impl AppConfig {
                         k.clone(),
                         PublicCredentials {
                             has_passkey: v.passkey.as_deref().is_some_and(|s| !s.is_empty()),
+                            has_torrent_key: v
+                                .torrent_key
+                                .as_deref()
+                                .is_some_and(|s| !s.is_empty()),
                             uid: v.uid.clone(),
                             has_cookie: v.cookie.as_deref().is_some_and(|s| !s.is_empty()),
                             user_agent: v.user_agent.clone(),

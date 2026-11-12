@@ -19,7 +19,7 @@
 use crate::bencode;
 use crate::downloader::qbittorrent::{IYUU_TAG, site_tag};
 use crate::downloader::{AddTorrentOptions, Downloader};
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::fetch::fetch_torrent;
 use crate::iyuu::{HASH_CHUNK_SIZE, IyuuClient, SiteCredentials};
 use crate::models::{
@@ -47,8 +47,6 @@ pub struct DiscoveryConfig {
     pub exclude_tags: Vec<String>,
     /// Save-path prefixes to skip (e.g. a scratch download disk).
     pub exclude_paths: Vec<String>,
-    /// Restrict seeding to these site ids. Empty = every bound site.
-    pub site_ids: Vec<i64>,
     /// Reuse the source torrent's category on the cross-seed.
     pub reuse_category: bool,
     /// Category to apply when not reusing (and as fallback when the source has
@@ -74,7 +72,6 @@ impl Default for DiscoveryConfig {
             min_size_gib: 0.0,
             exclude_tags: Vec::new(),
             exclude_paths: Vec::new(),
-            site_ids: Vec::new(),
             reuse_category: true,
             default_category: None,
             tags: Vec::new(),
@@ -188,13 +185,7 @@ pub async fn discover(
 
     // ------------------------------------------------------- IYUU query
     let site_map = ctx.iyuu.sites_by_id().await?;
-    let sid_list: Vec<i64> = if ctx.config.site_ids.is_empty() {
-        // Report everything we have credentials for, plus every site IYUU knows:
-        // a narrower list would filter out results we then have to re-query for.
-        site_map.keys().copied().collect()
-    } else {
-        ctx.config.site_ids.clone()
-    };
+    let sid_list = target_sites(ctx, &site_map)?;
 
     let source_hashes: Vec<String> = sources.iter().map(|t| t.hash.clone()).collect();
     check_quota_before_query(ctx, &mut out)?;
@@ -211,6 +202,7 @@ pub async fn discover(
         sources.as_slice(),
         &found,
         &site_map,
+        &sid_list,
         &present,
         &already_seeded,
         &known_bad,
@@ -327,6 +319,7 @@ fn build_jobs(
     sources: &[&TorrentInfo],
     found: &HashMap<String, Vec<SeedCandidate>>,
     site_map: &HashMap<i64, IyuuSite>,
+    target_sids: &[i64],
     present: &HashSet<String>,
     already_seeded: &HashSet<String>,
     known_bad: &HashSet<String>,
@@ -358,9 +351,10 @@ fn build_jobs(
                 stats.skipped += 1;
                 continue;
             }
-            if let Some(restrict) = site_filter(&ctx.config, cand.sid)
-                && !restrict
-            {
+            // The query was already scoped to the target sites, but IYUU may
+            // answer with a sid outside it (a host that ignores `sids`), and a
+            // site without credentials cannot be fetched from regardless.
+            if !target_sids.contains(&cand.sid) {
                 stats.skipped += 1;
                 continue;
             }
@@ -473,13 +467,47 @@ fn filter_source(t: &TorrentInfo, cfg: &DiscoveryConfig) -> std::result::Result<
     Ok(())
 }
 
-/// `Some(true)` = allowed, `Some(false)` = excluded, `None` = no restriction.
-fn site_filter(cfg: &DiscoveryConfig, sid: i64) -> Option<bool> {
-    if cfg.site_ids.is_empty() {
-        None
-    } else {
-        Some(cfg.site_ids.contains(&sid))
+/// The sites a run may reseed into.
+///
+/// The credential map is the source of truth: a site is a target only because
+/// the user added it (and gave us what it takes to download from it). Nothing is
+/// inferred from the full IYUU catalogue — being "known to IYUU" is not the same
+/// as "wanted here", and querying every site would burn quota on candidates the
+/// engine has no credentials to fetch anyway.
+///
+/// There is deliberately no second "selected sites" list: one source of truth
+/// means adding a site is the whole action, and removing it stops targeting it.
+///
+/// # Errors
+/// Returns [`CoreError::Config`] when the result is empty — a run with nowhere to
+/// reseed would silently do nothing, which looks exactly like "no candidates
+/// found" in the UI.
+fn target_sites(ctx: &EngineContext, site_map: &HashMap<i64, IyuuSite>) -> Result<Vec<i64>> {
+    collect_target_sites(&ctx.credentials, site_map)
+}
+
+/// The pure core of [`target_sites`], so the rule can be tested without building
+/// a full engine (which needs a live IYUU client and a downloader).
+fn collect_target_sites(
+    credentials: &CredentialMap,
+    site_map: &HashMap<i64, IyuuSite>,
+) -> Result<Vec<i64>> {
+    let mut sites: Vec<i64> = credentials
+        .iter()
+        .filter(|(_, c)| c.has_any_credential())
+        // A sid IYUU's catalogue does not list cannot be fetched from: we have no
+        // download URL template for it, so it would fail per candidate.
+        .filter(|(sid, _)| site_map.is_empty() || site_map.contains_key(sid))
+        .map(|(sid, _)| *sid)
+        .collect();
+
+    sites.sort_unstable();
+    if sites.is_empty() {
+        return Err(CoreError::Config(
+            "还没有添加任何站点：请先在「站点凭据」里添加要辅种的站点".into(),
+        ));
     }
+    Ok(sites)
 }
 
 fn category_for(source: &TorrentInfo, cfg: &DiscoveryConfig) -> Option<String> {
@@ -1075,5 +1103,78 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(category_for(&with_cat, &cfg2).as_deref(), Some("pt"));
+    }
+
+    fn site(id: i64) -> IyuuSite {
+        IyuuSite {
+            id,
+            site: format!("s{id}"),
+            nickname: String::new(),
+            base_url: format!("s{id}.org"),
+            download_page: "download.php?id={}&passkey={passkey}".into(),
+            details_page: String::new(),
+            reseed_check: "passkey".into(),
+            is_https: 1,
+            cookie_required: 0,
+            bind_check: String::new(),
+        }
+    }
+
+    #[test]
+    fn target_sites_comes_from_the_added_credentials_only() {
+        // The catalogue lists three sites; the user added two. Only the added two
+        // may be queried — "known to IYUU" is not "wanted here", and querying the
+        // rest would spend quota on candidates we cannot fetch.
+        let site_map: HashMap<i64, IyuuSite> = [site(1), site(2), site(3)]
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        let mut creds = CredentialMap::new();
+        creds.insert(
+            1,
+            SiteCredentials {
+                passkey: Some("a".into()),
+                ..Default::default()
+            },
+        );
+        creds.insert(
+            3,
+            SiteCredentials {
+                api_key: Some("k".into()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(collect_target_sites(&creds, &site_map).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn credentials_without_a_usable_secret_are_not_targets() {
+        // An entry holding only a user_agent cannot download anything; treating
+        // it as a target would produce a fetch failure per candidate.
+        let site_map: HashMap<i64, IyuuSite> = [(1, site(1))].into_iter().collect();
+        let mut creds = CredentialMap::new();
+        creds.insert(
+            1,
+            SiteCredentials {
+                user_agent: Some("Mozilla/5.0".into()),
+                ..Default::default()
+            },
+        );
+
+        let err = collect_target_sites(&creds, &site_map)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("还没有添加任何站点"), "{err}");
+    }
+
+    #[test]
+    fn no_added_sites_is_a_config_error_not_an_empty_run() {
+        // Silently running with zero targets looks identical to "no candidates
+        // found", which sends the user hunting for a bug that isn't there.
+        let err = collect_target_sites(&CredentialMap::new(), &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("站点凭据"), "{err}");
     }
 }
