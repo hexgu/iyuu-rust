@@ -1,0 +1,27 @@
+# iyuu-reseed — IYUU cross-seed service
+#
+# The named volume holds the SQLite database, which is where the in-flight
+# verification queue lives. Keep it: recreating the container without it drops
+# every unresolved cross-seed and they will sit paused in the downloader again.
+services:
+  iyuu-reseed:
+    build: .
+    image: iyuu-reseed:latest
+    container_name: iyuu-reseed
+    restart: unless-stopped
+    ports:
+      - "8098:8098"
+    volumes:
+      - ./data:/data
+      # Optional: give the container the same clock as the host so a cron like
+      # "0 4 * * *" fires at 04:00 local rather than UTC.
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TZ: Asia/Shanghai
+      IYUU_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8098/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
