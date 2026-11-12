@@ -6,6 +6,7 @@ import {
   ArrowRight,
   CheckCircle2,
   CircleSlash,
+  Crown,
   Download,
   Loader2,
   Play,
@@ -18,6 +19,7 @@ import {
   ApiError,
   type Attempt,
   type DownloaderSummary,
+  type QuotaResponse,
   type RunProgress,
   type StatusResponse,
 } from '@/lib/api'
@@ -33,8 +35,10 @@ const progress = ref<RunProgress | null>(null)
 const summary = ref<DownloaderSummary | null>(null)
 const recent = ref<Attempt[]>([])
 const counts = ref<Record<string, number>>({})
+const quota = ref<QuotaResponse | null>(null)
 const loading = ref(true)
 const startError = ref<string | null>(null)
+const startErrorIsQuota = ref(false)
 const starting = ref(false)
 const cancelling = ref(false)
 let timer: ReturnType<typeof setInterval> | undefined
@@ -42,24 +46,27 @@ let timer: ReturnType<typeof setInterval> | undefined
 async function loadAll() {
   // Fetch in parallel: these are independent and the page is useless until all
   // of them land.
-  const [s, p, sum, att, st] = await Promise.allSettled([
+  const [s, p, sum, att, st, q] = await Promise.allSettled([
     api.status(),
     api.progress(),
     api.downloaderSummary(),
     api.attempts({ limit: 8 }),
     api.attemptStats(),
+    api.quota(),
   ])
   if (s.status === 'fulfilled') status.value = s.value
   if (p.status === 'fulfilled') progress.value = p.value
   if (sum.status === 'fulfilled') summary.value = sum.value
   if (att.status === 'fulfilled') recent.value = att.value.items
   if (st.status === 'fulfilled') counts.value = st.value.counts
+  if (q.status === 'fulfilled') quota.value = q.value
   loading.value = false
 }
 
 async function startRun() {
   starting.value = true
   startError.value = null
+  startErrorIsQuota.value = false
   try {
     await api.startRun()
     // The run starts asynchronously; give it a beat, then refresh so the UI
@@ -68,10 +75,85 @@ async function startRun() {
     await loadAll()
   } catch (e) {
     startError.value = e instanceof ApiError ? e.message : String(e)
+    // A quota rejection is not a bug and needs different words: it means "wait or
+    // switch servers", and the banner links to exactly that.
+    startErrorIsQuota.value = e instanceof ApiError && e.kind === 'rate_limited'
+    loadAll()
   } finally {
     starting.value = false
   }
 }
+
+/**
+ * Quota banner state.
+ *
+ * Only the states that should change what the user does produce a banner: an
+ * active cooldown, an exhausted day, or a nearly-spent day. Everything else stays
+ * silent — a permanent yellow bar would just be ignored.
+ */
+const quotaBanner = computed(() => {
+  const q = quota.value
+  if (!q) return null
+  const blockedUntil = q.blocked_until ? new Date(q.blocked_until) : null
+  if (blockedUntil && blockedUntil.getTime() > Date.now()) {
+    return {
+      tone: 'error' as const,
+      title: 'IYUU 接口已限流',
+      body: `为了不把临时限流变成封禁，已停止请求，${formatDateTime(q.blocked_until!)} 后自动恢复。`,
+      showUpgrade: true,
+    }
+  }
+  if (q.remaining_requests <= 0) {
+    return {
+      tone: 'error' as const,
+      title: '今日请求额度已用尽',
+      body: q.reset_at
+        ? `今日已用 ${q.used_requests}/${q.daily_requests} 次（${q.tier_label}）。${formatDateTime(q.reset_at)} 后重置。`
+        : `今日已用 ${q.used_requests}/${q.daily_requests} 次（${q.tier_label}）。`,
+      showUpgrade: true,
+    }
+  }
+  if (q.percent_used >= 90) {
+    return {
+      tone: 'warn' as const,
+      title: '今日额度即将用尽',
+      body: `已用 ${q.used_requests}/${q.daily_requests} 次（${q.tier_label}），剩余额度可能不足以覆盖全部种子，本次运行会自动截断。`,
+      showUpgrade: true,
+    }
+  }
+  return null
+})
+
+const isVip = computed(() => quota.value?.tier === 'vip')
+
+/**
+ * The account has a token but never answered the tier question.
+ *
+ * Everything downstream (server choice, budget, level of throttling) depends on
+ * that answer, so this outranks every other banner: without it the numbers
+ * displayed are guesses.
+ */
+const tierUnchosen = computed(() => !!status.value?.configured && !status.value.iyuu_tier_chosen)
+
+/** The upgrade prompt only makes sense for a free account that is out of room. */
+const upgradeApplies = computed(() => quotaBanner.value?.showUpgrade && !isVip.value)
+
+/** IYUU 会员中心。Not our product — every place that links here says so. */
+const MEMBER_URL = 'https://iyuu.cn/app/user/member'
+
+/**
+ * Whether starting a run is pointless right now.
+ *
+ * Disabling the button is better than letting the click fail: the run would abort
+ * on its first request anyway, and an enabled button implies "this will work".
+ * The server enforces this too — this is only the visible half.
+ */
+const blockedByQuota = computed(() => {
+  const q = quota.value
+  if (!q) return false
+  if (q.blocked_until && new Date(q.blocked_until).getTime() > Date.now()) return true
+  return q.remaining_requests <= 0
+})
 
 async function cancelRun() {
   cancelling.value = true
@@ -238,7 +320,18 @@ const activityText = computed(() => {
             <Square v-else />
             取消
           </Button>
-          <Button v-else :disabled="starting || !status?.configured" @click="startRun">
+          <Button
+            v-else
+            :disabled="starting || !status?.configured || blockedByQuota || tierUnchosen"
+            :title="
+              tierUnchosen
+                ? '请先在设置里选择 IYUU 会员类型'
+                : blockedByQuota
+                  ? '今日额度已用尽或正在限流冷却，请等额度重置'
+                  : ''
+            "
+            @click="startRun"
+          >
             <Loader2 v-if="starting" class="animate-spin" />
             <Play v-else />
             开始辅种
@@ -250,8 +343,71 @@ const activityText = computed(() => {
     <Alert v-if="startError" variant="destructive">
       <AlertTriangle />
       <div>
-        <div class="font-medium">任务未能启动</div>
+        <div class="font-medium">
+          {{ startErrorIsQuota ? 'IYUU 今日额度不足，任务未启动' : '任务未能启动' }}
+        </div>
         <AlertDescription class="text-destructive/90">{{ startError }}</AlertDescription>
+        <div v-if="startErrorIsQuota" class="mt-1.5 flex flex-wrap items-center gap-2 text-xs">
+          <RouterLink to="/settings" class="underline underline-offset-2">检查会员类型</RouterLink>
+          <span class="opacity-60">·</span>
+          <a
+            :href="MEMBER_URL"
+            target="_blank"
+            rel="noreferrer"
+            class="underline underline-offset-2"
+          >了解 IYUU SVIP</a>
+        </div>
+      </div>
+    </Alert>
+
+    <!-- Unanswered tier outranks every other banner: server and budget both
+         depend on it, so the numbers below would be guesses. -->
+    <Alert v-if="tierUnchosen" variant="warning">
+      <AlertTriangle />
+      <div>
+        <div class="font-medium">还没选择 IYUU 会员类型</div>
+        <AlertDescription>
+          普通用户每天 500 次查询，SVIP 2500 次。这个信息无法从 Token 判断，需要你确认。
+          <RouterLink to="/settings" class="ml-0.5 underline underline-offset-2">
+            去设置里选择
+          </RouterLink>
+        </AlertDescription>
+      </div>
+    </Alert>
+
+    <!-- Quota / rate-limit banner: only for states that change what to do next -->
+    <Alert
+      v-else-if="quotaBanner"
+      :variant="quotaBanner.tone === 'error' ? 'destructive' : 'warning'"
+    >
+      <AlertTriangle />
+      <div class="min-w-0">
+        <div class="font-medium">{{ quotaBanner.title }}</div>
+        <AlertDescription
+          :class="quotaBanner.tone === 'error' ? 'text-destructive/90' : ''"
+        >
+          {{ quotaBanner.body }}
+        </AlertDescription>
+        <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+          <RouterLink to="/settings" class="underline underline-offset-2">
+            查看会员类型与额度设置
+          </RouterLink>
+          <template v-if="upgradeApplies">
+            <span class="opacity-60">·</span>
+            <a
+              :href="MEMBER_URL"
+              target="_blank"
+              rel="noreferrer"
+              class="inline-flex items-center gap-1 underline underline-offset-2"
+            >
+              <Crown class="size-3" />
+              额度不够？IYUU SVIP 每天 2500 次
+            </a>
+            <span class="text-muted-foreground text-[10px] opacity-70">
+              （第三方提示，非官方项目）
+            </span>
+          </template>
+        </div>
       </div>
     </Alert>
 
@@ -313,6 +469,80 @@ const activityText = computed(() => {
       </Card>
 
       <div class="space-y-5">
+        <!-- IYUU quota: the constraint that decides how much of a run can happen -->
+        <Card>
+          <CardHeader class="flex-row items-center justify-between">
+            <CardTitle class="text-sm">IYUU 额度</CardTitle>
+            <Crown v-if="isVip" class="text-status-warn size-3.5" />
+          </CardHeader>
+          <CardContent class="space-y-2 text-xs">
+            <!-- 未选择会员类型时，下面所有数字都是按猜测算的，先让人去选 -->
+            <div v-if="tierUnchosen" class="space-y-2">
+              <p class="text-muted-foreground leading-relaxed">
+                还没有选择会员类型。普通用户每天 500 次、SVIP 2500 次，
+                在选定之前这里的额度数字没有意义。
+              </p>
+              <RouterLink
+                to="/settings"
+                class="text-foreground flex items-center gap-1 text-[11px] underline underline-offset-2"
+              >
+                去设置里选择 <ArrowRight class="size-3" />
+              </RouterLink>
+            </div>
+            <template v-else-if="quota">
+              <div class="flex justify-between">
+                <span class="text-muted-foreground">会员类型</span>
+                <span class="font-medium">{{ quota.tier_label }}</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-muted-foreground">今日请求</span>
+                <span class="tabular font-medium">
+                  {{ quota.used_requests }} / {{ quota.daily_requests }}
+                </span>
+              </div>
+              <div class="bg-muted h-1 overflow-hidden rounded-full">
+                <div
+                  :class="cn(
+                    'h-full rounded-full',
+                    quota.remaining_requests <= 0 || quota.blocked_until
+                      ? 'bg-status-error'
+                      : quota.percent_used >= 90
+                        ? 'bg-status-warn'
+                        : 'bg-status-success',
+                  )"
+                  :style="{ width: `${Math.max(quota.percent_used, 1)}%` }"
+                />
+              </div>
+              <div class="flex justify-between">
+                <span class="text-muted-foreground">剩余</span>
+                <span class="tabular font-medium">{{ quota.remaining_requests }} 次</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-muted-foreground">种子覆盖</span>
+                <span class="tabular font-medium">
+                  {{ quota.used_hashes.toLocaleString() }} / {{ quota.daily_hashes.toLocaleString() }}
+                </span>
+              </div>
+              <div v-if="quota.reset_at" class="flex justify-between border-t pt-2">
+                <span class="text-muted-foreground">额度重置</span>
+                <span class="tabular">{{ formatDateTime(quota.reset_at) }}</span>
+              </div>
+              <RouterLink
+                to="/settings"
+                class="text-muted-foreground hover:text-foreground flex items-center gap-1 pt-1 text-[11px]"
+              >
+                会员类型与额度 <ArrowRight class="size-3" />
+              </RouterLink>
+            </template>
+            <div v-else-if="loading" class="space-y-2">
+              <Skeleton v-for="i in 4" :key="i" class="h-4 w-full" />
+            </div>
+            <p v-else class="text-muted-foreground py-2 text-center">
+              还没有请求记录
+            </p>
+          </CardContent>
+        </Card>
+
         <!-- Downloader summary -->
         <Card>
           <CardHeader>

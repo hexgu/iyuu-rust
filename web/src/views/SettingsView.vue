@@ -9,13 +9,14 @@ import {
   Save,
   Server,
   Timer,
-
   Zap,
 } from 'lucide-vue-next'
 import {
   api,
   ApiError,
+  type ApiTier,
   type PublicConfig,
+  type QuotaResponse,
   type SiteInfo,
   type SiteCredentials,
 } from '@/lib/api'
@@ -36,6 +37,8 @@ import { Separator } from '@/components/ui/separator'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
+import TierPicker from '@/components/iyuu/TierPicker.vue'
+import TierSetupDialog from '@/components/iyuu/TierSetupDialog.vue'
 
 const cfg = ref<PublicConfig | null>(null)
 const loading = ref(true)
@@ -48,7 +51,6 @@ const saveMsg = reactive<{ kind: 'ok' | 'err' | null; text: string }>({
 // ---- local form state, seeded from the server config -------------------
 const form = reactive({
   token: '',
-  iyuuBaseUrl: '',
   dlKind: 'qbittorrent',
   dlName: '',
   dlUrl: '',
@@ -80,7 +82,6 @@ const testingDl = ref(false)
 const dlResult = reactive<{ ok: boolean | null; text: string }>({ ok: null, text: '' })
 
 function seedForm(c: PublicConfig) {
-  form.iyuuBaseUrl = c.iyuu.base_url ?? ''
   form.dlKind = c.downloader.kind
   form.dlName = c.downloader.name
   form.dlUrl = c.downloader.base_url
@@ -102,6 +103,62 @@ function seedForm(c: PublicConfig) {
   form.token = '' // write-only
 }
 
+// ---- 会员类型选择 -------------------------------------------------------
+//
+// The choice happens in a dialog, once, at the moment a token is saved. It is
+// not a form field because it is not a preference: it selects the server the
+// token is valid against, and it cannot be inferred.
+const tierDialogOpen = ref(false)
+/** Tier confirmed in the dialog, waiting to be written by the save. */
+const pendingTier = ref<ApiTier | null>(null)
+
+function openTierDialog() {
+  tierDialogOpen.value = true
+}
+
+/**
+ * The dialog confirmed a choice (already probed, for VIP). Store it and, when a
+ * token is waiting to be saved, continue the save immediately — making the user
+ * click 保存 twice for one action would be a pointless trap.
+ */
+async function onTierConfirmed(payload: { tier: ApiTier; token: string | null }) {
+  pendingTier.value = payload.tier
+  if (form.token.trim()) {
+    await commitSave()
+    return
+  }
+  // Re-picking a tier on an already-saved token: patch just that field.
+  saving.value = true
+  saveMsg.kind = null
+  try {
+    const r = await api.putConfig({ iyuu: { tier: payload.tier } })
+    cfg.value = r.config
+    saveMsg.kind = 'ok'
+    saveMsg.text = '会员类型已更新'
+    await loadQuota()
+  } catch (e) {
+    saveMsg.kind = 'err'
+    saveMsg.text = e instanceof ApiError ? e.message : String(e)
+  } finally {
+    saving.value = false
+    // Keep the confirmed tier only for this save; a later save must re-ask if the
+    // token changed again.
+    pendingTier.value = null
+  }
+}
+
+/** Live quota, so the picker shows the account's real position, not the plan's. */
+const quota = ref<QuotaResponse | null>(null)
+
+async function loadQuota() {
+  try {
+    quota.value = await api.quota()
+  } catch {
+    // Quota display is informational; a failure here must not break the page.
+    quota.value = null
+  }
+}
+
 async function loadConfig() {
   loading.value = true
   try {
@@ -120,6 +177,7 @@ onMounted(async () => {
   // Load the site list opportunistically: without a token it will 502, which is
   // fine — we just show a hint instead of an error.
   loadSites()
+  loadQuota()
 })
 
 async function loadSites() {
@@ -158,9 +216,26 @@ function splitList(v: string): string[] {
     .filter(Boolean)
 }
 
+/**
+ * Save entry point.
+ *
+ * A new token cannot be saved without a tier: the tier decides which server the
+ * token is valid against, and guessing one is how a paying user silently ends up
+ * on the free host. So instead of validating here, we open the selection dialog
+ * and let `commitSave` run once the user has answered.
+ */
 async function save() {
-  saving.value = true
   saveMsg.kind = null
+  if (form.token.trim() && !pendingTier.value) {
+    openTierDialog()
+    return
+  }
+  await commitSave()
+}
+
+/** Run the save with everything the form + dialog have collected so far. */
+async function commitSave() {
+  saving.value = true
   try {
     const credentials: Record<string, SiteCredentials> = {}
     for (const [sid, draft] of Object.entries(credDraft)) {
@@ -201,11 +276,11 @@ async function save() {
       schedule: { enabled: form.scheduleEnabled, cron: form.cron },
     }
 
-    // Only include the token when the user typed one.
-    if (form.token) {
-      patch.iyuu = { token: form.token, base_url: form.iyuuBaseUrl || null }
-    } else if (form.iyuuBaseUrl !== (cfg.value?.iyuu.base_url ?? '')) {
-      patch.iyuu = { base_url: form.iyuuBaseUrl || null }
+    // A new token is always saved together with its tier — the server rejects one
+    // without the other, because the tier decides which server the token is valid
+    // against. `save()` guarantees `pendingTier` is set before we get here.
+    if (form.token.trim() && pendingTier.value) {
+      patch.iyuu = { token: form.token.trim(), tier: pendingTier.value }
     }
 
     if (Object.keys(credentials).length) patch.credentials = credentials
@@ -224,26 +299,41 @@ async function save() {
     saveMsg.kind = 'ok'
     saveMsg.text = '已保存'
     loadSites()
+    loadQuota()
   } catch (e) {
     saveMsg.kind = 'err'
     saveMsg.text = e instanceof ApiError ? e.message : String(e)
   } finally {
     saving.value = false
+    // The token (if any) is stored now; a second save must ask for the tier again
+    // only if the token field is filled in again.
+    pendingTier.value = null
   }
 }
 
+/**
+ * Test against the saved tier. There is no tier selector in the form anymore, so
+ * this only proves "the token I already saved still works"; choosing a server is
+ * the dialog's job, and it probes before it saves.
+ */
 async function testIyuu() {
   testingIyuu.value = true
   iyuuResult.ok = null
   iyuuResult.text = ''
   try {
-    const r = await api.testIyuu(form.token || undefined)
+    const r = await api.testIyuu({})
     iyuuResult.ok = true
-    iyuuResult.text = `连接成功：支持 ${r.site_count} 个站点，已绑定 ${r.bound_count} 个`
-    await loadSites()
+    iyuuResult.text = `连接成功：支持 ${r.site_count} 个站点，已绑定 ${r.bound_count} 个 · 本次消耗 2 次额度`
+    quota.value = null
+    await Promise.all([loadSites(), loadQuota()])
   } catch (e) {
     iyuuResult.ok = false
-    iyuuResult.text = e instanceof ApiError ? e.message : String(e)
+    if (e instanceof ApiError && e.kind === 'rate_limited') {
+      iyuuResult.text = `${e.message}（等额度重置后再试）`
+    } else {
+      iyuuResult.text = e instanceof ApiError ? e.message : String(e)
+    }
+    loadQuota()
   } finally {
     testingIyuu.value = false
   }
@@ -352,35 +442,43 @@ const configuredCount = computed(
       <Card>
         <CardHeader>
           <CardTitle class="flex items-center gap-2 text-sm">
-            <KeyRound class="size-4" /> IYUU
+            <KeyRound class="size-4" /> IYUU 账号
           </CardTitle>
           <CardDescription>
             Token 在 <a href="https://iyuu.cn" target="_blank" rel="noreferrer" class="underline underline-offset-2">iyuu.cn</a>
-            获取；需要在站点账号里完成绑定，否则查询结果会为空
+            获取；需要在 IYUU 里完成站点绑定，否则查询结果会为空
           </CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
-          <div class="grid gap-4 sm:grid-cols-2">
-            <div class="space-y-1.5">
-              <Label for="token">
-                Token
-                <span v-if="cfg?.iyuu.has_token" class="text-muted-foreground ml-1 font-normal">
-                  （已保存 {{ cfg.iyuu.token_hint }}，留空表示不修改）
-                </span>
-              </Label>
-              <Input
-                id="token"
-                v-model="form.token"
-                type="password"
-                autocomplete="off"
-                :placeholder="cfg?.iyuu.has_token ? '••••••••（已保存）' : 'IYUU0812xxxxxxx'"
-              />
-            </div>
-            <div class="space-y-1.5">
-              <Label for="baseurl">API 地址（可选）</Label>
-              <Input id="baseurl" v-model="form.iyuuBaseUrl" placeholder="https://2025.iyuu.cn" />
-            </div>
+          <div class="space-y-1.5">
+            <Label for="token">
+              Token
+              <span v-if="cfg?.iyuu.has_token" class="text-muted-foreground ml-1 font-normal">
+                （已保存 {{ cfg.iyuu.token_hint }}，留空表示不修改）
+              </span>
+            </Label>
+            <Input
+              id="token"
+              v-model="form.token"
+              type="password"
+              autocomplete="off"
+              :placeholder="cfg?.iyuu.has_token ? '••••••••（已保存）' : 'IYUU0812xxxxxxx'"
+              @keyup.enter="save"
+            />
+            <p class="text-muted-foreground text-[11px]">
+              保存时会让你选择会员类型（普通用户 / SVIP）——两者额度差 5 倍，且无法从 Token 判断
+            </p>
           </div>
+
+          <Separator />
+
+          <!-- 会员类型状态 + 额度 -->
+          <TierPicker
+            :tier="cfg?.iyuu.tier_chosen ? (cfg?.iyuu.tier ?? null) : null"
+            :quota="quota"
+            :disabled="saving"
+            @edit="openTierDialog"
+          />
 
           <div class="flex flex-wrap items-center gap-3">
             <Button variant="outline" size="sm" :disabled="testingIyuu" @click="testIyuu">
@@ -396,6 +494,9 @@ const configuredCount = computed(
               )"
             >
               {{ iyuuResult.text }}
+            </span>
+            <span v-else class="text-muted-foreground text-[11px]">
+              使用已保存的会员类型真实请求一次
             </span>
           </div>
         </CardContent>
@@ -694,5 +795,13 @@ const configuredCount = computed(
         </CardContent>
       </Card>
     </template>
+
+    <!-- 会员类型选择：保存 Token 或点「修改」时打开 -->
+    <TierSetupDialog
+      v-model:open="tierDialogOpen"
+      :token="form.token"
+      :current-tier="cfg?.iyuu.tier_chosen ? (cfg?.iyuu.tier ?? null) : null"
+      @confirm="onTierConfirmed"
+    />
   </div>
 </template>

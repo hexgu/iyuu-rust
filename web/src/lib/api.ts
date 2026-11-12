@@ -10,6 +10,7 @@
 
 export type ErrorKind =
   | 'iyuu_auth'
+  | 'rate_limited'
   | 'config'
   | 'downloader_auth'
   | 'downloader'
@@ -102,6 +103,15 @@ export interface StatusResponse {
   /** Next scheduled discovery run (ISO-8601); null when scheduling is off. */
   next_run_at: string | null
   schedule_enabled: boolean
+  /** Declared membership tier. Decides which IYUU server is called. */
+  iyuu_tier: ApiTier
+  /** False until the user answers the tier question. */
+  iyuu_tier_chosen: boolean
+  /** Requests spent today against the tier's daily allowance. */
+  quota_used: number
+  quota_daily: number
+  /** ISO-8601 end of a rate-limit cooldown, if IYUU told us to back off. */
+  quota_blocked_until: string | null
   last_run:
     | {
         id: string
@@ -113,6 +123,47 @@ export interface StatusResponse {
         message: string | null
       }
     | null
+}
+
+/**
+ * IYUU account tier.
+ *
+ * Two distinct services, not a feature flag: `free` is served by 2025.iyuu.cn
+ * with 500 reseed queries/day, `vip` by vip.iyuu.cn with 2500. The user declares
+ * which they hold — it cannot be detected, because a request to the wrong host
+ * just fails.
+ */
+export type ApiTier = 'free' | 'vip'
+
+export interface TierInfo {
+  id: ApiTier
+  label: string
+  daily_requests: number
+  daily_hashes: number
+}
+
+export interface QuotaResponse {
+  tier: ApiTier
+  tier_label: string
+  /** Quota day, `YYYY-MM-DD` (UTC+8, IYUU's reset boundary). */
+  day: string
+  daily_requests: number
+  used_requests: number
+  remaining_requests: number
+  daily_hashes: number
+  used_hashes: number
+  remaining_hashes: number
+  blocked_until: string | null
+  reset_at: string | null
+  percent_used: number
+  denied_requests: number
+  /** False until the user answers the tier question. */
+  tier_chosen: boolean
+  /**
+   * Plan table for the picker. Note there is no host here on purpose: the API
+   * base is a deployment detail (env var) and never reaches the browser.
+   */
+  tiers: TierInfo[]
 }
 
 export interface Run {
@@ -195,7 +246,15 @@ export interface ScheduleConfig {
 }
 
 export interface PublicConfig {
-  iyuu: { has_token: boolean; token_hint: string; base_url: string | null }
+  iyuu: {
+    has_token: boolean
+    token_hint: string
+    tier: ApiTier
+    /** False until the user answers the tier question. */
+    tier_chosen: boolean
+    daily_requests: number
+    daily_hashes: number
+  }
   downloader: {
     kind: string
     name: string
@@ -247,9 +306,11 @@ export interface DownloaderSummary {
 
 export interface TestIyuuResult {
   ok: boolean
+  tier: ApiTier
   site_count: number
   bound_count: number
   bound_sites: { id: number; site: string; nickname: string }[]
+  quota: Omit<QuotaResponse, 'tiers' | 'tier_chosen'>
 }
 
 export interface TestDownloaderResult {
@@ -265,6 +326,8 @@ export interface TestDownloaderResult {
 export const api = {
   status: () => request<StatusResponse>('/status'),
 
+  quota: () => request<QuotaResponse>('/quota'),
+
   getConfig: () => request<PublicConfig>('/config'),
 
   putConfig: (patch: unknown) =>
@@ -273,10 +336,19 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
-  testIyuu: (token?: string) =>
+  /**
+   * Probe a token, optionally against a tier/host before saving it.
+   *
+   * Costs two real requests against the daily allowance, so the UI must tell the
+   * user that rather than presenting it as free.
+   */
+  testIyuu: (body: { token?: string; tier?: ApiTier } = {}) =>
     request<TestIyuuResult>('/test/iyuu', {
       method: 'POST',
-      body: JSON.stringify({ token: token ?? null }),
+      body: JSON.stringify({
+        token: body.token ?? null,
+        tier: body.tier ?? null,
+      }),
     }),
 
   testDownloader: (body: {

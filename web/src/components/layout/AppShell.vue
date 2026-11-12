@@ -169,8 +169,19 @@ const unhealthy = computed(
       <slot />
     </main>
 
-    <footer class="text-muted-foreground border-t px-4 py-3 text-center text-xs">
-      iyuu-reseed · 基于 IYUU 开放 API · 校验通过才计为成功
+    <footer class="text-muted-foreground border-t px-4 py-3 text-center text-[11px] leading-relaxed">
+      <div>iyuu-reseed · 基于 IYUU 开放 API · 校验通过才计为成功</div>
+      <div class="mt-0.5 opacity-80">
+        本项目为第三方工具，<span class="text-foreground/80">并非 IYUU 官方项目</span>，
+        不提供 IYUU 会员/额度相关的售后与连带责任；会员权益以
+        <a
+          href="https://iyuu.cn/app/user/member"
+          target="_blank"
+          rel="noreferrer"
+          class="underline underline-offset-2"
+        >IYUU 官方</a>
+        为准
+      </div>
     </footer>
   </div>
 </template>
