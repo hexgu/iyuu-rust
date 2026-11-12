@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use iyuu_core::downloader::Downloader;
 use iyuu_core::iyuu::IyuuClient;
 use iyuu_core::models::RunTrigger;
+use iyuu_core::ratelimit::ApiTier;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/status", get(status))
+        // IYUU quota + tier
+        .route("/quota", get(get_quota))
         // settings
         .route("/config", get(get_config).put(put_config))
         // connectivity tests
@@ -86,6 +89,16 @@ struct StatusResponse {
     /// Next scheduled discovery run, ISO-8601. Absent when scheduling is off.
     next_run_at: Option<String>,
     schedule_enabled: bool,
+    /// Declared membership tier (`free` / `vip`).
+    iyuu_tier: String,
+    /// `false` until the user answers the tier question. The UI uses this to
+    /// funnel them into the setup dialog instead of running with a guessed tier.
+    iyuu_tier_chosen: bool,
+    /// Requests already spent today, against the tier's daily allowance.
+    quota_used: u32,
+    quota_daily: u32,
+    /// Present while IYUU has us in a rate-limit cooldown.
+    quota_blocked_until: Option<String>,
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>> {
@@ -104,6 +117,8 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>> {
 
     let next_run_at = crate::scheduler::next_run_at(&cfg.schedule);
 
+    let quota = current_quota(&state)?;
+
     Ok(Json(StatusResponse {
         configured: !cfg.iyuu.token.is_empty(),
         iyuu_ok: !cfg.iyuu.token.is_empty(),
@@ -115,7 +130,75 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>> {
         last_run,
         next_run_at: next_run_at.map(|d| d.to_rfc3339()),
         schedule_enabled: cfg.schedule.enabled,
+        iyuu_tier: cfg.iyuu.tier().as_str().to_string(),
+        iyuu_tier_chosen: cfg.iyuu.tier_chosen(),
+        quota_used: quota.used_requests,
+        quota_daily: quota.daily_requests,
+        quota_blocked_until: quota
+            .blocked_until
+            .filter(|at| *at > chrono::Utc::now())
+            .map(|d| d.to_rfc3339()),
     }))
+}
+
+// ------------------------------------------------------------------- quota
+
+/// Current quota position, preferring the live client.
+///
+/// The live client is preferred because it holds state a fresh snapshot cannot
+/// reconstruct: an active rate-limit cooldown and this run's spend. With no
+/// client yet (nothing has run since startup) the persisted counters are used, so
+/// the UI shows the day's real position instead of an empty widget.
+fn current_quota(state: &AppState) -> Result<iyuu_core::ratelimit::QuotaSnapshot> {
+    if let Some(client) = state.iyuu.read().clone() {
+        return Ok(client.quota());
+    }
+    let usage = state.db.load_api_usage()?;
+    let today = iyuu_core::ratelimit::quota_day(chrono::Utc::now());
+    let usage = usage.for_day(&today);
+    Ok(iyuu_core::ratelimit::QuotaSnapshot::new(
+        state.config_snapshot().iyuu.tier(),
+        chrono::Utc::now(),
+        usage.used_requests,
+        usage.used_hashes,
+        None,
+    ))
+}
+
+/// IYUU quota position for the declared tier.
+///
+/// No host is included, by design: the API base is an environment-level
+/// deployment detail and the browser has no business knowing it. The tier is the
+/// part a user can act on, and it is enough to explain every number here.
+async fn get_quota(State(state): State<AppState>) -> Result<Json<Value>> {
+    let cfg = state.config_snapshot();
+    let snapshot = current_quota(&state)?;
+
+    let mut body = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("tier_chosen".into(), Value::Bool(cfg.iyuu.tier_chosen()));
+        // Enough for the UI to render "500 → 2500" without hardcoding the plan
+        // table in the bundle. Hosts are intentionally absent.
+        obj.insert(
+            "tiers".into(),
+            json!([
+                {
+                    "id": "free",
+                    "label": "普通用户",
+                    "daily_requests": iyuu_core::ratelimit::ApiTier::Free.daily_requests(),
+                    "daily_hashes": iyuu_core::ratelimit::ApiTier::Free.daily_hashes(),
+                },
+                {
+                    "id": "vip",
+                    "label": "SVIP 会员",
+                    "daily_requests": iyuu_core::ratelimit::ApiTier::Vip.daily_requests(),
+                    "daily_hashes": iyuu_core::ratelimit::ApiTier::Vip.daily_hashes(),
+                },
+            ]),
+        );
+    }
+
+    Ok(Json(body))
 }
 
 // ----------------------------------------------------------------- settings
@@ -129,6 +212,10 @@ async fn put_config(
     State(state): State<AppState>,
     Json(patch): Json<ConfigPatch>,
 ) -> Result<Json<Value>> {
+    // Validate the raw patch first: `apply_patch` canonicalizes the tier, so a
+    // typo would otherwise be silently rewritten into a valid-but-wrong value.
+    crate::config::AppConfig::validate_patch(&patch)?;
+
     let mut cfg = state.config_snapshot();
     cfg.apply_patch(patch);
     cfg.validate()?;
@@ -146,6 +233,9 @@ async fn put_config(
 struct TestIyuuBody {
     /// Test a token without saving it first.
     token: Option<String>,
+    /// Required for a new token: the tier decides the server, and the server
+    /// cannot be inferred from the token.
+    tier: Option<String>,
 }
 
 async fn test_iyuu(
@@ -156,28 +246,62 @@ async fn test_iyuu(
     let token = body
         .token
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or(cfg.iyuu.token);
+        .unwrap_or_else(|| cfg.iyuu.token.clone());
 
     if token.trim().is_empty() {
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
 
-    let client = match cfg
-        .iyuu
-        .base_url
+    // The tier only decides which host to call and which budget to assume — it
+    // is **not** a credential, and it cannot be verified by probing. Both hosts
+    // front the same service, so a successful response says nothing about
+    // membership. Treat it as a self-declared preference and verify only the token.
+    let tier = body
+        .tier
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(base) => IyuuClient::with_base_url(token, base)?,
-        None => IyuuClient::new(token)?,
+        .map_or_else(|| cfg.iyuu.tier(), ApiTier::parse);
+
+    // Host comes from the tier (plus any environment override), never from the
+    // request: the browser cannot choose the server. `base_url_for` is used rather
+    // than `for_tier` so an operator's mirror override is honoured here too — a
+    // probe that bypassed it would reach the real IYUU while every real run goes
+    // through the mirror.
+    let client = IyuuClient::build(token, crate::config::IyuuConfig::base_url_for(tier), tier)?;
+
+    // `sites()` proves the host answers and fills the catalogue.
+    let sites = client.sites(true).await?;
+
+    // `recommended_sites()` is the token-scoped call: it is what actually proves
+    // the token is real, so its failure is fatal here rather than defaulted away.
+    // Swallowing it is what let an invalid token report success.
+    //
+    // Rate limiting is reported separately because it is not a verdict on the
+    // token — the request never got as far as being judged, and telling the user
+    // to "check your token" because of a throttle would be wrong advice.
+    let bound = match client.recommended_sites().await {
+        Ok(list) => list,
+        Err(iyuu_core::CoreError::RateLimited(msg)) => {
+            return Err(ServerError::RateLimited(msg));
+        }
+        Err(e) => {
+            return Err(ServerError::IyuuAuth(format!(
+                "此 Token 无法在 IYUU 上使用：请检查 Token 是否正确（原始信息：{e}）"
+            )));
+        }
     };
 
-    // `sites()` both proves the token works and fills the site cache.
-    let sites = client.sites(true).await?;
-    let bound = client.recommended_sites().await.unwrap_or_default();
+    // A valid token with no bound sites cannot produce candidates, so a "success"
+    // here would be a setup that silently adds nothing.
+    if bound.is_empty() {
+        return Err(ServerError::IyuuAuth(
+            "此 Token 尚未在 IYUU 绑定任何站点，辅种查询结果会为空。请先在 IYUU 里完成站点绑定"
+                .into(),
+        ));
+    }
 
     Ok(Json(json!({
         "ok": true,
+        "tier": tier.as_str(),
         "site_count": sites.len(),
         "bound_count": bound.len(),
         "bound_sites": bound.iter().map(|s| json!({
@@ -185,6 +309,9 @@ async fn test_iyuu(
             "site": s.site,
             "nickname": s.nickname,
         })).collect::<Vec<_>>(),
+        // Two probe requests were spent; report the resulting position so the UI
+        // can warn instead of the user discovering it from a failed run.
+        "quota": client.quota(),
     })))
 }
 
@@ -242,18 +369,7 @@ async fn test_downloader(
 
 async fn list_sites(State(state): State<AppState>) -> Result<Json<Value>> {
     let cfg = state.config_snapshot();
-    if cfg.iyuu.token.is_empty() {
-        return Err(ServerError::IyuuAuth("尚未配置 IYUU Token".into()));
-    }
-    let client = match cfg
-        .iyuu
-        .base_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
-        None => IyuuClient::new(cfg.iyuu.token.clone())?,
-    };
+    let client = client_for(&cfg)?;
     let sites = client.sites(false).await?;
     // Mark which sites already have credentials so the UI can highlight gaps.
     let creds = cfg.credentials;
@@ -281,20 +397,30 @@ async fn list_sites(State(state): State<AppState>) -> Result<Json<Value>> {
     Ok(Json(json!({"sites": out})))
 }
 
-async fn list_bound_sites(State(state): State<AppState>) -> Result<Json<Value>> {
-    let cfg = state.config_snapshot();
-    if cfg.iyuu.token.is_empty() {
+/// Build a throwaway client from the saved config, for read-only endpoints.
+///
+/// Config-driven on purpose: `list_sites` must query the same server a run would,
+/// otherwise a VIP user's site list could come from one host while the reseed
+/// query goes to another.
+fn client_for(cfg: &crate::config::AppConfig) -> Result<IyuuClient> {
+    if cfg.iyuu.token.trim().is_empty() {
         return Err(ServerError::IyuuAuth("尚未配置 IYUU Token".into()));
     }
-    let client = match cfg
-        .iyuu
-        .base_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
-        None => IyuuClient::new(cfg.iyuu.token.clone())?,
-    };
+    if !cfg.iyuu.tier_chosen() {
+        return Err(ServerError::Config(
+            "请先选择 IYUU 会员类型（普通用户 / SVIP）".into(),
+        ));
+    }
+    Ok(IyuuClient::build(
+        cfg.iyuu.token.clone(),
+        cfg.iyuu.effective_base_url(),
+        cfg.iyuu.tier(),
+    )?)
+}
+
+async fn list_bound_sites(State(state): State<AppState>) -> Result<Json<Value>> {
+    let cfg = state.config_snapshot();
+    let client = client_for(&cfg)?;
     let bound = client.recommended_sites().await?;
     Ok(Json(json!({
         "sites": bound.iter().map(|s| json!({
@@ -343,6 +469,34 @@ async fn start_run(
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
     cfg.downloader.kind()?;
+
+    // Refuse to start with no IYUU budget. Every discovery run spends at least
+    // one request, so with the day's allowance gone the run can only waste a
+    // downloader scan and then fail — better to say so now, with the reset time,
+    // than after two minutes of work.
+    let quota = current_quota(&state)?;
+    let blocked = quota.blocked_until.filter(|at| *at > chrono::Utc::now());
+    if let Some(until) = blocked {
+        return Err(ServerError::RateLimited(format!(
+            "IYUU 限流冷却中，{} 后才可再次请求",
+            until.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+        )));
+    }
+    if quota.remaining_requests == 0 {
+        let reset = quota.reset_at.map_or_else(
+            || "明日".to_string(),
+            |t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            },
+        );
+        return Err(ServerError::RateLimited(format!(
+            "今日 IYUU 额度已用尽（{}/{} 次，{}），{reset} 后重置。\
+             需要更大额度可考虑 IYUU 的 SVIP 会员服务器",
+            quota.used_requests, quota.daily_requests, quota.tier_label
+        )));
+    }
 
     let state2 = state.clone();
     let run_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
