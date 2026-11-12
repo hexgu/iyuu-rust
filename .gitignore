@@ -7,3 +7,4 @@ web/dist
 *.tsbuildinfo
 .agents
 skills-lock.json
+/.dev

@@ -89,3 +89,12 @@ clap = { version = "4", features = ["derive", "env"] }
 parking_lot = "0.12"
 dashmap = "6"
 bitflags = "2"
+
+# Debug builds carry the default `debug = 2` (full DWARF), which on this
+# workspace produces a 154 MB binary and dominates both build time and disk
+# usage. `debug = 1` keeps line tables (breakpoints and backtraces still point
+# at the right source line) while dropping type/variable debug info, which is
+# the bulk of the cost. Set back to 2 if you ever need to inspect variables in
+# a debugger; `cargo build --release` is unaffected.
+[profile.dev]
+debug = 1
