@@ -1,6 +1,7 @@
 //! IYUU 辅种 API client.
 //!
-//! Endpoints implemented (all against `https://2025.iyuu.cn`):
+//! Endpoints implemented (against the host for the account's tier — see
+//! [`ApiTier`]):
 //!   GET  /reseed/sites/index          — supported sites (with `download_page` template)
 //!   GET  /reseed/sites/recommend      — recommended sites (binding-oriented)
 //!   POST /reseed/sites/reportExisting — report held site ids, get `sid_sha1`
@@ -20,9 +21,19 @@
 //!  * Responses are `{code, data, msg}` where `code == 0` is success for most
 //!    endpoints but `200` is success for the `/spider/*` ones. The reference
 //!    implementations only accept 0, so we accept both.
+//!  * The API is **metered per day** and rejects bursts. Every call is charged
+//!    against a local quota mirror first ([`QuotaSnapshot`]) and paced by the
+//!    tier's interval, so a run cannot spend the budget by accident. When IYUU
+//!    does reject us, the client enters a cooldown instead of retrying into a
+//!    ban — see [`crate::ratelimit`].
 
 use crate::error::{CoreError, Result};
 use crate::models::{IyuuSite, SeedCandidate};
+use crate::ratelimit::{
+    ApiTier, HASHES_PER_REQUEST, QuotaBudget, QuotaSnapshot, QuotaUsage, looks_rate_limited,
+    rate_limit_cooldown,
+};
+use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -33,12 +44,13 @@ use std::time::{Duration, Instant};
 /// Version string advertised to the API. The server uses it for compatibility
 /// gating, so keep it in sync with what upstream clients send.
 pub const IYUU_API_VERSION: &str = "8.2.0";
-pub const DEFAULT_BASE_URL: &str = "https://2025.iyuu.cn";
+/// Default host, kept for callers that predate tier selection.
+pub const DEFAULT_BASE_URL: &str = ApiTier::FREE_BASE_URL;
 
 /// Chunk size for `hash` batches. The documented/reference limit is 200; the
 /// server rejects larger batches, and a rejection loses the whole chunk, so we
 /// stay at the documented value.
-pub const HASH_CHUNK_SIZE: usize = 200;
+pub const HASH_CHUNK_SIZE: usize = HASHES_PER_REQUEST;
 
 /// `usize` → `i64` for API counters. Saturates rather than wrapping so an
 /// impossible count never turns into a negative number.
@@ -90,6 +102,103 @@ struct Cache {
     sid_sha1_at: Option<Instant>,
 }
 
+/// Local mirror of the account's daily usage, plus pacing/back-off state.
+///
+/// Held in one lock so a check-and-charge cannot interleave with another
+/// worker's check-and-charge. Without that, two concurrent run paths could both
+/// see "1 request left" and both send.
+struct QuotaState {
+    tier: ApiTier,
+    /// Quota day (`YYYY-MM-DD`, UTC+8) the counters below belong to.
+    day: String,
+    used_requests: u32,
+    used_hashes: u32,
+    /// Set while we have been told to back off. Nothing is sent until it passes.
+    blocked_until: Option<chrono::DateTime<Utc>>,
+    /// When the last request was actually put on the wire, for pacing.
+    last_call: Option<Instant>,
+    /// Requests we refused locally because the budget was gone; surfaced to the
+    /// UI so "0 added" is explainable rather than mysterious.
+    denied_requests: u32,
+}
+
+impl QuotaState {
+    fn new(tier: ApiTier, usage: &QuotaUsage) -> Self {
+        let day = crate::ratelimit::quota_day(Utc::now());
+        // `for_day` drops a record from an earlier day, so a stale row in the
+        // database cannot suppress today's budget.
+        let usage = usage.for_day(&day);
+        Self {
+            tier,
+            day,
+            used_requests: usage.used_requests,
+            used_hashes: usage.used_hashes,
+            blocked_until: None,
+            last_call: None,
+            denied_requests: 0,
+        }
+    }
+
+    /// Export the counters for persistence.
+    fn usage(&self) -> QuotaUsage {
+        QuotaUsage {
+            day: self.day.clone(),
+            used_requests: self.used_requests,
+            used_hashes: self.used_hashes,
+        }
+    }
+
+    /// Budget available right now: the daily remainder, minus any active back-off.
+    ///
+    /// Deliberately not clamped per run. A run should use as much of the day's
+    /// allowance as its torrent list needs — splitting it into smaller batches
+    /// only means more runs, and the account gets the same daily total either
+    /// way. The only real ceiling is IYUU's own counter.
+    fn budget(&self) -> QuotaBudget {
+        if self.blocked_until.is_some_and(|at| at > Utc::now()) {
+            return QuotaBudget::new(0, 0);
+        }
+        QuotaBudget::new(
+            self.tier
+                .daily_requests()
+                .saturating_sub(self.used_requests),
+            self.tier.daily_hashes().saturating_sub(self.used_hashes),
+        )
+    }
+
+    /// Roll the counters over when the quota day changes.
+    ///
+    /// IYUU resets on its own boundary; we cannot know the exact second, so we
+    /// mirror a UTC+8 midnight. Being early only costs a request that the server
+    /// may still reject (and then we back off again); being late would silently
+    /// under-use the budget.
+    fn roll_over(&mut self, now: chrono::DateTime<Utc>) {
+        let today = crate::ratelimit::quota_day(now);
+        if today != self.day {
+            self.day = today;
+            self.used_requests = 0;
+            self.used_hashes = 0;
+            self.denied_requests = 0;
+        }
+        // An expired block must not keep suppressing requests.
+        if self.blocked_until.is_some_and(|at| at <= now) {
+            self.blocked_until = None;
+        }
+    }
+
+    fn snapshot(&self) -> QuotaSnapshot {
+        let mut snap = QuotaSnapshot::new(
+            self.tier,
+            Utc::now(),
+            self.used_requests,
+            self.used_hashes,
+            self.blocked_until,
+        );
+        snap.denied_requests = self.denied_requests;
+        snap
+    }
+}
+
 /// `sid_sha1` is documented as valid for 7 days; we refresh at 6 to leave slack.
 const SID_SHA1_TTL: Duration = Duration::from_hours(144);
 /// Site list changes rarely; a day is plenty and avoids a request per run.
@@ -100,10 +209,11 @@ pub struct IyuuClient {
     base_url: String,
     token: String,
     cache: RwLock<Cache>,
+    quota: RwLock<QuotaState>,
 }
 
 impl IyuuClient {
-    /// Build a client against the public IYUU API.
+    /// Build a client against the public (free-tier) IYUU API.
     ///
     /// # Errors
     /// Returns an error when the HTTP client cannot be built.
@@ -111,11 +221,33 @@ impl IyuuClient {
         Self::with_base_url(token, DEFAULT_BASE_URL)
     }
 
-    /// Build a client against an explicit base URL (used by tests and mirrors).
+    /// Build a client for an explicit tier, using that tier's host.
+    ///
+    /// # Errors
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn for_tier(token: impl Into<String>, tier: ApiTier) -> Result<Self> {
+        Self::build(token, tier.base_url(), tier)
+    }
+
+    /// Build a client against an explicit base URL (tests, mirrors, and a user
+    /// who overrides the host). Tier still decides the *budget* — a custom host
+    /// does not buy extra quota, since the meter lives on the account.
     ///
     /// # Errors
     /// Returns an error when the HTTP client cannot be built.
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
+        Self::build(token, base_url, ApiTier::Free)
+    }
+
+    /// Build a client with both an explicit host and an explicit tier.
+    ///
+    /// # Errors
+    /// Returns an error when the HTTP client cannot be built.
+    pub fn build(
+        token: impl Into<String>,
+        base_url: impl Into<String>,
+        tier: ApiTier,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
@@ -127,13 +259,60 @@ impl IyuuClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
             cache: RwLock::new(Cache::default()),
+            quota: RwLock::new(QuotaState::new(tier, &QuotaUsage::default())),
         })
     }
 
-    /// Share one client (and therefore one connection pool + cache) across the
-    /// whole process. Every reseed run reuses it.
+    /// Seed the quota mirror from usage persisted earlier today (or from an
+    /// earlier day, which is ignored).
+    ///
+    /// The client object is recreated on every run, so without this a restart
+    /// mid-day would hand the next run a full budget the account does not have —
+    /// and the server would start rejecting us.
+    #[must_use]
+    pub fn with_usage(self, usage: &QuotaUsage) -> Self {
+        {
+            let mut guard = self.quota.write();
+            *guard = QuotaState::new(guard.tier, usage);
+        }
+        self
+    }
+
+    /// Current counters, for persisting between runs.
+    #[must_use]
+    pub fn usage(&self) -> QuotaUsage {
+        self.quota.read().usage()
+    }
+
+    /// Share one client (and therefore one connection pool + cache + quota
+    /// mirror) across the whole process. Every reseed run reuses it.
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    /// Current quota mirror, for the API and the UI.
+    #[must_use]
+    pub fn quota(&self) -> QuotaSnapshot {
+        let mut guard = self.quota.write();
+        guard.roll_over(Utc::now());
+        guard.snapshot()
+    }
+
+    /// Budget available right now, honouring an active back-off and any per-run
+    /// cap. Read through the state object so the run cap is included — asking the
+    /// snapshot alone would ignore it.
+    #[must_use]
+    pub fn budget(&self) -> QuotaBudget {
+        let mut guard = self.quota.write();
+        guard.roll_over(Utc::now());
+        guard.budget()
+    }
+
+    /// The host this client talks to — shown in the UI so a wrong tier is
+    /// visible rather than mysterious.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     fn url(&self, path: &str) -> String {
@@ -145,9 +324,103 @@ impl IyuuClient {
             .map_err(|_| CoreError::Config("IYUU token contains invalid header characters".into()))
     }
 
+    /// Charge one request against the local quota, then wait out the tier's
+    /// pacing interval.
+    ///
+    /// Charge-before-send, not after: a request that times out still consumed
+    /// server-side quota, and under-counting is the failure that leads to an
+    /// actual ban. `hashes` is how many info-hashes this request carries (0 for
+    /// non-reseed endpoints), so the two budgets stay in step.
+    ///
+    /// Errors with [`CoreError::RateLimited`] when the local mirror already says
+    /// "no", which is why callers must run this *before* building a request.
+    async fn spend(&self, what: &str, hashes: usize) -> Result<()> {
+        let wait = {
+            let mut guard = self.quota.write();
+            guard.roll_over(Utc::now());
+
+            if guard.blocked_until.is_some_and(|at| at > Utc::now()) {
+                let until = guard.blocked_until.unwrap_or_else(Utc::now);
+                let msg = format!(
+                    "IYUU 接口处于限流冷却中，{} 前不再请求（{what}）",
+                    until.format("%H:%M:%S")
+                );
+                guard.denied_requests = guard.denied_requests.saturating_add(1);
+                return Err(CoreError::RateLimited(msg));
+            }
+
+            if guard.used_requests >= guard.tier.daily_requests() {
+                guard.denied_requests = guard.denied_requests.saturating_add(1);
+                return Err(CoreError::RateLimited(format!(
+                    "今日请求次数已用尽（{}/{}），明日 00:00（UTC+8）后重置",
+                    guard.used_requests,
+                    guard.tier.daily_requests(),
+                )));
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "hash counts per request are capped at HASHES_PER_REQUEST"
+            )]
+            let hashes = hashes.min(HASHES_PER_REQUEST) as u32;
+            guard.used_requests = guard.used_requests.saturating_add(1);
+            guard.used_hashes = guard.used_hashes.saturating_add(hashes);
+
+            // Pace: sleep at least the tier interval since the previous call.
+            let interval = guard.tier.request_interval();
+            let wait = guard
+                .last_call
+                .map(|at| interval.saturating_sub(at.elapsed()))
+                .filter(|d| !d.is_zero());
+            guard.last_call = Some(Instant::now());
+            wait
+        };
+
+        if let Some(d) = wait {
+            tokio::time::sleep(d).await;
+        }
+        Ok(())
+    }
+
+    /// Put the client into back-off after a rate-limit rejection, and translate
+    /// the error. A cooldown is the only correct response: retrying into a
+    /// throttle is how an account gets a longer ban than the quota itself.
+    fn trip_breaker(&self, msg: &str) -> CoreError {
+        let mut guard = self.quota.write();
+        guard.blocked_until = Some(Utc::now() + rate_limit_cooldown());
+        CoreError::RateLimited(format!(
+            "IYUU 判定请求超限，已暂停 {} 分钟：{msg}",
+            rate_limit_cooldown().num_minutes()
+        ))
+    }
+
+    /// Whether a breaker is currently active.
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        self.quota
+            .read()
+            .blocked_until
+            .is_some_and(|at| at > Utc::now())
+    }
+
+    /// Clear an active cooldown.
+    ///
+    /// Used by the settings test endpoint: a connectivity probe is an explicit,
+    /// one-off user action, not part of a run. If the probe is short-circuited by a
+    /// cooldown left over from an earlier run, the user gets "rate limited" for a
+    /// request that was never sent — and no way to find out whether their token
+    /// works. A probe therefore attempts exactly one request and does not inherit
+    /// the run's breaker.
+    pub fn clear_cooldown(&self) {
+        self.quota.write().blocked_until = None;
+    }
+
     /// Unwrap the `{code, data, msg}` envelope, mapping the API's own error
     /// codes into a typed error that callers can react to.
-    fn unwrap_envelope<T>(status: reqwest::StatusCode, body: &str, what: &str) -> Result<T>
+    ///
+    /// A quota/rate-limit message does not just produce an error — it trips the
+    /// breaker, so every later call in this process stops instead of hammering a
+    /// service that has already told us to go away.
+    fn unwrap_envelope<T>(&self, status: reqwest::StatusCode, body: &str, what: &str) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -198,6 +471,12 @@ impl IyuuClient {
         if msg.contains("token") || msg.contains("Token") {
             return Err(CoreError::IyuuToken(msg));
         }
+        // Checked after the token branch on purpose: "token 超出有效期" is a
+        // credential problem, and telling the user to wait half an hour would be
+        // the wrong advice.
+        if looks_rate_limited(&msg) {
+            return Err(self.trip_breaker(&msg));
+        }
         Err(CoreError::Upstream {
             what: what.to_string(),
             code,
@@ -228,10 +507,17 @@ impl IyuuClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+                let msg = if msg.is_empty() { body } else { msg };
+                // A 429 (or an over-quota message on any status) means stop,
+                // not retry. Checking the body as well covers deployments that
+                // answer 403 with a quota message instead of 429.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || looks_rate_limited(&msg) {
+                    return Err(self.trip_breaker(&msg));
+                }
                 return Err(CoreError::Upstream {
                     what: what.to_string(),
                     code,
-                    msg: if msg.is_empty() { body } else { msg },
+                    msg,
                 });
             }
             return Err(CoreError::Upstream {
@@ -260,13 +546,14 @@ impl IyuuClient {
             }
         }
 
+        self.spend("获取站点列表", 0).await?;
         let req = self
             .http
             .get(self.url("/reseed/sites/index"))
             .header("token", self.token_header()?);
         let body = self.send(req, "获取站点列表").await?;
         let data: SitesData =
-            Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
+            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
 
         // `count` is the server's total, which may exceed `sites.len()` when the
         // account is bound to only part of the catalogue. Log the mismatch
@@ -312,12 +599,13 @@ impl IyuuClient {
             list: Vec<IyuuSite>,
         }
 
+        self.spend("获取推荐站点", 0).await?;
         let req = self
             .http
             .get(self.url("/reseed/sites/recommend"))
             .header("token", self.token_header()?);
         let body = self.send(req, "获取推荐站点").await?;
-        let data: Wrapper = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "获取推荐站点")?;
+        let data: Wrapper = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取推荐站点")?;
         if data.count != len_as_i64(data.list.len()) {
             tracing::debug!(
                 reported = data.count,
@@ -344,13 +632,14 @@ impl IyuuClient {
                 "无可汇报的站点，请先在 IYUU 绑定站点".into(),
             ));
         }
+        self.spend("汇报站点", 0).await?;
         let req = self
             .http
             .post(self.url("/reseed/sites/reportExisting"))
             .header("token", self.token_header()?)
             .json(&serde_json::json!({ "sid_list": sid_list }));
         let body = self.send(req, "汇报站点").await?;
-        let data: SidSha1Data = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
+        let data: SidSha1Data = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
         if data.sid_sha1.is_empty() {
             return Err(CoreError::Upstream {
                 what: "汇报站点".into(),
@@ -437,6 +726,7 @@ impl IyuuClient {
             ("version", IYUU_API_VERSION),
         ];
 
+        self.spend("查询辅种", sorted.len()).await?;
         let req = self
             .http
             .post(self.url("/reseed/index/index"))
@@ -444,7 +734,7 @@ impl IyuuClient {
             .form(&form);
         let body = self.send(req, "查询辅种").await?;
 
-        match Self::unwrap_envelope::<ReseedData>(reqwest::StatusCode::OK, &body, "查询辅种") {
+        match self.unwrap_envelope::<ReseedData>(reqwest::StatusCode::OK, &body, "查询辅种") {
             Ok(data) => Ok(data
                 .per_hash
                 .into_iter()
@@ -463,12 +753,23 @@ impl IyuuClient {
         }
     }
 
-    /// Convenience wrapper: query with automatic chunking and one `sid_sha1`
-    /// refresh-and-retry. Returns per-hash candidates plus non-fatal warnings.
+    /// Convenience wrapper: query with automatic chunking, local budget
+    /// enforcement, and one `sid_sha1` refresh-and-retry. Returns per-hash
+    /// candidates plus non-fatal warnings.
+    ///
+    /// **Quota behaviour.** A run is capped at whatever the local mirror says is
+    /// left, expressed in whole batches: a query costs one request whether it
+    /// carries 1 hash or 200, so sending a 3-hash batch out of a nearly spent
+    /// budget wastes a request. When the cap bites, the remainder is dropped with
+    /// a warning naming it — silently returning fewer results would look like "no
+    /// other sites have these torrents", which is the wrong conclusion.
+    ///
+    /// Exhaustion never fails the run. Partial results are real results, and a
+    /// run that dies with an error throws away the candidates it did find.
     ///
     /// # Errors
-    /// Returns an error when a chunk cannot be queried even after refreshing
-    /// `sid_sha1`.
+    /// Returns an error only when `sid_sha1` cannot be obtained at all (a
+    /// credential problem, not a quota one).
     pub async fn reseed_query_all(
         &self,
         hashes: &[String],
@@ -480,10 +781,43 @@ impl IyuuClient {
             return Ok((out, warnings));
         }
 
-        let mut sid_sha1 = self.ensure_sid_sha1(sid_list).await?;
+        // `sid_sha1` costs a request of its own when the cache is cold, so it is
+        // fetched before the budget is read — otherwise the first run of the day
+        // would overrun by exactly one request.
+        let mut sid_sha1 = match self.ensure_sid_sha1(sid_list).await {
+            Ok(v) => v,
+            Err(CoreError::RateLimited(msg)) => {
+                warnings.push(format!("配额不足，本次未查询任何辅种：{msg}"));
+                return Ok((out, warnings));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let budget = self.budget();
+        let affordable = budget.batches();
+        let total_batches = hashes.len().div_ceil(HASH_CHUNK_SIZE);
+
+        if total_batches == 0 {
+            return Ok((out, warnings));
+        }
+        if affordable < total_batches {
+            let covered = budget.hashes_affordable();
+            warnings.push(format!(
+                "本次 {total_batches} 个批次超出今日剩余额度（可查 {affordable} 批 / {covered} 个种子），\
+                 已优先查询前 {affordable} 个批次，其余 {} 个种子留待下次",
+                hashes.len().saturating_sub(covered)
+            ));
+            tracing::warn!(
+                total_batches,
+                affordable,
+                requested = hashes.len(),
+                "本地配额不足，本次查询已截断"
+            );
+        }
+
         let mut refreshed = false;
 
-        for chunk in hashes.chunks(HASH_CHUNK_SIZE) {
+        for chunk in hashes.chunks(HASH_CHUNK_SIZE).take(affordable) {
             loop {
                 match self.reseed_query(chunk, &sid_sha1).await {
                     Ok(map) => {
@@ -497,7 +831,17 @@ impl IyuuClient {
                         // also rejected, the token itself is the problem.
                         refreshed = true;
                         self.invalidate_sid_sha1();
-                        sid_sha1 = self.report_existing(sid_list).await?;
+                        match self.report_existing(sid_list).await {
+                            Ok(v) => sid_sha1 = v,
+                            // Re-reporting costs another request; if that one is
+                            // also refused we are done for today.
+                            Err(CoreError::RateLimited(msg)) => {
+                                warnings
+                                    .push(format!("刷新站点哈希被限流，提前结束本次查询：{msg}"));
+                                return Ok((out, warnings));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     Err(CoreError::SidSha1Expired(msg)) => {
                         return Err(CoreError::Upstream {
@@ -506,6 +850,14 @@ impl IyuuClient {
                             msg: format!("sid_sha1 在刷新后仍被拒绝：{msg}"),
                         });
                     }
+                    // Quota gone mid-run: keep what we already found and stop.
+                    // This is the case the local mirror exists to avoid, and it
+                    // means IYUU counts something we do not (another client on
+                    // the same token), so continuing is pointless.
+                    Err(e @ CoreError::RateLimited(_)) => {
+                        warnings.push(format!("查询配额耗尽，提前结束：{e}"));
+                        return Ok((out, warnings));
+                    }
                     // A single bad chunk shouldn't kill the whole run.
                     Err(e) => {
                         warnings.push(format!("批次查询失败：{e}"));
@@ -513,8 +865,9 @@ impl IyuuClient {
                     }
                 }
             }
-            // Be a good API citizen: no documented rate limit, but the site does
-            // throttle, and burning that budget gets the token temp-banned.
+            // Pacing between batches. `spend()` already spaces consecutive
+            // requests by the tier interval; this only keeps a tight free-tier
+            // loop from looking like a burst.
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
 
@@ -529,10 +882,11 @@ impl IyuuClient {
     /// # Errors
     /// Returns an error when the request fails or IYUU rejects the credentials.
     pub async fn bind(&self, req: &BindRequest<'_>) -> Result<()> {
+        self.spend("绑定站点", 0).await?;
         let request = self.http.post(self.url("/reseed/users/bind")).form(req);
         let body = self.send(request, "绑定站点").await?;
         let _: serde_json::Value =
-            Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
+            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
         // Binding changes which sites we hold, so both caches are now stale.
         self.invalidate_sid_sha1();
         let mut guard = self.cache.write();
@@ -550,12 +904,13 @@ impl IyuuClient {
         struct TotalData {
             total: i64,
         }
+        self.spend("查站点收录", 0).await?;
         let request = self
             .http
             .get(self.url("/spider/torrent/total"))
             .query(&[("site", site)]);
         let body = self.send(request, "查站点收录").await?;
-        let data: TotalData = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
+        let data: TotalData = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
         Ok(data.total)
     }
 }
@@ -674,6 +1029,115 @@ mod tests {
         assert_eq!(site_scheme(&s), "https");
         s.is_https = 2;
         assert_eq!(site_scheme(&s), "https", "both -> prefer https");
+    }
+
+    // ------------------------------------------------------------- quota
+
+    /// Usage record for "today" with the given counters.
+    fn usage_today(requests: u32, hashes: u32) -> QuotaUsage {
+        QuotaUsage {
+            day: crate::ratelimit::quota_day(Utc::now()),
+            used_requests: requests,
+            used_hashes: hashes,
+        }
+    }
+
+    fn client(tier: ApiTier, usage: &QuotaUsage) -> IyuuClient {
+        IyuuClient::build("token", tier.base_url(), tier)
+            .unwrap()
+            .with_usage(usage)
+    }
+
+    #[test]
+    fn tier_picks_matching_host() {
+        assert_eq!(
+            client(ApiTier::Free, &usage_today(0, 0)).base_url(),
+            "https://2025.iyuu.cn"
+        );
+        assert_eq!(
+            client(ApiTier::Vip, &usage_today(0, 0)).base_url(),
+            "https://vip.iyuu.cn"
+        );
+    }
+
+    #[test]
+    fn persisted_usage_is_restored() {
+        // A restart mid-day must not hand the next run a fresh budget.
+        let c = client(ApiTier::Free, &usage_today(400, 80_000));
+        let snap = c.quota();
+        assert_eq!(snap.used_requests, 400);
+        assert_eq!(snap.remaining_requests, 100);
+    }
+
+    #[test]
+    fn stale_usage_from_yesterday_is_ignored() {
+        let mut usage = usage_today(500, 100_000);
+        usage.day = "2000-01-01".into();
+        let snap = client(ApiTier::Free, &usage).quota();
+        assert_eq!(
+            snap.used_requests, 0,
+            "yesterday's spend must not count today"
+        );
+        assert_eq!(snap.remaining_requests, 500);
+    }
+
+    #[tokio::test]
+    async fn spend_refuses_when_daily_budget_is_gone() {
+        // Already at the free limit: no request may go out, and the error must be
+        // the typed quota one so the caller stops instead of retrying.
+        let c = client(ApiTier::Free, &usage_today(500, 100_000));
+        match c.spend("查询辅种", 200).await {
+            Err(CoreError::RateLimited(msg)) => assert!(msg.contains("已用尽"), "{msg}"),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // A refused request must not be counted as spent.
+        assert_eq!(c.usage().used_requests, 500);
+    }
+
+    #[tokio::test]
+    async fn spend_counts_request_and_hashes() {
+        let c = client(ApiTier::Vip, &usage_today(0, 0));
+        c.spend("查询辅种", 200).await.unwrap();
+        let usage = c.usage();
+        assert_eq!(usage.used_requests, 1);
+        assert_eq!(usage.used_hashes, 200);
+    }
+
+    #[tokio::test]
+    async fn budget_is_the_daily_remainder_not_a_per_run_cap() {
+        // There is no per-run cap: one run is meant to spend whatever the day
+        // still allows, because the account is metered per day, not per run.
+        // Verified through the restored counter rather than by spending 500
+        // requests — each `spend` paces itself, so looping would take minutes.
+        let c = client(ApiTier::Free, &usage_today(1, 200));
+        assert_eq!(
+            c.budget().batches(),
+            499,
+            "one run may use all 499 remaining requests"
+        );
+
+        let c = client(ApiTier::Vip, &usage_today(1, 200));
+        assert_eq!(c.budget().batches(), 2499);
+    }
+
+    #[tokio::test]
+    async fn budget_reports_whole_batches_only() {
+        // 150 requests used of 500 → 350 left; hashes used leave room for 350
+        // batches too, so the request count is the binding constraint.
+        let c = client(ApiTier::Free, &usage_today(150, 30_000));
+        let budget = c.budget();
+        assert_eq!(budget.batches(), 350);
+        assert_eq!(budget.hashes_affordable(), 70_000);
+    }
+
+    #[test]
+    fn breaker_error_reports_cooldown() {
+        let c = client(ApiTier::Free, &usage_today(0, 0));
+        let err = c.trip_breaker("请求过于频繁");
+        assert!(matches!(err, CoreError::RateLimited(_)));
+        // The cooldown must be visible to the engine, which reads `budget()`.
+        assert_eq!(c.budget().batches(), 0);
+        assert!(c.quota().blocked_until.is_some());
     }
 
     #[test]

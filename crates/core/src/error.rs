@@ -35,6 +35,12 @@ pub enum CoreError {
     #[error("sid_sha1 失效：{0}")]
     SidSha1Expired(String),
 
+    /// IYUU rejected a request for going over its rate/quota limit. A distinct
+    /// variant because the correct reaction is "stop calling for a while", not
+    /// "retry" and not "the token is broken".
+    #[error("IYUU 接口限流或超出配额：{0}")]
+    RateLimited(String),
+
     /// The downloader rejected us (auth, version, endpoint missing).
     #[error("下载器错误（{client}）：{msg}")]
     Downloader { client: String, msg: String },

@@ -18,5 +18,6 @@ pub mod error;
 pub mod fetch;
 pub mod iyuu;
 pub mod models;
+pub mod ratelimit;
 
 pub use error::{CoreError, Result};

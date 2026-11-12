@@ -197,8 +197,10 @@ pub async fn discover(
     };
 
     let source_hashes: Vec<String> = sources.iter().map(|t| t.hash.clone()).collect();
+    check_quota_before_query(ctx, &mut out)?;
+
     let (found, warnings) = ctx.iyuu.reseed_query_all(&source_hashes, &sid_list).await?;
-    out.warnings = warnings;
+    out.warnings.extend(warnings);
     stats.queried = len_as_i64(source_hashes.len());
     stats.candidates = found.values().map(|v| len_as_i64(v.len())).sum();
     progress(&stats);
@@ -273,6 +275,44 @@ pub async fn discover(
 /// clamped one.
 fn len_as_i64(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Refuse to start the query phase with no budget, and warn when we are close.
+///
+/// This runs before the first request rather than surfacing later as "0
+/// candidates found", because those two states look identical in the UI and mean
+/// opposite things: one says the sites have nothing, the other says IYUU never
+/// got asked. A warning at 90% exists because the remaining budget often cannot
+/// cover the whole torrent list, and a truncated run should not be a surprise.
+fn check_quota_before_query(ctx: &EngineContext, out: &mut DiscoveryOutcome) -> Result<()> {
+    let quota = ctx.iyuu.quota();
+    if quota.remaining_requests == 0 {
+        let reset = quota.reset_at.map_or_else(
+            || "次日".to_string(),
+            |t| t.format("%m-%d %H:%M").to_string(),
+        );
+        return Err(crate::CoreError::RateLimited(format!(
+            "今日 IYUU 请求额度已用尽（{} 次/天，{}），{reset} 后重置",
+            quota.daily_requests, quota.tier_label,
+        )));
+    }
+
+    tracing::info!(
+        tier = quota.tier_label,
+        used = quota.used_requests,
+        daily = quota.daily_requests,
+        remaining = quota.remaining_requests,
+        "IYUU 今日额度"
+    );
+
+    // `* 10 >= * 9` instead of a float: exact, and no cast lint.
+    if quota.used_requests * 10 >= quota.daily_requests * 9 {
+        out.warnings.push(format!(
+            "IYUU 今日额度已用 {}/{}（{}），剩余额度可能不足以覆盖全部种子",
+            quota.used_requests, quota.daily_requests, quota.tier_label
+        ));
+    }
+    Ok(())
 }
 
 /// Turn the IYUU answer into the concrete work list, applying every skip rule
