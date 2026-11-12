@@ -92,8 +92,17 @@ docker compose up -d --build
 1. 填 IYUU Token（[iyuu.cn](https://iyuu.cn) 获取），**选择会员类型**（普通 / SVIP），
    点「测试连接」。测试会按所选等级真实请求一次，并扣减 2 次额度
 2. 填下载器地址与账号，点「测试连接」
-3. 在「站点凭据」里给准备辅种的站点填 passkey（M-Team 填 API Key，Monika 填 RSS 链接）
-4. 保存 → 回概览页点「开始辅种」
+3. 到左侧「站点凭据」页 → 点「添加站点」，从 IYUU 站点目录里挑要辅种的站点，
+   再填它需要的字段（多数站点只要 passkey；M-Team 填 API Key，Monika 填 RSS 链接）
+
+   > 只辅种你添加过的站点。站点目录有上百个，默认一个都不启用——没添加的站点
+   > 即使 IYUU 有资源也不会去碰，避免把额度花在你不需要的站上。
+
+   > 如果你之前用 IYUU AutoSeed（或 MoviePilot 的辅种插件），可以在这一页点
+   > **「导入备份」** 选它的 `cn_sites_*.json`，不用一个个手填。导入会先做一次预览，
+   > 把「会导入谁 / 跳过谁 / 为什么跳过」列出来再让你确认：AutoSeed 里处于禁用状态的
+   > 站点只会被报告，不会被悄悄开启。
+4. 回概览页点「开始辅种」
 
 > **容器里的地址怎么写**：辅种服务在容器内，`127.0.0.1` 指的是容器自己。qBittorrent 跑在宿主机或局域网其他机器上时，要填宿主的局域网 IP（例如 `http://192.168.0.215:8080`），或者用 `host.docker.internal`（macOS/Windows）与 `--add-host` 显式指定。
 
@@ -308,6 +317,8 @@ environment:
 | GET/PUT | `/config` | 读写配置（密钥只写不回显） |
 | POST | `/test/iyuu` `/test/downloader` | 连通性测试 |
 | GET | `/sites` `/sites/bound` | IYUU 支持/已绑定站点 |
+| PUT/DELETE | `/sites/{sid}/credentials` | 单站点凭据：合并保存 / 删除（删除即停止辅种该站点） |
+| POST | `/sites/import` | 导入 AutoSeed 站点备份（`apply: false` 为预览，不写入） |
 | GET/POST | `/runs` | 任务列表 / 触发任务 |
 | GET | `/runs/progress` | 当前任务实时进度与日志 |
 | POST | `/runs/{id}/cancel` | 取消任务 |

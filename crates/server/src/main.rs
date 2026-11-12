@@ -8,6 +8,7 @@ mod config;
 mod db;
 mod env_config;
 mod error;
+mod importer;
 mod runner;
 mod scheduler;
 

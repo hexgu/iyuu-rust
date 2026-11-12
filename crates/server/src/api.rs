@@ -11,7 +11,7 @@ use crate::error::{Result, ServerError};
 use crate::runner::{self, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use iyuu_core::downloader::Downloader;
 use iyuu_core::iyuu::IyuuClient;
@@ -37,6 +37,16 @@ pub fn router(state: AppState) -> Router {
         .route("/test/downloader", post(test_downloader))
         .route("/sites", get(list_sites))
         .route("/sites/bound", get(list_bound_sites))
+        // Credentials are edited one site at a time: the settings page used to
+        // submit the whole catalogue in one patch, which meant one site's
+        // re-save could not be reasoned about on its own.
+        .route(
+            "/sites/{sid}/credentials",
+            put(put_site_credentials).delete(delete_site_credentials),
+        )
+        // Bulk import of AutoSeed's site export, so migrating does not mean
+        // re-typing every passkey. `apply=false` is a dry run.
+        .route("/sites/import", post(import_sites))
         // runs
         .route("/runs", get(list_runs))
         .route("/runs", post(start_run))
@@ -427,6 +437,208 @@ async fn list_bound_sites(State(state): State<AppState>) -> Result<Json<Value>> 
             "id": s.id, "site": s.site, "nickname": s.nickname,
         })).collect::<Vec<_>>()
     })))
+}
+
+/// Save (or update) the credentials for exactly one site.
+///
+/// Separate from `PUT /config` because the credentials page edits one site at a
+/// time: sending the whole map meant a page that had been open for a while
+/// would rewrite every other site's entry with stale values. Merging server-side
+/// (see [`iyuu_core::iyuu::SiteCredentials::merge_from`]) also lets the blank
+/// secret fields in the form keep meaning "unchanged".
+async fn put_site_credentials(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+    Json(patch): Json<iyuu_core::iyuu::SiteCredentials>,
+) -> Result<Json<Value>> {
+    let sid = parse_site_id(&sid)?;
+    if patch.is_empty() {
+        return Err(ServerError::Config("凭据不能为空".into()));
+    }
+
+    let mut cfg = state.config_snapshot();
+    let entry = cfg.credentials.entry(sid.to_string()).or_default();
+    entry.merge_from(patch);
+
+    // Refuse an entry that ends up with nothing usable: the UI would show it as
+    // configured while the engine has no way to download from the site.
+    if !entry.has_any_credential() {
+        return Err(ServerError::Config("凭据不能为空".into()));
+    }
+
+    cfg.save(&state.db)?;
+    *state.config.write() = cfg.clone();
+    state.push_log(format!("站点 {sid} 凭据已更新"));
+
+    Ok(Json(json!({
+        "ok": true,
+        "config": serde_json::to_value(cfg.public_view()).unwrap_or(Value::Null),
+    })))
+}
+
+/// Remove one site's credentials (delete its entry entirely, so the site stops
+/// being targeted by reseed runs).
+async fn delete_site_credentials(
+    State(state): State<AppState>,
+    Path(sid): Path<String>,
+) -> Result<Json<Value>> {
+    let sid = parse_site_id(&sid)?;
+
+    let mut cfg = state.config_snapshot();
+    if cfg.credentials.remove(&sid.to_string()).is_none() {
+        return Err(ServerError::NotFound(format!("站点 {sid} 未配置凭据")));
+    }
+
+    cfg.save(&state.db)?;
+    *state.config.write() = cfg.clone();
+    state.push_log(format!("站点 {sid} 凭据已删除"));
+
+    Ok(Json(json!({
+        "ok": true,
+        "config": serde_json::to_value(cfg.public_view()).unwrap_or(Value::Null),
+    })))
+}
+
+/// Body of `POST /sites/import`.
+#[derive(Deserialize)]
+struct ImportBody {
+    /// The `AutoSeed` export, either as a JSON string or as already-parsed JSON.
+    ///
+    /// A string is what a `<input type="file">` upload in the browser naturally
+    /// produces, and it keeps the parse error attributable to the file. Pre-parsed
+    /// JSON is accepted too so `curl` can post the file directly.
+    data: Value,
+    /// `false` = dry run: report what would change, write nothing.
+    #[serde(default = "default_true")]
+    apply: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Import `AutoSeed`'s site export into the credential map.
+///
+/// Design choices worth stating, because they are what makes this safe to run on
+/// a file the user did not read:
+///
+/// * **Disabled sites are reported, not imported.** `AutoSeed`'s `disabled` flag
+///   means the user turned that site off on purpose; importing it as a reseed
+///   target would silently start seeding where they had said no.
+/// * **Rows with no credential are ignored.** That is the whole catalogue, which
+///   is the thing this app is not supposed to show.
+/// * **Existing entries are replaced, not merged.** The backup is the authoritative
+///   copy of what the user had; merging would keep a stale value that the file was
+///   supposed to correct. The count is reported so an overwrite is never silent.
+/// * **Nothing secret is echoed back.** The response carries site names and which
+///   *fields* were imported, never values.
+async fn import_sites(
+    State(state): State<AppState>,
+    Json(body): Json<ImportBody>,
+) -> Result<Json<Value>> {
+    // Accept either a JSON string (browser file upload) or the parsed array/object
+    // (curl). Two shapes, because both are reasonable and guessing wrong would
+    // produce a confusing 422.
+    let file: crate::importer::BackupFile = match &body.data {
+        Value::String(raw) => serde_json::from_str(raw).map_err(|e| {
+            ServerError::Config(format!(
+                "无法解析备份文件：{e}（应为 AutoSeed 导出的 JSON）"
+            ))
+        })?,
+        other => serde_json::from_value(other.clone()).map_err(|e| {
+            ServerError::Config(format!(
+                "无法解析备份文件：{e}（应为 AutoSeed 导出的 JSON）"
+            ))
+        })?,
+    };
+
+    let rows = file.into_sites();
+    if rows.is_empty() {
+        return Err(ServerError::Config(
+            "备份文件里没有站点记录（应为 AutoSeed 导出的 JSON 数组）".into(),
+        ));
+    }
+
+    let mut cfg = state.config_snapshot();
+    let mut out = crate::importer::ImportOutcome::default();
+    // Site names are metadata, not secrets — they make the report readable
+    // ("M-Team was skipped") instead of a wall of ids.
+    let mut details: Vec<Value> = Vec::new();
+
+    for row in &rows {
+        let Some(sid) = row.sid.filter(|id| *id > 0) else {
+            out.skipped_unkeyed += 1;
+            continue;
+        };
+        let Some(creds) = crate::importer::credentials_from(row) else {
+            out.skipped_empty += 1;
+            continue;
+        };
+
+        let fields = crate::importer::field_names(&creds);
+        let name = row
+            .nickname
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(row.site.as_deref())
+            .unwrap_or_default()
+            .to_string();
+
+        // Disabled in AutoSeed = the user does not want it. Report, don't apply.
+        if row.disabled == Some(1) {
+            out.skipped_disabled.push(sid);
+            details.push(json!({
+                "sid": sid, "name": name, "fields": fields, "status": "disabled",
+            }));
+            continue;
+        }
+
+        let existed = cfg.credentials.contains_key(&sid.to_string());
+        if existed {
+            out.replaced += 1;
+        }
+        cfg.credentials.insert(sid.to_string(), creds);
+        out.imported.push(sid);
+        details.push(json!({
+            "sid": sid,
+            "name": name,
+            "fields": fields,
+            "status": if existed { "replaced" } else { "imported" },
+        }));
+    }
+
+    let summary = out.summary();
+
+    // A dry run must not touch the stored config — that is the point of asking
+    // for `apply: false`.
+    let config = if body.apply {
+        cfg.save(&state.db)?;
+        *state.config.write() = cfg.clone();
+        state.push_log(&summary);
+        json!(serde_json::to_value(cfg.public_view()).unwrap_or(Value::Null))
+    } else {
+        // The current config, unchanged, so the UI can keep rendering.
+        json!(serde_json::to_value(state.config_snapshot().public_view()).unwrap_or(Value::Null))
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "applied": body.apply,
+        "summary": summary,
+        "imported": out.imported,
+        "skipped_disabled": out.skipped_disabled,
+        "replaced": out.replaced,
+        "skipped_empty": out.skipped_empty,
+        "skipped_unkeyed": out.skipped_unkeyed + out.skipped_invalid,
+        "details": details,
+        "config": config,
+    })))
+}
+
+fn parse_site_id(raw: &str) -> Result<i64> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| ServerError::Config(format!("站点 ID「{raw}」不是数字")))
 }
 
 // --------------------------------------------------------------------- runs

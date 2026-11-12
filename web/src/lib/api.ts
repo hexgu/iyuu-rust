@@ -219,6 +219,8 @@ export interface SiteCredentials {
 
 export interface PublicCredentials {
   has_passkey: boolean
+  /** Some sites (TGG, HDCity) take an authkey instead of a passkey. */
+  has_torrent_key: boolean
   uid: string | null
   has_cookie: boolean
   user_agent: string | null
@@ -230,7 +232,6 @@ export interface ReseedConfig {
   min_size_gib: number
   exclude_tags: string[]
   exclude_paths: string[]
-  site_ids: number[]
   reuse_category: boolean
   default_category: string | null
   tags: string[]
@@ -278,6 +279,28 @@ export interface SiteInfo {
   reseed_check: string
   cookie_required: number
   has_credentials: boolean
+}
+
+/** One row of an import report. Never carries a secret value, only field names. */
+export interface ImportSiteDetail {
+  sid: number
+  name: string
+  fields: string[]
+  status: 'imported' | 'replaced' | 'disabled'
+}
+
+export interface ImportResult {
+  ok: boolean
+  /** `false` when this was a dry run. */
+  applied: boolean
+  summary: string
+  imported: number[]
+  skipped_disabled: number[]
+  replaced: number
+  skipped_empty: number
+  skipped_unkeyed: number
+  details: ImportSiteDetail[]
+  config: PublicConfig
 }
 
 export interface TorrentItem {
@@ -364,6 +387,40 @@ export const api = {
     }),
 
   sites: () => request<{ sites: SiteInfo[] }>('/sites'),
+
+  /**
+   * Save one site's credentials.
+   *
+   * Per-site rather than a whole-map patch: two browser tabs editing different
+   * sites must not overwrite each other, and the blank secret fields in the form
+   * only have a defined meaning ("unchanged") when the server merges into the
+   * stored entry.
+   */
+  putSiteCredentials: (sid: number, body: SiteCredentials) =>
+    request<{ ok: boolean; config: PublicConfig }>(`/sites/${sid}/credentials`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+
+  /**
+   * Import IYUU AutoSeed's site export.
+   *
+   * `apply: false` is a dry run that reports what would change and writes
+   * nothing — the file comes from another app and the user should see the
+   * outcome before it lands in their config.
+   */
+  importSites: (data: string, apply = true) =>
+    request<ImportResult>('/sites/import', {
+      method: 'POST',
+      body: JSON.stringify({ data, apply }),
+    }),
+
+  /** Remove a site entirely, so runs stop targeting it. */
+  deleteSiteCredentials: (sid: number) =>
+    request<{ ok: boolean; config: PublicConfig }>(`/sites/${sid}/credentials`, {
+      method: 'DELETE',
+    }),
+
   boundSites: () =>
     request<{ sites: { id: number; site: string; nickname: string }[] }>('/sites/bound'),
 
