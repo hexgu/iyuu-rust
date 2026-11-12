@@ -18,7 +18,7 @@
 
 use crate::bencode;
 use crate::error::{CoreError, Result};
-use crate::iyuu::{render_download_template, site_scheme, SiteCredentials};
+use crate::iyuu::{SiteCredentials, render_download_template, site_scheme};
 use crate::models::IyuuSite;
 use scraper::{Html, Selector};
 use std::time::Duration;
@@ -114,10 +114,10 @@ pub async fn fetch_torrent(
     // Try the cheap path first even for flavour sites whose template happens to
     // be fully resolvable — a template substitution is one request instead of two.
     let mut candidates: Vec<String> = Vec::new();
-    if matches!(flavor, SiteFlavor::Standard | SiteFlavor::ScrapeDetails) {
-        if let Some(path) = render_download_template(&site.download_page, torrent_id, creds) {
-            candidates.push(join_url(site, &path));
-        }
+    if matches!(flavor, SiteFlavor::Standard | SiteFlavor::ScrapeDetails)
+        && let Some(path) = render_download_template(&site.download_page, torrent_id, creds)
+    {
+        candidates.push(join_url(site, &path));
     }
 
     let mut last_err: Option<CoreError> = None;
@@ -212,8 +212,7 @@ async fn download_and_validate(
     }
     // Detect HTML even when the content-type lies, by looking for a markup prefix.
     let head = &bytes[..bytes.len().min(64)];
-    if head.starts_with(b"<!DOCTYPE") || head.starts_with(b"<html") || head.starts_with(b"<?xml")
-    {
+    if head.starts_with(b"<!DOCTYPE") || head.starts_with(b"<html") || head.starts_with(b"<?xml") {
         return Err(CoreError::TorrentFetch {
             site: site.display_name().to_string(),
             msg: "返回内容是 HTML/XML，不是种子文件".into(),
@@ -376,11 +375,7 @@ pub fn extract_download_link(html: &str, site: &IyuuSite, torrent_id: i64) -> Op
             // Some sites' pages carry the link in an inline script instead of an
             // anchor. Same rule applies: only trust it when it's unambiguous.
             let from_script = extract_from_script(html, site);
-            if all.is_empty() {
-                from_script
-            } else {
-                None
-            }
+            if all.is_empty() { from_script } else { None }
         }
     }
 }
@@ -414,15 +409,19 @@ async fn fetch_mteam(
     torrent_id: i64,
     creds: &SiteCredentials,
 ) -> Result<String> {
-    let api_key = creds.api_key.as_deref().filter(|k| !k.is_empty()).ok_or_else(|| {
-        CoreError::TorrentFetch {
+    let api_key = creds
+        .api_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| CoreError::TorrentFetch {
             site: site.display_name().to_string(),
             msg: "M-Team 需要配置 API Key".into(),
-        }
-    })?;
+        })?;
 
     let host = site.host();
-    let api_host = host.replace("kp.m-team", "api.m-team").replace("m-team", "api.m-team");
+    let api_host = host
+        .replace("kp.m-team", "api.m-team")
+        .replace("m-team", "api.m-team");
     let scheme = site_scheme(site);
     let url = format!("{scheme}://{api_host}/api/torrent/genDlToken");
 
@@ -460,13 +459,13 @@ async fn fetch_mteam(
             msg: format!("genDlToken 失败：{message}"),
         });
     }
-    let link = body
-        .get("data")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CoreError::TorrentFetch {
-            site: site.display_name().to_string(),
-            msg: "genDlToken 未返回下载链接".into(),
-        })?;
+    let link =
+        body.get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CoreError::TorrentFetch {
+                site: site.display_name().to_string(),
+                msg: "genDlToken 未返回下载链接".into(),
+            })?;
     Ok(link.to_string())
 }
 
@@ -478,12 +477,14 @@ async fn fetch_monika(
     creds: &SiteCredentials,
 ) -> Result<String> {
     let _ = http;
-    let rsskey = creds.rsskey.as_deref().filter(|k| !k.is_empty()).ok_or_else(|| {
-        CoreError::TorrentFetch {
+    let rsskey = creds
+        .rsskey
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| CoreError::TorrentFetch {
             site: site.display_name().to_string(),
             msg: "Monika 站点需要配置 RSS 链接（内含 rsskey）".into(),
-        }
-    })?;
+        })?;
     // Accept either a bare key or a full RSS URL.
     let key = if rsskey.contains('/') {
         rsskey
@@ -588,7 +589,10 @@ mod tests {
         let mut s = site("x.org");
         s.is_https = 0;
         assert_eq!(site_scheme(&s), "http");
-        assert_eq!(join_url(&s, "download.php?id=1"), "http://x.org/download.php?id=1");
+        assert_eq!(
+            join_url(&s, "download.php?id=1"),
+            "http://x.org/download.php?id=1"
+        );
     }
 
     #[test]

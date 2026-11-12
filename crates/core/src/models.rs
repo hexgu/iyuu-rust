@@ -55,7 +55,9 @@ pub struct IyuuSite {
 impl IyuuSite {
     /// Host without scheme, e.g. `springsunday.net`.
     pub fn host(&self) -> &str {
-        self.base_url.trim_start_matches("http://").trim_start_matches("https://")
+        self.base_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
     }
 
     /// Best display name available.
@@ -148,8 +150,7 @@ impl TorrentInfo {
                 "metadl" => TorrentPhase::DownloadingMetadata,
                 "missingfiles" => TorrentPhase::MissingFiles,
                 "error" => TorrentPhase::Error,
-                "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup"
-                | "stoppedup" => {
+                "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup" | "stoppedup" => {
                     if self.progress >= 0.999 {
                         TorrentPhase::Complete
                     } else {

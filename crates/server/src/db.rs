@@ -15,12 +15,10 @@
 use crate::error::ServerError;
 use chrono::{DateTime, Utc};
 use iyuu_core::engine::AttemptStore;
-use iyuu_core::models::{
-    ReseedAttempt, ReseedState, Run, RunStats, RunStatus, RunTrigger,
-};
+use iyuu_core::models::{ReseedAttempt, ReseedState, Run, RunStats, RunStatus, RunTrigger};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::collections::HashSet;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -253,9 +251,8 @@ impl Db {
                 }
             }
             None => {
-                let mut stmt = conn.prepare(
-                    "SELECT * FROM attempts ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT * FROM attempts ORDER BY id DESC LIMIT ?1 OFFSET ?2")?;
                 let rows = stmt.query_map(params![limit, offset], map_row)?;
                 for r in rows {
                     out.push(r?);
@@ -268,11 +265,11 @@ impl Db {
     pub fn count_attempts(&self, state: Option<&str>) -> Result<i64, ServerError> {
         let conn = self.pool.get()?;
         let n = match state {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM attempts WHERE state = ?1",
-                [s],
-                |r| r.get(0),
-            )?,
+            Some(s) => {
+                conn.query_row("SELECT COUNT(*) FROM attempts WHERE state = ?1", [s], |r| {
+                    r.get(0)
+                })?
+            }
             None => conn.query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get(0))?,
         };
         Ok(n)
@@ -281,8 +278,7 @@ impl Db {
     /// Per-state counts, for the dashboard.
     pub fn state_counts(&self) -> Result<Vec<(String, i64)>, ServerError> {
         let conn = self.pool.get()?;
-        let mut stmt =
-            conn.prepare("SELECT state, COUNT(*) FROM attempts GROUP BY state")?;
+        let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM attempts GROUP BY state")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -476,7 +472,7 @@ impl AttemptStore for Db {
                  WHERE state IN ('added', 'verifying')
                  ORDER BY COALESCE(verify_started_at, added_at, created_at) ASC",
             )?;
-            let rows = stmt.query_map([], |r| attempt_from_row(r))?;
+            let rows = stmt.query_map([], attempt_from_row)?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await

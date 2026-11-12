@@ -21,7 +21,7 @@ use base64::Engine;
 use chrono::{TimeZone, Utc};
 use parking_lot::RwLock;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 /// The exact field set we request. Transmission errors on unknown names, so this
@@ -148,8 +148,7 @@ impl TransmissionClient {
         } else {
             Some(format!(
                 "Basic {}",
-                base64::engine::general_purpose::STANDARD
-                    .encode(format!("{username}:{password}"))
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
             ))
         };
 
@@ -207,7 +206,7 @@ impl TransmissionClient {
                         return Err(CoreError::Downloader {
                             client: self.name.clone(),
                             msg: "Transmission 会话握手失败（未返回 session-id）".into(),
-                        })
+                        });
                     }
                 }
             }
@@ -311,10 +310,11 @@ impl TransmissionClient {
 
         // Transmission only includes the key when non-empty.
         let raw = out.get("torrents").cloned().unwrap_or_else(|| json!([]));
-        let list: Vec<TrTorrent> = serde_json::from_value(raw).map_err(|e| CoreError::Downloader {
-            client: self.name.clone(),
-            msg: format!("解析种子列表失败：{e}"),
-        })?;
+        let list: Vec<TrTorrent> =
+            serde_json::from_value(raw).map_err(|e| CoreError::Downloader {
+                client: self.name.clone(),
+                msg: format!("解析种子列表失败：{e}"),
+            })?;
         Ok(list.into_iter().map(Self::map_torrent).collect())
     }
 }
@@ -353,12 +353,11 @@ impl Downloader for TransmissionClient {
     }
 
     async fn add_torrent(&self, torrent_bytes: &[u8], opts: &AddTorrentOptions) -> Result<String> {
-        let local_hash = bencode::info_hash_from_torrent(torrent_bytes).map_err(|e| {
-            CoreError::Downloader {
+        let local_hash =
+            bencode::info_hash_from_torrent(torrent_bytes).map_err(|e| CoreError::Downloader {
                 client: self.name.clone(),
                 msg: format!("种子文件解析失败：{e}"),
-            }
-        })?;
+            })?;
         let hex_hash = bencode::hash_to_hex(&local_hash);
 
         let mut args = json!({
@@ -445,11 +444,8 @@ impl Downloader for TransmissionClient {
         }
         let ids: Vec<String> = hashes.iter().map(|h| h.to_ascii_uppercase()).collect();
         for tag in tags {
-            self.rpc(
-                "torrent-set",
-                json!({ "ids": ids, "labels": [tag] }),
-            )
-            .await?;
+            self.rpc("torrent-set", json!({ "ids": ids, "labels": [tag] }))
+                .await?;
         }
         Ok(())
     }

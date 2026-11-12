@@ -68,12 +68,7 @@ struct QbTorrent {
 }
 
 impl QBittorrentClient {
-    pub async fn new(
-        name: &str,
-        base_url: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<Self> {
+    pub async fn new(name: &str, base_url: &str, username: &str, password: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -121,7 +116,10 @@ impl QBittorrentClient {
         if !status.is_success() {
             return Err(CoreError::DownloaderAuth {
                 client: self.name.clone(),
-                msg: format!("HTTP {status}：{}", body.chars().take(200).collect::<String>()),
+                msg: format!(
+                    "HTTP {status}：{}",
+                    body.chars().take(200).collect::<String>()
+                ),
             });
         }
         // qB answers 200 with the literal "Fails." on bad credentials, or
@@ -323,15 +321,15 @@ impl Downloader for QBittorrentClient {
         let app = resp.text().await.unwrap_or_default().trim().to_string();
 
         // WebAPI version drives which endpoint names / params exist.
-        if let Ok(r) = self.http.get(self.api("app/webapiVersion")).send().await {
-            if let Ok(v) = r.text().await {
-                let parsed = parse_version(v.trim());
-                *self.webapi.write() = parsed;
-                if let Some((maj, min, _)) = parsed {
-                    // torrents/stop|start landed in WebAPI 2.11 (qB 5.0).
-                    self.modern
-                        .store(maj > 2 || (maj == 2 && min >= 11), Ordering::Relaxed);
-                }
+        if let Ok(r) = self.http.get(self.api("app/webapiVersion")).send().await
+            && let Ok(v) = r.text().await
+        {
+            let parsed = parse_version(v.trim());
+            *self.webapi.write() = parsed;
+            if let Some((maj, min, _)) = parsed {
+                // torrents/stop|start landed in WebAPI 2.11 (qB 5.0).
+                self.modern
+                    .store(maj > 2 || (maj == 2 && min >= 11), Ordering::Relaxed);
             }
         }
         Ok(app)
@@ -362,12 +360,11 @@ impl Downloader for QBittorrentClient {
     async fn add_torrent(&self, torrent_bytes: &[u8], opts: &AddTorrentOptions) -> Result<String> {
         // Hash locally first: qB's add response carries no hash, and we must
         // verify against something the client actually accepted.
-        let local_hash = bencode::info_hash_from_torrent(torrent_bytes).map_err(|e| {
-            CoreError::Downloader {
+        let local_hash =
+            bencode::info_hash_from_torrent(torrent_bytes).map_err(|e| CoreError::Downloader {
                 client: self.name.clone(),
                 msg: format!("种子文件解析失败：{e}"),
-            }
-        })?;
+            })?;
         let hex_hash = bencode::hash_to_hex(&local_hash);
 
         let part = reqwest::multipart::Part::bytes(torrent_bytes.to_vec())
@@ -409,7 +406,10 @@ impl Downloader for QBittorrentClient {
         let resp = self
             .http
             .post(self.api("torrents/add"))
-            .header(USER_AGENT, concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")))
+            .header(
+                USER_AGENT,
+                concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")),
+            )
             .multipart(form)
             .send()
             .await
@@ -446,7 +446,7 @@ impl Downloader for QBittorrentClient {
         // qB is asynchronous: the add returns before the torrent is queryable.
         for attempt in 0..10 {
             if self
-                .torrents_by_hash(&[hex_hash.clone()])
+                .torrents_by_hash(std::slice::from_ref(&hex_hash))
                 .await
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
@@ -455,12 +455,11 @@ impl Downloader for QBittorrentClient {
             }
             // Fall back to tag lookup, in case qB computed a different v1 hash
             // (hybrid v1/v2 torrents).
-            if let Some(tag) = opts.tags.iter().find(|t| t.starts_with("iyuu-")) {
-                if let Ok(found) = self.info(&[("tag", tag.as_str())]).await {
-                    if let Some(t) = found.first() {
-                        return Ok(bencode::normalize_hash(&t.hash));
-                    }
-                }
+            if let Some(tag) = opts.tags.iter().find(|t| t.starts_with("iyuu-"))
+                && let Ok(found) = self.info(&[("tag", tag.as_str())]).await
+                && let Some(t) = found.first()
+            {
+                return Ok(bencode::normalize_hash(&t.hash));
             }
             tokio::time::sleep(Duration::from_millis(200 * (attempt + 1) as u64)).await;
         }

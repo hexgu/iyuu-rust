@@ -23,8 +23,8 @@ use iyuu_core::iyuu::IyuuClient;
 use iyuu_core::models::{Run, RunStats, RunStatus, RunTrigger};
 use parking_lot::RwLock;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// Live progress of the current (or last) discovery run.
@@ -91,7 +91,10 @@ impl AppState {
 
     pub fn push_log(&self, line: impl Into<String>) {
         let mut p = self.progress.write();
-        p.log.insert(0, format!("{} {}", Utc::now().format("%H:%M:%S"), line.into()));
+        p.log.insert(
+            0,
+            format!("{} {}", Utc::now().format("%H:%M:%S"), line.into()),
+        );
         p.log.truncate(400);
     }
 }
@@ -109,7 +112,12 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
 
-    let iyuu = match cfg.iyuu.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+    let iyuu = match cfg
+        .iyuu
+        .base_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
         None => IyuuClient::new(cfg.iyuu.token.clone())?,
     };
@@ -181,9 +189,11 @@ impl Drop for RunningGuard {
 /// both see it false. `try_lock` makes "one run at a time" an invariant rather
 /// than a race.
 pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<String> {
-    let guard = state.run_gate.clone().try_lock_owned().map_err(|_| {
-        ServerError::Config("已有任务正在运行".into())
-    })?;
+    let guard = state
+        .run_gate
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| ServerError::Config("已有任务正在运行".into()))?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut run = Run {
@@ -238,12 +248,9 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
                 Some(outcome.warnings.join("；"))
             };
 
-            state.db.finish_run(
-                &run_id,
-                run.status,
-                &run.stats,
-                run.message.as_deref(),
-            )?;
+            state
+                .db
+                .finish_run(&run_id, run.status, &run.stats, run.message.as_deref())?;
 
             {
                 let mut p = state.progress.write();
@@ -257,7 +264,7 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
                 };
             }
 
-                    state.push_log(format!(
+            state.push_log(format!(
                 "完成：新增 {}，已存在 {}，失败 {}（校验不通过 {}）",
                 run.stats.added,
                 run.stats.existed,
@@ -271,12 +278,10 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
             run.status = RunStatus::Failed;
             run.finished_at = Some(Utc::now());
             run.message = Some(e.to_string());
-            let _ = state.db.finish_run(
-                &run_id,
-                RunStatus::Failed,
-                &run.stats,
-                Some(&e.to_string()),
-            );
+            let _ =
+                state
+                    .db
+                    .finish_run(&run_id, RunStatus::Failed, &run.stats, Some(&e.to_string()));
             {
                 let mut p = state.progress.write();
                 p.running = false;
@@ -317,14 +322,7 @@ async fn run_inner(
         p.phase = "processing".into();
     };
 
-    let outcome = engine::discover(
-        &ctx,
-        &state.db,
-        run_id,
-        cancel,
-        &on_progress,
-    )
-    .await?;
+    let outcome = engine::discover(&ctx, &state.db, run_id, cancel, &on_progress).await?;
 
     for w in &outcome.warnings {
         state.push_log(format!("警告：{w}"));
@@ -374,12 +372,12 @@ pub async fn verification_loop(state: AppState) {
 
         // Skip while discovery is adding torrents: those adds are tracked by the
         // run itself, and polling mid-add produces half-initialized reads.
-        if !state.is_running.load(Ordering::SeqCst) {
-            if let Err(e) = verify_once(&state).await {
-                // Connection failures are expected (downloader restart) — log at
-                // debug level so the UI log doesn't fill with noise.
-                tracing::debug!(error = %e, "校验巡检失败");
-            }
+        if !state.is_running.load(Ordering::SeqCst)
+            && let Err(e) = verify_once(&state).await
+        {
+            // Connection failures are expected (downloader restart) — log at
+            // debug level so the UI log doesn't fill with noise.
+            tracing::debug!(error = %e, "校验巡检失败");
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;

@@ -17,11 +17,11 @@
 //! disabled or IYUU is down, and that a restart resumes rather than loses.
 
 use crate::bencode;
-use crate::downloader::qbittorrent::{site_tag, IYUU_TAG};
+use crate::downloader::qbittorrent::{IYUU_TAG, site_tag};
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::Result;
 use crate::fetch::fetch_torrent;
-use crate::iyuu::{IyuuClient, SiteCredentials, HASH_CHUNK_SIZE};
+use crate::iyuu::{HASH_CHUNK_SIZE, IyuuClient, SiteCredentials};
 use crate::models::*;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
@@ -96,12 +96,7 @@ pub struct EngineContext {
 #[async_trait::async_trait]
 pub trait AttemptStore: Send + Sync {
     async fn upsert_attempt(&self, attempt: &mut ReseedAttempt) -> Result<i64>;
-    async fn update_state(
-        &self,
-        id: i64,
-        state: ReseedState,
-        message: Option<&str>,
-    ) -> Result<()>;
+    async fn update_state(&self, id: i64, state: ReseedState, message: Option<&str>) -> Result<()>;
     async fn update_check(
         &self,
         id: i64,
@@ -215,11 +210,11 @@ pub async fn discover(
                 stats.skipped += 1;
                 continue;
             }
-            if let Some(restrict) = site_filter(&ctx.config, cand.sid) {
-                if !restrict {
-                    stats.skipped += 1;
-                    continue;
-                }
+            if let Some(restrict) = site_filter(&ctx.config, cand.sid)
+                && !restrict
+            {
+                stats.skipped += 1;
+                continue;
             }
             if !seen_targets.insert(target.clone()) {
                 continue;
@@ -351,7 +346,10 @@ fn filter_source(t: &TorrentInfo, cfg: &DiscoveryConfig) -> std::result::Result<
 
     // Skip our own cross-seeds: seeding them again from themselves would be a
     // no-op at best and a duplicate-add loop at worst.
-    if t.tags.iter().any(|tag| tag == IYUU_TAG || tag.starts_with(&format!("{IYUU_TAG}:"))) {
+    if t.tags
+        .iter()
+        .any(|tag| tag == IYUU_TAG || tag.starts_with(&format!("{IYUU_TAG}:")))
+    {
         return Err("本身即为辅种");
     }
     for excluded in &cfg.exclude_tags {
@@ -412,7 +410,10 @@ async fn process_job(
     run_id: &str,
 ) -> JobResult {
     let cand = &job.candidate;
-    let site = site_map.get(&cand.sid).cloned().unwrap_or_else(|| job.site.clone());
+    let site = site_map
+        .get(&cand.sid)
+        .cloned()
+        .unwrap_or_else(|| job.site.clone());
     let creds = ctx.credentials.get(&cand.sid).cloned().unwrap_or_default();
     let target = bencode::normalize_hash(&cand.info_hash);
 
@@ -424,7 +425,7 @@ async fn process_job(
                 attempt: None,
                 outcome: JobOutcome::Skipped,
                 message: Some("已在下载器中".into()),
-            }
+            };
         }
         Ok(None) => {}
         Err(e) => {
@@ -432,24 +433,17 @@ async fn process_job(
         }
     }
 
-    let fetched = match fetch_torrent(
-        &ctx.http,
-        &site,
-        cand.torrent_id,
-        &creds,
-        Some(&target),
-    )
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            return JobResult {
-                attempt: None,
-                outcome: JobOutcome::FetchFailed,
-                message: Some(format!("{}: {e}", site.display_name())),
+    let fetched =
+        match fetch_torrent(&ctx.http, &site, cand.torrent_id, &creds, Some(&target)).await {
+            Ok(f) => f,
+            Err(e) => {
+                return JobResult {
+                    attempt: None,
+                    outcome: JobOutcome::FetchFailed,
+                    message: Some(format!("{}: {e}", site.display_name())),
+                };
             }
-        }
-    };
+        };
 
     if ctx.config.dry_run {
         let mut attempt = new_attempt(job, &site, &target, run_id);
@@ -557,10 +551,7 @@ async fn apply_job_result(
     if let Some(mut attempt) = result.attempt {
         match store.upsert_attempt(&mut attempt).await {
             Ok(id) => {
-                if matches!(
-                    attempt.state,
-                    ReseedState::Added | ReseedState::Verifying
-                ) {
+                if matches!(attempt.state, ReseedState::Added | ReseedState::Verifying) {
                     out.new_attempt_ids.push(id);
                 }
             }
@@ -679,14 +670,13 @@ pub async fn verify_pending(
                 TorrentPhase::Complete if info.progress >= 0.999 => {
                     // Success. Only now can we say the cross-seed works.
                     out.promoted += 1;
-                    if ctx.config.auto_start_after_verify {
-                        if let Err(e) = ctx
+                    if ctx.config.auto_start_after_verify
+                        && let Err(e) = ctx
                             .downloader
                             .start(std::slice::from_ref(&attempt.target_info_hash))
                             .await
-                        {
-                            tracing::warn!(hash = %attempt.target_info_hash, error = %e, "启动辅种失败");
-                        }
+                    {
+                        tracing::warn!(hash = %attempt.target_info_hash, error = %e, "启动辅种失败");
                     }
                     if let Err(e) = ctx
                         .downloader
@@ -758,14 +748,13 @@ pub async fn verify_pending(
                     if verify_pending_state && attempt.check_count <= 3 {
                         // Give it a nudge: without this, a qB that ignored the
                         // recheck request sits at 0% forever.
-                        if attempt.check_count == 0 {
-                            if let Err(e) = ctx
+                        if attempt.check_count == 0
+                            && let Err(e) = ctx
                                 .downloader
                                 .recheck(std::slice::from_ref(&attempt.target_info_hash))
                                 .await
-                            {
-                                tracing::debug!(error = %e, "补发校验失败");
-                            }
+                        {
+                            tracing::debug!(error = %e, "补发校验失败");
                         }
                         out.still_waiting += 1;
                         store
@@ -862,25 +851,37 @@ mod tests {
     #[test]
     fn rejects_incomplete_sources() {
         let t = torrent("a", 0.5, "downloading");
-        assert_eq!(filter_source(&t, &DiscoveryConfig::default()), Err("未完成下载"));
+        assert_eq!(
+            filter_source(&t, &DiscoveryConfig::default()),
+            Err("未完成下载")
+        );
     }
 
     #[test]
     fn rejects_checking_sources() {
         let t = torrent("a", 1.0, "checkingDL");
-        assert_eq!(filter_source(&t, &DiscoveryConfig::default()), Err("正在校验"));
+        assert_eq!(
+            filter_source(&t, &DiscoveryConfig::default()),
+            Err("正在校验")
+        );
     }
 
     #[test]
     fn rejects_our_own_cross_seeds() {
         let mut t = torrent("a", 1.0, "uploading");
         t.tags = vec![IYUU_TAG.to_string()];
-        assert_eq!(filter_source(&t, &DiscoveryConfig::default()), Err("本身即为辅种"));
+        assert_eq!(
+            filter_source(&t, &DiscoveryConfig::default()),
+            Err("本身即为辅种")
+        );
 
         // Site-suffixed variant must also be recognized.
         let mut t2 = torrent("b", 1.0, "uploading");
         t2.tags = vec![site_tag("springsunday")];
-        assert_eq!(filter_source(&t2, &DiscoveryConfig::default()), Err("本身即为辅种"));
+        assert_eq!(
+            filter_source(&t2, &DiscoveryConfig::default()),
+            Err("本身即为辅种")
+        );
     }
 
     #[test]

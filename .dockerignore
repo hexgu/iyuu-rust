@@ -1,6 +1,9 @@
+# Build context hygiene: keep the image build fast and free of host state.
 target
 web/node_modules
 web/dist
 data
 .git
+.agents
 *.log
+*.tsbuildinfo

@@ -13,8 +13,8 @@ use crate::runner::{self, AppState};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use iyuu_core::models::RunTrigger;
 use parking_lot::Mutex;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 
 pub struct Scheduler {
@@ -43,28 +43,28 @@ async fn loop_task(state: AppState) {
 
     loop {
         let cfg = state.config_snapshot();
-        if cfg.schedule.enabled {
-            if let Some(schedule) = parse_cron(&cfg.schedule.cron) {
-                let now = chrono::Local::now();
-                let minute_key = now.format("%Y-%m-%d %H:%M").to_string();
+        if cfg.schedule.enabled
+            && let Some(schedule) = parse_cron(&cfg.schedule.cron)
+        {
+            let now = chrono::Local::now();
+            let minute_key = now.format("%Y-%m-%d %H:%M").to_string();
 
-                if last_fired.as_deref() != Some(minute_key.as_str())
-                    && schedule.matches(now.with_timezone(&Utc))
-                {
-                    last_fired = Some(minute_key);
-                    if state.is_running.load(Ordering::SeqCst) {
-                        state.push_log("定时任务跳过：已有任务在运行");
-                    } else {
-                        state.push_log(format!("定时任务触发（{}）", cfg.schedule.cron));
-                        let state2 = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                runner::execute_discovery(&state2, RunTrigger::Schedule).await
-                            {
-                                state2.push_log(format!("定时任务失败：{e}"));
-                            }
-                        });
-                    }
+            if last_fired.as_deref() != Some(minute_key.as_str())
+                && schedule.matches(now.with_timezone(&Utc))
+            {
+                last_fired = Some(minute_key);
+                if state.is_running.load(Ordering::SeqCst) {
+                    state.push_log("定时任务跳过：已有任务在运行");
+                } else {
+                    state.push_log(format!("定时任务触发（{}）", cfg.schedule.cron));
+                    let state2 = state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            runner::execute_discovery(&state2, RunTrigger::Schedule).await
+                        {
+                            state2.push_log(format!("定时任务失败：{e}"));
+                        }
+                    });
                 }
             }
         }
@@ -115,11 +115,7 @@ impl Field {
             } else {
                 let v: u32 = range_part.parse().ok()?;
                 // A bare value with a step (`5/2`) means "5 to max".
-                if step > 1 {
-                    (v, max)
-                } else {
-                    (v, v)
-                }
+                if step > 1 { (v, max) } else { (v, v) }
             };
 
             if start > end || end > max || start < min {
@@ -179,7 +175,9 @@ impl Schedule {
         // fires when EITHER matches. Respecting this avoids surprising users who
         // copy a cron expression from elsewhere.
         let dom_match = self.days_of_month.matches(now.day());
-        let dow_match = self.days_of_week.matches(now.weekday().num_days_from_sunday());
+        let dow_match = self
+            .days_of_week
+            .matches(now.weekday().num_days_from_sunday());
         match (
             self.days_of_month.is_wildcard,
             self.days_of_week.is_wildcard,
@@ -287,6 +285,9 @@ mod tests {
         // 12th OR Thursday: the 1st of the month (not Thursday) still matches.
         let s = Schedule::parse("0 0 1 * 4").unwrap();
         let t = Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap();
-        assert!(s.matches(t), "day-of-month match should fire even if not Thursday");
+        assert!(
+            s.matches(t),
+            "day-of-month match should fire even if not Thursday"
+        );
     }
 }

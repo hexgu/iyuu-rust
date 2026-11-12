@@ -229,10 +229,10 @@ impl IyuuClient {
     pub async fn sites(&self, force: bool) -> Result<Vec<IyuuSite>> {
         if !force {
             let guard = self.cache.read();
-            if let (Some(sites), Some(at)) = (&guard.sites, guard.sites_fetched_at) {
-                if at.elapsed() < SITES_TTL {
-                    return Ok(sites.clone());
-                }
+            if let (Some(sites), Some(at)) = (&guard.sites, guard.sites_fetched_at)
+                && at.elapsed() < SITES_TTL
+            {
+                return Ok(sites.clone());
             }
         }
 
@@ -241,7 +241,8 @@ impl IyuuClient {
             .get(self.url("/reseed/sites/index"))
             .header("token", self.token_header()?);
         let body = self.send(req, "获取站点列表").await?;
-        let data: SitesData = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
+        let data: SitesData =
+            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
 
         let mut guard = self.cache.write();
         guard.sites = Some(data.sites.clone());
@@ -299,8 +300,7 @@ impl IyuuClient {
             .header("token", self.token_header()?)
             .json(&serde_json::json!({ "sid_list": sid_list }));
         let body = self.send(req, "汇报站点").await?;
-        let data: SidSha1Data =
-            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
+        let data: SidSha1Data = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
         if data.sid_sha1.is_empty() {
             return Err(CoreError::Upstream {
                 what: "汇报站点".into(),
@@ -319,10 +319,10 @@ impl IyuuClient {
     pub async fn ensure_sid_sha1(&self, sid_list: &[i64]) -> Result<String> {
         {
             let guard = self.cache.read();
-            if let (Some(v), Some(at)) = (&guard.sid_sha1, guard.sid_sha1_at) {
-                if at.elapsed() < SID_SHA1_TTL {
-                    return Ok(v.clone());
-                }
+            if let (Some(v), Some(at)) = (&guard.sid_sha1, guard.sid_sha1_at)
+                && at.elapsed() < SID_SHA1_TTL
+            {
+                return Ok(v.clone());
             }
         }
         self.report_existing(sid_list).await
@@ -466,10 +466,7 @@ impl IyuuClient {
     pub async fn bind(&self, req: &BindRequest<'_>) -> Result<()> {
         let form = reqwest::Client::new();
         let _ = form;
-        let request = self
-            .http
-            .post(self.url("/reseed/users/bind"))
-            .form(req);
+        let request = self.http.post(self.url("/reseed/users/bind")).form(req);
         let body = self.send(request, "绑定站点").await?;
         let _: serde_json::Value =
             self.unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
@@ -491,8 +488,7 @@ impl IyuuClient {
             .get(self.url("/spider/torrent/total"))
             .query(&[("site", site)]);
         let body = self.send(request, "查站点收录").await?;
-        let data: TotalData =
-            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
+        let data: TotalData = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
         Ok(data.total)
     }
 }

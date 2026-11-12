@@ -3,9 +3,9 @@
 //! The mapping matters for the UI: a bad token must not look like a transient
 //! network blip, and a downloader auth failure must not look like "no results".
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 #[derive(Debug)]

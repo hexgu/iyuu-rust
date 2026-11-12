@@ -17,7 +17,7 @@ use iyuu_core::downloader::Downloader;
 use iyuu_core::iyuu::IyuuClient;
 use iyuu_core::models::RunTrigger;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -156,7 +156,12 @@ async fn test_iyuu(
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
 
-    let client = match cfg.iyuu.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+    let client = match cfg
+        .iyuu
+        .base_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(base) => IyuuClient::with_base_url(token, base)?,
         None => IyuuClient::new(token)?,
     };
@@ -197,8 +202,12 @@ async fn test_downloader(
         None => cfg.downloader.kind()?,
     };
 
-    let base_url = body.base_url.unwrap_or_else(|| cfg.downloader.base_url.clone());
-    let username = body.username.unwrap_or_else(|| cfg.downloader.username.clone());
+    let base_url = body
+        .base_url
+        .unwrap_or_else(|| cfg.downloader.base_url.clone());
+    let username = body
+        .username
+        .unwrap_or_else(|| cfg.downloader.username.clone());
     // An empty password means "use the saved one", matching the patch semantics.
     let password = body
         .password
@@ -210,8 +219,8 @@ async fn test_downloader(
             .or_else(|| cfg.downloader.extra.transmission_rpc_path.clone()),
     };
 
-    let dl = iyuu_core::downloader::build(kind, "test", &base_url, &username, &password, &extra)
-        .await?;
+    let dl =
+        iyuu_core::downloader::build(kind, "test", &base_url, &username, &password, &extra).await?;
     let version = dl.version().await?;
     let torrents = dl.list_torrents().await?;
     let complete = torrents.iter().filter(|t| t.is_verified_complete()).count();
@@ -230,7 +239,12 @@ async fn list_sites(State(state): State<AppState>) -> Result<Json<Value>> {
     if cfg.iyuu.token.is_empty() {
         return Err(ServerError::IyuuAuth("尚未配置 IYUU Token".into()));
     }
-    let client = match cfg.iyuu.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+    let client = match cfg
+        .iyuu
+        .base_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
         None => IyuuClient::new(cfg.iyuu.token.clone())?,
     };
@@ -269,7 +283,12 @@ async fn list_bound_sites(State(state): State<AppState>) -> Result<Json<Value>> 
     if cfg.iyuu.token.is_empty() {
         return Err(ServerError::IyuuAuth("尚未配置 IYUU Token".into()));
     }
-    let client = match cfg.iyuu.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+    let client = match cfg
+        .iyuu
+        .base_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
         None => IyuuClient::new(cfg.iyuu.token.clone())?,
     };
@@ -408,10 +427,7 @@ async fn requeue_attempt(
     Ok(Json(json!({"ok": true})))
 }
 
-async fn delete_attempt(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>> {
+async fn delete_attempt(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Value>> {
     if state.db.get_attempt(id)?.is_none() {
         return Err(ServerError::NotFound(format!("辅种记录 {id}")));
     }
@@ -453,10 +469,7 @@ async fn list_torrents(
         .filter(|t| match filter.as_str() {
             "complete" => t.is_verified_complete(),
             "incomplete" => !t.is_verified_complete(),
-            "checking" => matches!(
-                t.phase(),
-                iyuu_core::models::TorrentPhase::Checking
-            ),
+            "checking" => matches!(t.phase(), iyuu_core::models::TorrentPhase::Checking),
             "error" => matches!(
                 t.phase(),
                 iyuu_core::models::TorrentPhase::Error
@@ -524,4 +537,3 @@ async fn downloader_summary(State(state): State<AppState>) -> Result<Json<Value>
         "uploaded": uploaded,
     })))
 }
-

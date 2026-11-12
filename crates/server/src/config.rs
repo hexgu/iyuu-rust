@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 const SETTINGS_KEY: &str = "app_config";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub iyuu: IyuuConfig,
@@ -79,9 +79,8 @@ impl Default for DownloaderConfig {
 
 impl DownloaderConfig {
     pub fn kind(&self) -> std::result::Result<DownloaderKind, ServerError> {
-        DownloaderKind::parse(&self.kind).ok_or_else(|| {
-            ServerError::Config(format!("未知的下载器类型：{}", self.kind))
-        })
+        DownloaderKind::parse(&self.kind)
+            .ok_or_else(|| ServerError::Config(format!("未知的下载器类型：{}", self.kind)))
     }
 }
 
@@ -186,25 +185,11 @@ pub struct UiConfig {
     pub language: Option<String>,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            iyuu: IyuuConfig::default(),
-            downloader: DownloaderConfig::default(),
-            reseed: ReseedConfig::default(),
-            credentials: HashMap::new(),
-            schedule: ScheduleConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
-}
-
 impl AppConfig {
     pub fn load(db: &Db) -> Result<Self> {
         match db.get_setting(SETTINGS_KEY)? {
-            Some(raw) => serde_json::from_str(&raw).map_err(|e| {
-                ServerError::Config(format!("已保存的配置无法解析：{e}"))
-            }),
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|e| ServerError::Config(format!("已保存的配置无法解析：{e}"))),
             None => Ok(Self::default()),
         }
     }
@@ -322,11 +307,19 @@ impl AppConfig {
                     (
                         k.clone(),
                         PublicCredentials {
-                            has_passkey: v.passkey.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                            has_passkey: v
+                                .passkey
+                                .as_deref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false),
                             uid: v.uid.clone(),
                             has_cookie: v.cookie.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
                             user_agent: v.user_agent.clone(),
-                            has_api_key: v.api_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                            has_api_key: v
+                                .api_key
+                                .as_deref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false),
                             has_rsskey: v.rsskey.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
                         },
                     )
@@ -394,10 +387,10 @@ impl AppConfig {
             }
             // Empty password on a patch means "unchanged": a form re-submit with
             // a blank password field must not wipe a working credential.
-            if let Some(v) = p.password {
-                if !v.is_empty() {
-                    self.downloader.password = v;
-                }
+            if let Some(v) = p.password
+                && !v.is_empty()
+            {
+                self.downloader.password = v;
             }
             if let Some(v) = p.extra {
                 self.downloader.extra = v;

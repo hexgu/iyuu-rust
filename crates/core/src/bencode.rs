@@ -92,7 +92,10 @@ impl Value {
 
 /// Decode a full bencode document.
 pub fn decode(input: &[u8]) -> Result<Value> {
-    let mut cursor = Cursor { data: input, pos: 0 };
+    let mut cursor = Cursor {
+        data: input,
+        pos: 0,
+    };
     let value = cursor.parse_value()?;
     if cursor.pos != input.len() {
         return Err(BencodeError::TrailingBytes);
@@ -111,7 +114,10 @@ pub struct InfoSpan {
 /// walk the top-level dict, and when the key is `info`, remember where the
 /// value starts and where it ends.
 pub fn find_info_span(input: &[u8]) -> Result<InfoSpan> {
-    let mut cursor = Cursor { data: input, pos: 0 };
+    let mut cursor = Cursor {
+        data: input,
+        pos: 0,
+    };
     if cursor.peek()? != b'd' {
         return Err(BencodeError::InvalidType(cursor.peek()?));
     }
@@ -238,7 +244,10 @@ impl<'a> Cursor<'a> {
             return Err(BencodeError::InvalidLength);
         }
         self.pos += 1;
-        let end = self.pos.checked_add(len).ok_or(BencodeError::InvalidLength)?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(BencodeError::InvalidLength)?;
         if end > self.data.len() {
             return Err(BencodeError::UnexpectedEof);
         }
@@ -318,24 +327,26 @@ mod tests {
     fn decodes_ints_strings_lists_dicts() {
         let v = decode(b"d3:agei30e4:name4:anny5:itemsl1:a1:bee").unwrap();
         assert_eq!(v.get("age").unwrap().as_int(), Some(30));
-        assert_eq!(v.get("name").unwrap().as_str_lossy().as_deref(), Some("anny"));
+        assert_eq!(
+            v.get("name").unwrap().as_str_lossy().as_deref(),
+            Some("anny")
+        );
         assert_eq!(v.get("items").unwrap().as_list().unwrap().len(), 2);
     }
 
     #[test]
     fn rejects_trailing_bytes() {
-        assert!(matches!(
-            decode(b"i1ee"),
-            Err(BencodeError::TrailingBytes)
-        ));
+        assert!(matches!(decode(b"i1ee"), Err(BencodeError::TrailingBytes)));
     }
 
     #[test]
     fn info_hash_uses_raw_bytes_not_reserialized() {
         // Two torrents with the same info keys in different order MUST hash
         // differently — this is why we hash the original span.
-        let a = b"d4:infod4:name1:a6:lengthi1e12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        let b = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let a =
+            b"d4:infod4:name1:a6:lengthi1e12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let b =
+            b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         let ha = info_hash_from_torrent(a).unwrap();
         let hb = info_hash_from_torrent(b).unwrap();
         assert_ne!(ha, hb);

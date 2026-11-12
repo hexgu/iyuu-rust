@@ -156,15 +156,15 @@ fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router {
                 if !path.is_empty() && path.contains('.') {
                     let candidate = dir.join(&path);
                     // Reject traversal: a `..` segment must never escape web_dir.
-                    if !path.split('/').any(|seg| seg == "..") {
-                        if let Ok(bytes) = tokio::fs::read(&candidate).await {
-                            let ctype = guess_content_type(&candidate);
-                            return (
-                                [(axum::http::header::CONTENT_TYPE, ctype)],
-                                Body::from(bytes),
-                            )
-                                .into_response();
-                        }
+                    if !path.split('/').any(|seg| seg == "..")
+                        && let Ok(bytes) = tokio::fs::read(&candidate).await
+                    {
+                        let ctype = guess_content_type(&candidate);
+                        return (
+                            [(axum::http::header::CONTENT_TYPE, ctype)],
+                            Body::from(bytes),
+                        )
+                            .into_response();
                     }
                 }
 
