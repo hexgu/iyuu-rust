@@ -1,6 +1,6 @@
 //! Domain models shared by the engine, the downloader adapters, and the API.
 //!
-//! The state machine here is deliberately richer than what MoviePilot's plugin
+//! The state machine here is deliberately richer than what `MoviePilot`'s plugin
 //! does, because the failure modes seen in production were all state-machine
 //! gaps:
 //!
@@ -54,6 +54,7 @@ pub struct IyuuSite {
 
 impl IyuuSite {
     /// Host without scheme, e.g. `springsunday.net`.
+    #[must_use]
     pub fn host(&self) -> &str {
         self.base_url
             .trim_start_matches("http://")
@@ -61,6 +62,7 @@ impl IyuuSite {
     }
 
     /// Best display name available.
+    #[must_use]
     pub fn display_name(&self) -> &str {
         if self.nickname.is_empty() {
             &self.site
@@ -92,6 +94,7 @@ pub enum DownloaderKind {
 }
 
 impl DownloaderKind {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Qbittorrent => "qbittorrent",
@@ -99,6 +102,7 @@ impl DownloaderKind {
         }
     }
 
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "qbittorrent" | "qb" | "qbit" => Some(Self::Qbittorrent),
@@ -139,6 +143,7 @@ pub struct TorrentInfo {
 
 impl TorrentInfo {
     /// Client-agnostic interpretation of the raw state.
+    #[must_use]
     pub fn phase(&self) -> TorrentPhase {
         let s = self.state.to_ascii_lowercase();
         match self.kind {
@@ -150,14 +155,10 @@ impl TorrentInfo {
                 "metadl" => TorrentPhase::DownloadingMetadata,
                 "missingfiles" => TorrentPhase::MissingFiles,
                 "error" => TorrentPhase::Error,
-                "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup" | "stoppedup" => {
-                    if self.progress >= 0.999 {
-                        TorrentPhase::Complete
-                    } else {
-                        TorrentPhase::Incomplete
-                    }
-                }
-                "downloading" | "stalleddl" | "queueddl" | "forceddl" | "pauseddl"
+                // Uploading, queued, paused and downloading states all mean the
+                // same thing to us: done or not done, judged by progress alone.
+                "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup" | "stoppedup"
+                | "downloading" | "stalleddl" | "queueddl" | "forceddl" | "pauseddl"
                 | "stoppeddl" | "allocating" | "moving" => {
                     if self.progress >= 0.999 {
                         TorrentPhase::Complete
@@ -188,6 +189,7 @@ impl TorrentInfo {
     /// True when the data is verified intact and the torrent is seeding (or
     /// held complete). This is the ONLY condition under which a cross-seed
     /// counts as successful.
+    #[must_use]
     pub fn is_verified_complete(&self) -> bool {
         matches!(self.phase(), TorrentPhase::Complete) && self.progress >= 0.999
     }
@@ -247,6 +249,7 @@ pub enum ReseedState {
 }
 
 impl ReseedState {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -263,8 +266,18 @@ impl ReseedState {
         }
     }
 
+    /// Parse the persisted string form. Anything unrecognised falls back to
+    /// `Pending`, which re-examines the torrent on the next sweep rather than
+    /// dropping the attempt on the floor.
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
+            // Spelled out rather than folded into the wildcard: listing it keeps
+            // the mapping symmetric with `as_str`.
+            #[expect(
+                clippy::match_same_arms,
+                reason = "explicit round-trip with as_str beats a shorter wildcard"
+            )]
             "pending" => Self::Pending,
             "skipped" => Self::Skipped,
             "fetching" => Self::Fetching,
@@ -281,6 +294,7 @@ impl ReseedState {
     }
 
     /// Terminal states never get retried automatically.
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -295,6 +309,7 @@ impl ReseedState {
     }
 
     /// States the verification worker should keep polling.
+    #[must_use]
     pub fn awaiting_verification(&self) -> bool {
         matches!(self, Self::Added | Self::Verifying)
     }
@@ -302,8 +317,8 @@ impl ReseedState {
 
 /// A single cross-seed attempt, persisted.
 ///
-/// One row per (source_torrent_hash, target_site, target_info_hash). Persisting
-/// this is what makes the queue survive a restart — the MoviePilot plugin keeps
+/// One row per (`source_torrent_hash`, `target_site`, `target_info_hash`). Persisting
+/// this is what makes the queue survive a restart — the `MoviePilot` plugin keeps
 /// it in a Python dict and loses every in-flight verification on restart, which
 /// is why torrents get stranded in `paused` forever.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +350,7 @@ impl ReseedAttempt {
     /// Backoff for verification polling: fast at first (a small torrent verifies
     /// in seconds), then progressively slower so a huge one doesn't hammer the
     /// API. Capped so we still notice completion promptly.
+    #[must_use]
     pub fn next_check_delay(&self) -> std::time::Duration {
         let secs = match self.check_count {
             0 => 5,
@@ -368,6 +384,7 @@ pub enum RunTrigger {
 }
 
 impl RunTrigger {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Manual => "manual",
@@ -376,6 +393,7 @@ impl RunTrigger {
         }
     }
 
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
             "schedule" => Self::Schedule,
@@ -395,6 +413,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -404,6 +423,7 @@ impl RunStatus {
         }
     }
 
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         match s {
             "completed" => Self::Completed,
@@ -416,7 +436,7 @@ impl RunStatus {
 
 /// Aggregated counters for a run. Note `seeding` vs `added`: we track both,
 /// because reporting only "added" is exactly the misleading metric that made the
-/// MoviePilot plugin's numbers useless.
+/// `MoviePilot` plugin's numbers useless.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunStats {
     /// Source torrents scanned in the downloader.

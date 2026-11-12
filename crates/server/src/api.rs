@@ -67,6 +67,12 @@ async fn version() -> Json<Value> {
     }))
 }
 
+// Health flags are shipped as flat booleans on purpose: the dashboard renders
+// one indicator per field, and every client binding reads them by name.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "flat health indicators consumed directly by the dashboard"
+)]
 #[derive(Serialize)]
 struct StatusResponse {
     configured: bool,
@@ -254,15 +260,12 @@ async fn list_sites(State(state): State<AppState>) -> Result<Json<Value>> {
     let out: Vec<Value> = sites
         .iter()
         .map(|s| {
-            let has_cred = creds
-                .get(&s.id.to_string())
-                .map(|c| {
-                    c.passkey.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
-                        || c.cookie.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
-                        || c.api_key.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
-                        || c.rsskey.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let has_cred = creds.get(&s.id.to_string()).is_some_and(|c| {
+                c.passkey.as_deref().is_some_and(|v| !v.is_empty())
+                    || c.cookie.as_deref().is_some_and(|v| !v.is_empty())
+                    || c.api_key.as_deref().is_some_and(|v| !v.is_empty())
+                    || c.rsskey.as_deref().is_some_and(|v| !v.is_empty())
+            });
             json!({
                 "id": s.id,
                 "site": s.site,
@@ -331,8 +334,7 @@ async fn start_run(
 
     let trigger = body
         .and_then(|b| b.0.trigger)
-        .map(|t| RunTrigger::parse(&t))
-        .unwrap_or(RunTrigger::Manual);
+        .map_or(RunTrigger::Manual, |t| RunTrigger::parse(&t));
 
     // Validate cheaply so the caller gets an immediate 400 rather than a run id
     // for a run that will fail one second later.
@@ -477,7 +479,7 @@ async fn list_torrents(
             ),
             _ => true,
         })
-        .take(limit as usize)
+        .take(usize::try_from(limit).unwrap_or(0))
         .map(|t| {
             json!({
                 "hash": t.hash,
@@ -498,7 +500,11 @@ async fn list_torrents(
 
     // Stable ordering by size, biggest first: the interesting torrents are the
     // big ones, and it always beats "random client order".
-    items.sort_by_key(|v| -(v.get("size").and_then(|s| s.as_i64()).unwrap_or(0)));
+    items.sort_by_key(|v| {
+        -(v.get("size")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0))
+    });
 
     Ok(Json(json!({"items": items, "total": torrents.len()})))
 }

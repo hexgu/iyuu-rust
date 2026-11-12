@@ -22,7 +22,8 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub async fn shutdown(&self) {
+    /// Stop the background loop. Synchronous: aborting a handle never awaits.
+    pub fn shutdown(&self) {
         if let Some(h) = self.handle.lock().take() {
             h.abort();
         }
@@ -174,8 +175,8 @@ impl Schedule {
         // Standard cron quirk: if BOTH dom and dow are restricted, the schedule
         // fires when EITHER matches. Respecting this avoids surprising users who
         // copy a cron expression from elsewhere.
-        let dom_match = self.days_of_month.matches(now.day());
-        let dow_match = self
+        let day_of_month_hit = self.days_of_month.matches(now.day());
+        let day_of_week_hit = self
             .days_of_week
             .matches(now.weekday().num_days_from_sunday());
         match (
@@ -183,9 +184,9 @@ impl Schedule {
             self.days_of_week.is_wildcard,
         ) {
             (true, true) => true,
-            (true, false) => dow_match,
-            (false, true) => dom_match,
-            (false, false) => dom_match || dow_match,
+            (true, false) => day_of_week_hit,
+            (false, true) => day_of_month_hit,
+            (false, false) => day_of_month_hit || day_of_week_hit,
         }
     }
 
@@ -217,12 +218,11 @@ pub fn next_run_at(cfg: &crate::config::ScheduleConfig) -> Option<chrono::DateTi
 }
 
 fn parse_cron(expr: &str) -> Option<Schedule> {
-    match Schedule::parse(expr) {
-        Some(s) => Some(s),
-        None => {
-            tracing::warn!(expr, "cron 表达式无效，定时任务已跳过");
-            None
-        }
+    if let Some(s) = Schedule::parse(expr) {
+        Some(s)
+    } else {
+        tracing::warn!(expr, "cron 表达式无效，定时任务已跳过");
+        None
     }
 }
 

@@ -175,14 +175,23 @@ web/                  Vue 3 + shadcn-vue + Tailwind v4 + Vite
 
 `core` 不依赖 SQLite 或 axum，持久化通过 `AttemptStore` trait 注入——因此引擎逻辑可以脱离服务单独测试。
 
-## 测试
+## 测试与代码质量
 
 ```bash
-cargo test          # 37 个单元测试
+make check   # 门禁：fmt --check + clippy -D warnings + test
+cargo test   # 40 个单元测试
 cd web && bun run build   # 含 vue-tsc 类型检查
 ```
 
-核心正确性由单元测试覆盖：info_hash 必须基于原始字节、`checkingDL` 不得判为完成、`added` 不等于 `seeding`、cron 的 dom/dow 同时限定时取"或"、详情页多链接时不瞎猜等。
+`clippy` 的严格档（`pedantic`）通过 `[workspace.lints]` 常驻开启，所以下面这条就是完整门禁，不需要额外参数：
+
+```bash
+cargo clippy --all-targets --all-features --locked -- -D warnings
+```
+
+本项目额外禁用了 `unsafe_code`。少量确实不该改的写法（例如序列化/配置结构体里多个独立开关）用带理由的 `#[expect(...)]` 局部标注，而不是全局放宽——这样写法一旦不再需要抑制，编译器会提醒删掉。
+
+核心正确性由单元测试覆盖：info_hash 必须基于原始字节、`checkingDL` 不得判为完成、`added` 不等于 `seeding`、cron 的 dom/dow 同时限定时取"或"、详情页多链接时不瞎猜、体积阈值边界与负数体积不放过等。
 
 ## 注意
 

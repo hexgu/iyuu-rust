@@ -29,13 +29,13 @@ pub struct Db {
 }
 
 const MIGRATIONS: &[&str] = &[
-    r#"
+    r"
     CREATE TABLE IF NOT EXISTS settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
-    "#,
-    r#"
+    ",
+    r"
     CREATE TABLE IF NOT EXISTS torrent_cache (
         info_hash   TEXT PRIMARY KEY,
         site_id     INTEGER NOT NULL,
@@ -43,8 +43,8 @@ const MIGRATIONS: &[&str] = &[
         torrent_id  INTEGER NOT NULL,
         seen_at     TEXT NOT NULL
     );
-    "#,
-    r#"
+    ",
+    r"
     CREATE TABLE IF NOT EXISTS attempts (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
         source_hash       TEXT NOT NULL,
@@ -65,17 +65,17 @@ const MIGRATIONS: &[&str] = &[
         run_id            TEXT,
         created_at        TEXT NOT NULL
     );
-    "#,
+    ",
     // One row per target hash: re-running discovery must not create duplicates.
-    r#"
+    r"
     CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_target
         ON attempts(target_info_hash);
-    "#,
-    r#"
+    ",
+    r"
     CREATE INDEX IF NOT EXISTS idx_attempts_state
         ON attempts(state);
-    "#,
-    r#"
+    ",
+    r"
     CREATE TABLE IF NOT EXISTS runs (
         id          TEXT PRIMARY KEY,
         trigger     TEXT NOT NULL,
@@ -85,11 +85,11 @@ const MIGRATIONS: &[&str] = &[
         stats       TEXT NOT NULL,
         message     TEXT
     );
-    "#,
-    r#"
+    ",
+    r"
     CREATE INDEX IF NOT EXISTS idx_runs_started
         ON runs(started_at DESC);
-    "#,
+    ",
 ];
 
 impl Db {
@@ -169,9 +169,15 @@ impl Db {
         Ok(())
     }
 
+    // `status` (lifecycle) and `stats` (counters) are both SQL columns here;
+    // renaming either would only make the INSERT bindings harder to match up.
+    #[expect(
+        clippy::similar_names,
+        reason = "both names mirror the columns they bind to"
+    )]
     pub fn finish_run(
         &self,
-        id: &str,
+        run_id: &str,
         status: RunStatus,
         stats: &RunStats,
         message: Option<&str>,
@@ -181,7 +187,7 @@ impl Db {
             "UPDATE runs SET status = ?2, finished_at = ?3, stats = ?4, message = ?5
              WHERE id = ?1",
             params![
-                id,
+                run_id,
                 status.as_str(),
                 Utc::now().to_rfc3339(),
                 serde_json::to_string(stats).unwrap_or_else(|_| "{}".into()),
@@ -239,24 +245,21 @@ impl Db {
         let map_row = |row: &rusqlite::Row<'_>| attempt_from_row(row);
 
         let mut out = Vec::new();
-        match state {
-            Some(s) => {
-                let mut stmt = conn.prepare(
-                    "SELECT * FROM attempts WHERE state = ?1
-                     ORDER BY id DESC LIMIT ?2 OFFSET ?3",
-                )?;
-                let rows = stmt.query_map(params![s, limit, offset], map_row)?;
-                for r in rows {
-                    out.push(r?);
-                }
+        if let Some(s) = state {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM attempts WHERE state = ?1
+                 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt.query_map(params![s, limit, offset], map_row)?;
+            for r in rows {
+                out.push(r?);
             }
-            None => {
-                let mut stmt =
-                    conn.prepare("SELECT * FROM attempts ORDER BY id DESC LIMIT ?1 OFFSET ?2")?;
-                let rows = stmt.query_map(params![limit, offset], map_row)?;
-                for r in rows {
-                    out.push(r?);
-                }
+        } else {
+            let mut stmt =
+                conn.prepare("SELECT * FROM attempts ORDER BY id DESC LIMIT ?1 OFFSET ?2")?;
+            let rows = stmt.query_map(params![limit, offset], map_row)?;
+            for r in rows {
+                out.push(r?);
             }
         }
         Ok(out)
@@ -314,9 +317,7 @@ impl Db {
 }
 
 fn parse_dt(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+    DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
 
 fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReseedAttempt> {
@@ -418,7 +419,7 @@ impl AttemptStore for Db {
         message: Option<&str>,
     ) -> iyuu_core::Result<()> {
         let this = self.clone();
-        let message = message.map(|s| s.to_string());
+        let message = message.map(std::string::ToString::to_string);
         tokio::task::spawn_blocking(move || -> Result<(), ServerError> {
             let conn = this.pool.get()?;
             let finished = state.is_terminal().then(|| Utc::now().to_rfc3339());
@@ -443,7 +444,7 @@ impl AttemptStore for Db {
         message: Option<&str>,
     ) -> iyuu_core::Result<()> {
         let this = self.clone();
-        let message = message.map(|s| s.to_string());
+        let message = message.map(std::string::ToString::to_string);
         tokio::task::spawn_blocking(move || -> Result<(), ServerError> {
             let conn = this.pool.get()?;
             let now = Utc::now().to_rfc3339();

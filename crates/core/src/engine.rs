@@ -9,7 +9,7 @@
 //!
 //! **Verification** (`verify_pending`) — poll the downloader for every attempt
 //! still in `Added`/`Verifying` and drive it to a terminal state. This is the
-//! piece the MoviePilot plugin is missing: it keeps its queue in memory, so a
+//! piece the `MoviePilot` plugin is missing: it keeps its queue in memory, so a
 //! restart strands every in-flight cross-seed in `paused` forever, and it has no
 //! branch for `checkingDL` so it never learns that verification is still running.
 //!
@@ -22,13 +22,23 @@ use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::Result;
 use crate::fetch::fetch_torrent;
 use crate::iyuu::{HASH_CHUNK_SIZE, IyuuClient, SiteCredentials};
-use crate::models::*;
+use crate::models::{
+    IyuuSite, ReseedAttempt, ReseedState, RunStats, SeedCandidate, TorrentInfo, TorrentPhase,
+};
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Filtering rules applied to source torrents before any network work.
+///
+/// The flags are independent user-facing toggles persisted one-for-one in the
+/// settings file; grouping them into sub-structs would only add a layer between
+/// the JSON the UI writes and the code that reads it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these mirror independent settings toggles, not instance state"
+)]
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     /// Minimum torrent size in GiB. 0 disables the filter.
@@ -123,6 +133,10 @@ pub struct DiscoveryOutcome {
 }
 
 /// Run discovery against the configured downloader.
+///
+/// # Errors
+/// Returns an error when the downloader cannot be listed, the IYUU site list or
+/// reseed query fails, or an attempt record cannot be persisted.
 pub async fn discover(
     ctx: &EngineContext,
     store: &dyn AttemptStore,
@@ -135,7 +149,7 @@ pub async fn discover(
 
     // ---------------------------------------------------------------- scan
     let torrents = ctx.downloader.list_torrents().await?;
-    stats.scanned = torrents.len() as i64;
+    stats.scanned = len_as_i64(torrents.len());
 
     // The set of hashes already present, so we never add a duplicate. One
     // snapshot is enough: an add during this run cannot collide with a later
@@ -167,6 +181,11 @@ pub async fn discover(
         "扫描完成"
     );
 
+    if out.cancelled {
+        out.stats = stats;
+        return Ok(out);
+    }
+
     // ------------------------------------------------------- IYUU query
     let site_map = ctx.iyuu.sites_by_id().await?;
     let sid_list: Vec<i64> = if ctx.config.site_ids.is_empty() {
@@ -180,63 +199,22 @@ pub async fn discover(
     let source_hashes: Vec<String> = sources.iter().map(|t| t.hash.clone()).collect();
     let (found, warnings) = ctx.iyuu.reseed_query_all(&source_hashes, &sid_list).await?;
     out.warnings = warnings;
-    stats.queried = source_hashes.len() as i64;
-    stats.candidates = found.values().map(|v| v.len() as i64).sum();
+    stats.queried = len_as_i64(source_hashes.len());
+    stats.candidates = found.values().map(|v| len_as_i64(v.len())).sum();
     progress(&stats);
 
     // ------------------------------------------------- flatten + dedupe
-    // One entry per (source, candidate). A candidate hash can appear under
-    // several sources only if two source torrents share a hash, which cannot
-    // happen, so keying by target hash alone is safe and prevents double-adds.
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut seen_targets: HashSet<String> = HashSet::new();
-    let source_by_hash: HashMap<&str, &TorrentInfo> =
-        sources.iter().map(|t| (t.hash.as_str(), *t)).collect();
-
-    for (source_hash, candidates) in &found {
-        let Some(source) = source_by_hash.get(source_hash.as_str()) else {
-            continue;
-        };
-        for cand in candidates {
-            let target = bencode::normalize_hash(&cand.info_hash);
-            if target.is_empty() {
-                continue;
-            }
-            if present.contains(&target) || already_seeded.contains(&target) {
-                stats.existed += 1;
-                continue;
-            }
-            if known_bad.contains(&target) || ctx.blocked_hashes.contains(&target) {
-                stats.skipped += 1;
-                continue;
-            }
-            if let Some(restrict) = site_filter(&ctx.config, cand.sid)
-                && !restrict
-            {
-                stats.skipped += 1;
-                continue;
-            }
-            if !seen_targets.insert(target.clone()) {
-                continue;
-            }
-            let Some(site) = site_map.get(&cand.sid) else {
-                // IYUU returned a sid we have no metadata for; cannot build a
-                // download URL without it.
-                out.warnings
-                    .push(format!("未知站点 sid={}，跳过 {} 个候选", cand.sid, 1));
-                stats.skipped += 1;
-                continue;
-            };
-            jobs.push(Job {
-                source_name: source.name.clone(),
-                source_hash: source.hash.clone(),
-                save_path: source.save_path.clone(),
-                category: category_for(source, &ctx.config),
-                candidate: cand.clone(),
-                site: site.clone(),
-            });
-        }
-    }
+    let jobs = build_jobs(
+        ctx,
+        sources.as_slice(),
+        &found,
+        &site_map,
+        &present,
+        &already_seeded,
+        &known_bad,
+        &mut stats,
+        &mut out,
+    );
 
     tracing::info!(jobs = jobs.len(), "待处理辅种任务");
 
@@ -290,6 +268,87 @@ pub async fn discover(
     Ok(out)
 }
 
+/// `usize` → `i64` for the stat counters. Saturates instead of wrapping: a
+/// count that large is already wrong, and a negative stat is worse than a
+/// clamped one.
+fn len_as_i64(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Turn the IYUU answer into the concrete work list, applying every skip rule
+/// (already present, known-bad, site restriction, duplicate) and reporting the
+/// counts back through `stats`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the alternative is a builder struct used exactly once"
+)]
+fn build_jobs(
+    ctx: &EngineContext,
+    sources: &[&TorrentInfo],
+    found: &HashMap<String, Vec<SeedCandidate>>,
+    site_map: &HashMap<i64, IyuuSite>,
+    present: &HashSet<String>,
+    already_seeded: &HashSet<String>,
+    known_bad: &HashSet<String>,
+    stats: &mut RunStats,
+    out: &mut DiscoveryOutcome,
+) -> Vec<Job> {
+    // One entry per (source, candidate). A candidate hash can appear under
+    // several sources only if two source torrents share a hash, which cannot
+    // happen, so keying by target hash alone is safe and prevents double-adds.
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut seen_targets: HashSet<String> = HashSet::new();
+    let source_by_hash: HashMap<&str, &TorrentInfo> =
+        sources.iter().map(|t| (t.hash.as_str(), *t)).collect();
+
+    for (source_hash, candidates) in found {
+        let Some(source) = source_by_hash.get(source_hash.as_str()) else {
+            continue;
+        };
+        for cand in candidates {
+            let target = bencode::normalize_hash(&cand.info_hash);
+            if target.is_empty() {
+                continue;
+            }
+            if present.contains(&target) || already_seeded.contains(&target) {
+                stats.existed += 1;
+                continue;
+            }
+            if known_bad.contains(&target) || ctx.blocked_hashes.contains(&target) {
+                stats.skipped += 1;
+                continue;
+            }
+            if let Some(restrict) = site_filter(&ctx.config, cand.sid)
+                && !restrict
+            {
+                stats.skipped += 1;
+                continue;
+            }
+            if !seen_targets.insert(target.clone()) {
+                continue;
+            }
+            let Some(site) = site_map.get(&cand.sid) else {
+                // IYUU returned a sid we have no metadata for; cannot build a
+                // download URL without it.
+                out.warnings
+                    .push(format!("未知站点 sid={}，跳过 {} 个候选", cand.sid, 1));
+                stats.skipped += 1;
+                continue;
+            };
+            jobs.push(Job {
+                source_name: source.name.clone(),
+                source_hash: source.hash.clone(),
+                save_path: source.save_path.clone(),
+                category: category_for(source, &ctx.config),
+                candidate: cand.clone(),
+                site: site.clone(),
+            });
+        }
+    }
+
+    jobs
+}
+
 /// Snapshot the context for one discovery run.
 ///
 /// Called once per run, not once per job: the credential map and the blocked-hash
@@ -338,7 +397,13 @@ fn filter_source(t: &TorrentInfo, cfg: &DiscoveryConfig) -> std::result::Result<
     }
 
     if cfg.min_size_gib > 0.0 {
-        let gib = t.total_size as f64 / 1024.0 / 1024.0 / 1024.0;
+        // `f64` keeps 53 bits of mantissa, i.e. exact integers up to ~8 PiB.
+        // No real torrent comes close, so the conversion is lossless here.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "byte counts stay far below 2^53, so f64 represents them exactly"
+        )]
+        let gib = t.total_size.max(0) as f64 / 1024.0 / 1024.0 / 1024.0;
         if gib < cfg.min_size_gib {
             return Err("体积小于阈值");
         }
@@ -528,7 +593,8 @@ async fn apply_job_result(
     result: JobResult,
 ) {
     match result.outcome {
-        JobOutcome::Added => {
+        // A dry run reports what it would have added, so both count as added.
+        JobOutcome::Added | JobOutcome::DryRun => {
             stats.added += 1;
         }
         JobOutcome::FetchFailed => {
@@ -542,9 +608,6 @@ async fn apply_job_result(
         }
         JobOutcome::Skipped => {
             stats.existed += 1;
-        }
-        JobOutcome::DryRun => {
-            stats.added += 1;
         }
     }
 
@@ -589,6 +652,10 @@ pub struct VerifyOutcome {
 ///  * A torrent that has not resolved within `VERIFY_DEADLINE_SECS` is marked
 ///    `TimedOut` so it stops consuming attention — but it is NOT deleted, since
 ///    an operator may still want to see it.
+///
+/// # Errors
+/// Returns an error when pending attempts cannot be loaded, the downloader
+/// lookup fails, or a state update cannot be persisted.
 pub async fn verify_pending(
     ctx: &EngineContext,
     store: &dyn AttemptStore,
@@ -635,187 +702,174 @@ pub async fn verify_pending(
                 continue;
             };
 
-            let deadline_exceeded = attempt
-                .verify_started_at
-                .or(attempt.added_at)
-                .map(|start| {
-                    (Utc::now() - start).num_seconds() > ReseedAttempt::VERIFY_DEADLINE_SECS
-                })
-                .unwrap_or(false);
-
-            match info.phase() {
-                TorrentPhase::Checking => {
-                    if deadline_exceeded {
-                        out.timed_out += 1;
-                        store
-                            .update_check(
-                                attempt.id,
-                                ReseedState::TimedOut,
-                                attempt.check_count + 1,
-                                Some("校验超时，请检查磁盘或手动重新校验"),
-                            )
-                            .await?;
-                    } else {
-                        out.still_waiting += 1;
-                        store
-                            .update_check(
-                                attempt.id,
-                                ReseedState::Verifying,
-                                attempt.check_count + 1,
-                                Some(&format!("校验中：{}", info.state)),
-                            )
-                            .await?;
-                    }
-                }
-                TorrentPhase::Complete if info.progress >= 0.999 => {
-                    // Success. Only now can we say the cross-seed works.
-                    out.promoted += 1;
-                    if ctx.config.auto_start_after_verify
-                        && let Err(e) = ctx
-                            .downloader
-                            .start(std::slice::from_ref(&attempt.target_info_hash))
-                            .await
-                    {
-                        tracing::warn!(hash = %attempt.target_info_hash, error = %e, "启动辅种失败");
-                    }
-                    if let Err(e) = ctx
-                        .downloader
-                        .add_tags(
-                            std::slice::from_ref(&attempt.target_info_hash),
-                            &[format!("{IYUU_TAG}:verified")],
-                        )
-                        .await
-                    {
-                        tracing::debug!(error = %e, "打标签失败");
-                    }
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::Seeding,
-                            attempt.check_count + 1,
-                            Some("校验通过，开始辅种"),
-                        )
-                        .await?;
-                }
-                TorrentPhase::MissingFiles => {
-                    out.failed += 1;
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::MissingFiles,
-                            attempt.check_count + 1,
-                            Some("下载器报告文件缺失：保存路径与原种不一致"),
-                        )
-                        .await?;
-                }
-                TorrentPhase::Error => {
-                    out.failed += 1;
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::VerifyFailed,
-                            attempt.check_count + 1,
-                            Some(&format!(
-                                "下载器错误：{}",
-                                info.error.as_deref().unwrap_or(&info.state)
-                            )),
-                        )
-                        .await?;
-                }
-                TorrentPhase::Incomplete if deadline_exceeded => {
-                    out.timed_out += 1;
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::TimedOut,
-                            attempt.check_count + 1,
-                            Some("超时仍未完成校验"),
-                        )
-                        .await?;
-                }
-                TorrentPhase::Incomplete => {
-                    // Two very different situations share this state:
-                    //  (a) verification just finished and found data missing, or
-                    //  (b) a verify was requested and has not started yet.
-                    // The client tells us which via the state string. A stopped
-                    // torrent at 0% that we already asked to verify is (b).
-                    let lower = info.state.to_ascii_lowercase();
-                    let verify_pending_state = lower.contains("paused")
-                        || lower.contains("stopped")
-                        || lower.contains("queued")
-                        || lower.contains("stoppeddl");
-
-                    if verify_pending_state && attempt.check_count <= 3 {
-                        // Give it a nudge: without this, a qB that ignored the
-                        // recheck request sits at 0% forever.
-                        if attempt.check_count == 0
-                            && let Err(e) = ctx
-                                .downloader
-                                .recheck(std::slice::from_ref(&attempt.target_info_hash))
-                                .await
-                        {
-                            tracing::debug!(error = %e, "补发校验失败");
-                        }
-                        out.still_waiting += 1;
-                        store
-                            .update_check(
-                                attempt.id,
-                                ReseedState::Verifying,
-                                attempt.check_count + 1,
-                                Some("等待校验开始"),
-                            )
-                            .await?;
-                    } else {
-                        // Verification had its chance and found the data
-                        // incomplete. This is the failure the user must see.
-                        out.failed += 1;
-                        store
-                            .update_check(
-                                attempt.id,
-                                ReseedState::VerifyFailed,
-                                attempt.check_count + 1,
-                                Some(&format!(
-                                    "校验后仍不完整（进度 {:.1}%）：保存路径与原种不一致，或该站资源与本地不同",
-                                    info.progress * 100.0
-                                )),
-                            )
-                            .await?;
-                    }
-                }
-                TorrentPhase::DownloadingMetadata => {
-                    out.still_waiting += 1;
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::Verifying,
-                            attempt.check_count + 1,
-                            Some("等待元数据"),
-                        )
-                        .await?;
-                }
-                TorrentPhase::Complete => {
-                    // Complete but progress < 0.999 — inconsistent report.
-                    out.still_waiting += 1;
-                }
-                TorrentPhase::Unknown => {
-                    out.still_waiting += 1;
-                    store
-                        .update_check(
-                            attempt.id,
-                            ReseedState::Verifying,
-                            attempt.check_count + 1,
-                            Some(&format!("未知状态：{}", info.state)),
-                        )
-                        .await?;
-                }
-            }
+            advance_attempt(ctx, store, attempt, info, &mut out).await?;
         }
     }
 
     Ok(out)
 }
 
+/// Advance one attempt's state machine from the client's current view of the
+/// torrent. Split out of [`verify_pending`] so each terminal case reads as its
+/// own small branch instead of a 200-line match.
+async fn advance_attempt(
+    ctx: &EngineContext,
+    store: &dyn AttemptStore,
+    attempt: &ReseedAttempt,
+    info: &TorrentInfo,
+    out: &mut VerifyOutcome,
+) -> Result<()> {
+    let deadline_exceeded = attempt
+        .verify_started_at
+        .or(attempt.added_at)
+        .is_some_and(|start| {
+            (Utc::now() - start).num_seconds() > ReseedAttempt::VERIFY_DEADLINE_SECS
+        });
+
+    match info.phase() {
+        TorrentPhase::Checking if deadline_exceeded => {
+            out.timed_out += 1;
+            mark(
+                store,
+                attempt,
+                ReseedState::TimedOut,
+                "校验超时，请检查磁盘或手动重新校验",
+            )
+            .await?;
+        }
+        TorrentPhase::Checking => {
+            out.still_waiting += 1;
+            let note = format!("校验中：{}", info.state);
+            mark(store, attempt, ReseedState::Verifying, &note).await?;
+        }
+        TorrentPhase::Complete if info.progress >= 0.999 => {
+            // Success. Only now can we say the cross-seed works.
+            out.promoted += 1;
+            promote(ctx, store, attempt).await?;
+        }
+        TorrentPhase::MissingFiles => {
+            out.failed += 1;
+            mark(
+                store,
+                attempt,
+                ReseedState::MissingFiles,
+                "下载器报告文件缺失：保存路径与原种不一致",
+            )
+            .await?;
+        }
+        TorrentPhase::Error => {
+            out.failed += 1;
+            let note = format!(
+                "下载器错误：{}",
+                info.error.as_deref().unwrap_or(&info.state)
+            );
+            mark(store, attempt, ReseedState::VerifyFailed, &note).await?;
+        }
+        TorrentPhase::Incomplete if deadline_exceeded => {
+            out.timed_out += 1;
+            mark(store, attempt, ReseedState::TimedOut, "超时仍未完成校验").await?;
+        }
+        TorrentPhase::Incomplete => {
+            handle_incomplete(ctx, store, attempt, info, out).await?;
+        }
+        TorrentPhase::DownloadingMetadata => {
+            out.still_waiting += 1;
+            mark(store, attempt, ReseedState::Verifying, "等待元数据").await?;
+        }
+        TorrentPhase::Complete => {
+            // Complete but progress < 0.999 — inconsistent report.
+            out.still_waiting += 1;
+        }
+        TorrentPhase::Unknown => {
+            out.still_waiting += 1;
+            let note = format!("未知状态：{}", info.state);
+            mark(store, attempt, ReseedState::Verifying, &note).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Persist a new state plus its explanatory note, always bumping the check
+/// counter so the retry limit is measured in observations, not wall time.
+async fn mark(
+    store: &dyn AttemptStore,
+    attempt: &ReseedAttempt,
+    state: ReseedState,
+    note: &str,
+) -> Result<()> {
+    store
+        .update_check(attempt.id, state, attempt.check_count + 1, Some(note))
+        .await
+}
+
+/// Verification passed: start the torrent (when configured), tag it, and record
+/// the attempt as seeding.
+async fn promote(
+    ctx: &EngineContext,
+    store: &dyn AttemptStore,
+    attempt: &ReseedAttempt,
+) -> Result<()> {
+    let hash = std::slice::from_ref(&attempt.target_info_hash);
+    if ctx.config.auto_start_after_verify
+        && let Err(e) = ctx.downloader.start(hash).await
+    {
+        tracing::warn!(hash = %attempt.target_info_hash, error = %e, "启动辅种失败");
+    }
+    if let Err(e) = ctx
+        .downloader
+        .add_tags(hash, &[format!("{IYUU_TAG}:verified")])
+        .await
+    {
+        tracing::debug!(error = %e, "打标签失败");
+    }
+    mark(store, attempt, ReseedState::Seeding, "校验通过，开始辅种").await
+}
+
+/// Incomplete data, and not yet past the deadline. Two very different
+/// situations share this state:
+///  (a) verification just finished and found data missing, or
+///  (b) a verify was requested and has not started yet.
+/// The client tells us which via the state string. A stopped torrent at 0% that
+/// we already asked to verify is (b).
+async fn handle_incomplete(
+    ctx: &EngineContext,
+    store: &dyn AttemptStore,
+    attempt: &ReseedAttempt,
+    info: &TorrentInfo,
+    out: &mut VerifyOutcome,
+) -> Result<()> {
+    let lower = info.state.to_ascii_lowercase();
+    let verify_not_started =
+        lower.contains("paused") || lower.contains("stopped") || lower.contains("queued");
+
+    if verify_not_started && attempt.check_count <= 3 {
+        // Give it a nudge: without this, a qB that ignored the recheck request
+        // sits at 0% forever.
+        if attempt.check_count == 0
+            && let Err(e) = ctx
+                .downloader
+                .recheck(std::slice::from_ref(&attempt.target_info_hash))
+                .await
+        {
+            tracing::debug!(error = %e, "补发校验失败");
+        }
+        out.still_waiting += 1;
+        return mark(store, attempt, ReseedState::Verifying, "等待校验开始").await;
+    }
+
+    // Verification had its chance and found the data incomplete. This is the
+    // failure the user must see.
+    out.failed += 1;
+    let note = format!(
+        "校验后仍不完整（进度 {:.1}%）：保存路径与原种不一致，或该站资源与本地不同",
+        info.progress * 100.0
+    );
+    mark(store, attempt, ReseedState::VerifyFailed, &note).await
+}
+
 /// Sleep helper matching the engine's polling cadence.
+#[must_use]
 pub fn verify_tick() -> Duration {
     Duration::from_secs(15)
 }
@@ -826,6 +880,7 @@ pub const MAX_HASHES_PER_QUERY: usize = HASH_CHUNK_SIZE;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DownloaderKind;
 
     fn torrent(hash: &str, progress: f64, state: &str) -> TorrentInfo {
         TorrentInfo {
@@ -898,6 +953,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(filter_source(&t, &cfg), Err("体积小于阈值"));
+    }
+
+    #[test]
+    fn size_filter_boundary_is_inclusive() {
+        // `torrent()` builds exactly 10 GiB, so a 10 GiB floor must let it pass
+        // and anything above must reject it.
+        let t = torrent("a", 1.0, "uploading");
+        let exact = DiscoveryConfig {
+            min_size_gib: 10.0,
+            ..Default::default()
+        };
+        assert!(filter_source(&t, &exact).is_ok());
+
+        let above = DiscoveryConfig {
+            min_size_gib: 10.001,
+            ..Default::default()
+        };
+        assert_eq!(filter_source(&t, &above), Err("体积小于阈值"));
+    }
+
+    #[test]
+    fn size_filter_rejects_negative_size() {
+        // A client that reports a negative size must not sneak past a floor.
+        let mut t = torrent("a", 1.0, "uploading");
+        t.total_size = -1;
+        let cfg = DiscoveryConfig {
+            min_size_gib: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(filter_source(&t, &cfg), Err("体积小于阈值"));
+    }
+
+    #[test]
+    fn size_filter_disabled_when_zero() {
+        let mut t = torrent("a", 1.0, "uploading");
+        t.total_size = 1;
+        let cfg = DiscoveryConfig {
+            min_size_gib: 0.0,
+            ..Default::default()
+        };
+        assert!(filter_source(&t, &cfg).is_ok());
     }
 
     #[test]

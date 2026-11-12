@@ -104,14 +104,15 @@ impl From<iyuu_core::CoreError> for ServerError {
     fn from(e: iyuu_core::CoreError) -> Self {
         use iyuu_core::CoreError as C;
         match e {
-            C::IyuuToken(m) => ServerError::IyuuAuth(m),
             C::Config(m) => ServerError::Config(m),
             C::DownloaderAuth { msg, .. } => ServerError::DownloaderAuth(msg),
             C::Downloader { msg, .. } => ServerError::Downloader(msg),
             C::Upstream { what, code, msg } => {
                 ServerError::Internal(format!("IYUU {what} 失败（code={code}）：{msg}"))
             }
-            C::SidSha1Expired(m) => ServerError::IyuuAuth(m),
+            // Both mean "your IYUU auth material needs attention"; the UI shows
+            // the same hint for either.
+            C::SidSha1Expired(m) | C::IyuuToken(m) => ServerError::IyuuAuth(m),
             C::TorrentFetch { site, msg } => {
                 ServerError::Downloader(format!("获取种子失败（{site}）：{msg}"))
             }

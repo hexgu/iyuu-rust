@@ -4,7 +4,7 @@
 //! reseed engine never branches on client type. The adapters are responsible for
 //! all client-specific weirdness:
 //!
-//!  * qB 5.x renamed several WebAPI endpoints and changed `paused` to
+//!  * qB 5.x renamed several `WebAPI` endpoints and changed `paused` to
 //!    `stopped`, and silently dropped `skip_checking` from `torrents/add`.
 //!  * Transmission's RPC needs a session-id handshake and returns every numeric
 //!    field as an enum, not a bool.
@@ -104,6 +104,11 @@ pub trait Downloader: Send + Sync {
 }
 
 /// Build a downloader from persisted settings.
+///
+/// # Errors
+/// Returns an error when the configured client cannot be constructed or fails
+/// to authenticate; the message names the client so the UI can point at the
+/// right settings section.
 pub async fn build(
     kind: DownloaderKind,
     name: &str,

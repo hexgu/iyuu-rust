@@ -8,6 +8,9 @@ license.workspace = true
 name = "iyuu-reseed"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 iyuu-core = { path = "../core" }
 tokio.workspace = true

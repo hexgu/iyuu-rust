@@ -45,6 +45,7 @@ pub enum Value {
 }
 
 impl Value {
+    #[must_use]
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(i) => Some(*i),
@@ -52,6 +53,7 @@ impl Value {
         }
     }
 
+    #[must_use]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Str(s) => Some(s),
@@ -62,11 +64,13 @@ impl Value {
     /// Decode a byte string as UTF-8, lossily. Torrent metadata in the wild is
     /// frequently not valid UTF-8 (legacy GBK/Shift-JIS names), so we never fail
     /// the whole parse over it.
+    #[must_use]
     pub fn as_str_lossy(&self) -> Option<String> {
         self.as_bytes()
             .map(|b| String::from_utf8_lossy(b).into_owned())
     }
 
+    #[must_use]
     pub fn as_list(&self) -> Option<&[Value]> {
         match self {
             Value::List(l) => Some(l),
@@ -74,6 +78,7 @@ impl Value {
         }
     }
 
+    #[must_use]
     pub fn as_dict(&self) -> Option<&[(Vec<u8>, Value)]> {
         match self {
             Value::Dict(d) => Some(d),
@@ -82,6 +87,7 @@ impl Value {
     }
 
     /// Look up a key in a dict. Keys are raw bytes.
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.as_dict()?
             .iter()
@@ -91,6 +97,10 @@ impl Value {
 }
 
 /// Decode a full bencode document.
+///
+/// # Errors
+/// Returns [`BencodeError`] when the input is truncated, malformed, or carries
+/// bytes after the top-level value.
 pub fn decode(input: &[u8]) -> Result<Value> {
     let mut cursor = Cursor {
         data: input,
@@ -113,6 +123,10 @@ pub struct InfoSpan {
 /// materialize the whole structure. This is the torrust/transmission approach:
 /// walk the top-level dict, and when the key is `info`, remember where the
 /// value starts and where it ends.
+///
+/// # Errors
+/// Returns [`BencodeError`] when the document is not a bencode dict or has no
+/// `info` key.
 pub fn find_info_span(input: &[u8]) -> Result<InfoSpan> {
     let mut cursor = Cursor {
         data: input,
@@ -142,19 +156,27 @@ pub fn find_info_span(input: &[u8]) -> Result<InfoSpan> {
 }
 
 /// Compute the v1 info-hash (SHA-1 over the raw `info` dict bytes).
+///
+/// # Errors
+/// Propagates [`find_info_span`]'s failure when the `info` dict cannot be
+/// located.
 pub fn info_hash_from_torrent(input: &[u8]) -> Result<[u8; 20]> {
     let span = find_info_span(input)?;
     Ok(sha1_bytes(&input[span.start..span.end]))
 }
 
-/// Whether the torrent carries BitTorrent v2 metadata (only `piece layers` /
+/// Whether the torrent carries `BitTorrent` v2 metadata (only `piece layers` /
 /// `meta version 2` means the v1 hash may be absent or the torrent is hybrid).
+///
+/// # Errors
+/// Propagates [`decode`]'s failure when the document is malformed.
 pub fn is_v2(input: &[u8]) -> Result<bool> {
     let v = decode(input)?;
     let version = v.get("info").and_then(|i| i.get("meta version"));
-    Ok(matches!(version.and_then(|v| v.as_int()), Some(2)))
+    Ok(matches!(version.and_then(Value::as_int), Some(2)))
 }
 
+#[must_use]
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
     h.update(data);
@@ -166,11 +188,13 @@ pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
 
 /// Lowercase hex, which is what qBittorrent and Transmission both use on the
 /// wire and in their APIs.
+#[must_use]
 pub fn hash_to_hex(hash: &[u8; 20]) -> String {
     hex::encode(hash)
 }
 
 /// Parse a 40-char hex info-hash into bytes.
+#[must_use]
 pub fn hex_to_hash(s: &str) -> Option<[u8; 20]> {
     let s = s.trim();
     if s.len() != 40 {
@@ -188,6 +212,7 @@ pub fn hex_to_hash(s: &str) -> Option<[u8; 20]> {
 /// torrents added with magnet links occasionally surface uppercase, and
 /// Transmission returns uppercase hex in some fields. Dedup/matching bugs from
 /// this are notorious, so every hash entering the system goes through here.
+#[must_use]
 pub fn normalize_hash(s: &str) -> String {
     s.trim().to_ascii_lowercase()
 }
@@ -197,7 +222,7 @@ struct Cursor<'a> {
     pos: usize,
 }
 
-impl<'a> Cursor<'a> {
+impl Cursor<'_> {
     fn peek(&self) -> Result<u8> {
         self.data
             .get(self.pos)

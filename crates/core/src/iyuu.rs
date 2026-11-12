@@ -1,7 +1,7 @@
 //! IYUU 辅种 API client.
 //!
 //! Endpoints implemented (all against `https://2025.iyuu.cn`):
-//!   GET  /reseed/sites/index          — supported sites (with download_page template)
+//!   GET  /reseed/sites/index          — supported sites (with `download_page` template)
 //!   GET  /reseed/sites/recommend      — recommended sites (binding-oriented)
 //!   POST /reseed/sites/reportExisting — report held site ids, get `sid_sha1`
 //!   POST /reseed/index/index          — THE cross-seed query
@@ -39,6 +39,12 @@ pub const DEFAULT_BASE_URL: &str = "https://2025.iyuu.cn";
 /// server rejects larger batches, and a rejection loses the whole chunk, so we
 /// stay at the documented value.
 pub const HASH_CHUNK_SIZE: usize = 200;
+
+/// `usize` → `i64` for API counters. Saturates rather than wrapping so an
+/// impossible count never turns into a negative number.
+fn len_as_i64(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, Deserialize)]
 struct SitesData {
@@ -85,9 +91,9 @@ struct Cache {
 }
 
 /// `sid_sha1` is documented as valid for 7 days; we refresh at 6 to leave slack.
-const SID_SHA1_TTL: Duration = Duration::from_secs(6 * 24 * 3600);
+const SID_SHA1_TTL: Duration = Duration::from_hours(144);
 /// Site list changes rarely; a day is plenty and avoids a request per run.
-const SITES_TTL: Duration = Duration::from_secs(24 * 3600);
+const SITES_TTL: Duration = Duration::from_hours(24);
 
 pub struct IyuuClient {
     http: reqwest::Client,
@@ -97,10 +103,18 @@ pub struct IyuuClient {
 }
 
 impl IyuuClient {
+    /// Build a client against the public IYUU API.
+    ///
+    /// # Errors
+    /// Returns an error when the HTTP client cannot be built.
     pub fn new(token: impl Into<String>) -> Result<Self> {
         Self::with_base_url(token, DEFAULT_BASE_URL)
     }
 
+    /// Build a client against an explicit base URL (used by tests and mirrors).
+    ///
+    /// # Errors
+    /// Returns an error when the HTTP client cannot be built.
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")))
@@ -133,7 +147,7 @@ impl IyuuClient {
 
     /// Unwrap the `{code, data, msg}` envelope, mapping the API's own error
     /// codes into a typed error that callers can react to.
-    fn unwrap_envelope<T>(&self, status: reqwest::StatusCode, body: &str, what: &str) -> Result<T>
+    fn unwrap_envelope<T>(status: reqwest::StatusCode, body: &str, what: &str) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -147,12 +161,15 @@ impl IyuuClient {
             let preview: String = body.chars().take(200).collect();
             CoreError::Upstream {
                 what: what.to_string(),
-                code: status.as_u16() as i64,
+                code: i64::from(status.as_u16()),
                 msg: format!("响应解析失败({e})，前缀：{preview}"),
             }
         })?;
 
-        let code = raw.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let code = raw
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
         let msg = raw
             .get("msg")
             .and_then(|v| v.as_str())
@@ -202,7 +219,10 @@ impl IyuuClient {
             // Still try to surface the API's own message, it is far more useful
             // than "403 Forbidden".
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
-                let code = raw.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let code = raw
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1);
                 let msg = raw
                     .get("msg")
                     .and_then(|v| v.as_str())
@@ -216,7 +236,7 @@ impl IyuuClient {
             }
             return Err(CoreError::Upstream {
                 what: what.to_string(),
-                code: status.as_u16() as i64,
+                code: i64::from(status.as_u16()),
                 msg: body.chars().take(300).collect(),
             });
         }
@@ -226,6 +246,10 @@ impl IyuuClient {
     // ---------------------------------------------------------------- sites
 
     /// All sites IYUU supports for cross-seeding. Cached for a day.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails or the response envelope reports
+    /// a non-success code.
     pub async fn sites(&self, force: bool) -> Result<Vec<IyuuSite>> {
         if !force {
             let guard = self.cache.read();
@@ -242,16 +266,29 @@ impl IyuuClient {
             .header("token", self.token_header()?);
         let body = self.send(req, "获取站点列表").await?;
         let data: SitesData =
-            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
+            Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
+
+        // `count` is the server's total, which may exceed `sites.len()` when the
+        // account is bound to only part of the catalogue. Log the mismatch
+        // instead of silently discarding the field.
+        if data.count != len_as_i64(data.sites.len()) {
+            tracing::debug!(
+                reported = data.count,
+                received = data.sites.len(),
+                "站点列表数量与服务器报告不一致"
+            );
+        }
 
         let mut guard = self.cache.write();
         guard.sites = Some(data.sites.clone());
         guard.sites_fetched_at = Some(Instant::now());
-        let _ = data.count;
         Ok(data.sites)
     }
 
     /// Site list keyed by sid, for O(1) lookup during a run.
+    ///
+    /// # Errors
+    /// Propagates [`IyuuClient::sites`]'s failure.
     pub async fn sites_by_id(&self) -> Result<HashMap<i64, IyuuSite>> {
         Ok(self
             .sites(false)
@@ -262,13 +299,11 @@ impl IyuuClient {
     }
 
     /// Sites the user has bound ("recommended" set in IYUU's vocabulary).
+    ///
+    /// # Errors
+    /// Returns an error when the request fails or the response cannot be
+    /// decoded.
     pub async fn recommended_sites(&self) -> Result<Vec<IyuuSite>> {
-        let req = self
-            .http
-            .get(self.url("/reseed/sites/recommend"))
-            .header("token", self.token_header()?);
-        let body = self.send(req, "获取推荐站点").await?;
-
         #[derive(Deserialize)]
         struct Wrapper {
             #[serde(default)]
@@ -276,8 +311,20 @@ impl IyuuClient {
             #[serde(default)]
             list: Vec<IyuuSite>,
         }
-        let data: Wrapper = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取推荐站点")?;
-        let _ = data.count;
+
+        let req = self
+            .http
+            .get(self.url("/reseed/sites/recommend"))
+            .header("token", self.token_header()?);
+        let body = self.send(req, "获取推荐站点").await?;
+        let data: Wrapper = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "获取推荐站点")?;
+        if data.count != len_as_i64(data.list.len()) {
+            tracing::debug!(
+                reported = data.count,
+                received = data.list.len(),
+                "推荐站点数量与服务器报告不一致"
+            );
+        }
         Ok(data.list)
     }
 
@@ -288,6 +335,9 @@ impl IyuuClient {
     /// `sid_list` should be the sids we intend to seed on. Passing every bound
     /// site is correct: the server filters *its* answer down to those, so a
     /// wider list only costs response bytes, never correctness.
+    /// # Errors
+    /// Returns [`CoreError::Config`] when `sid_list` is empty, and otherwise
+    /// propagates request or envelope failures.
     pub async fn report_existing(&self, sid_list: &[i64]) -> Result<String> {
         if sid_list.is_empty() {
             return Err(CoreError::Config(
@@ -300,7 +350,7 @@ impl IyuuClient {
             .header("token", self.token_header()?)
             .json(&serde_json::json!({ "sid_list": sid_list }));
         let body = self.send(req, "汇报站点").await?;
-        let data: SidSha1Data = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
+        let data: SidSha1Data = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "汇报站点")?;
         if data.sid_sha1.is_empty() {
             return Err(CoreError::Upstream {
                 what: "汇报站点".into(),
@@ -316,6 +366,9 @@ impl IyuuClient {
     }
 
     /// Return a usable `sid_sha1`, fetching one if the cache is cold or stale.
+    ///
+    /// # Errors
+    /// Propagates [`IyuuClient::report_existing`]'s failure.
     pub async fn ensure_sid_sha1(&self, sid_list: &[i64]) -> Result<String> {
         {
             let guard = self.cache.read();
@@ -340,6 +393,11 @@ impl IyuuClient {
     ///
     /// Returns a map of `info_hash -> candidates`, and only includes hashes that
     /// actually have candidates (the server omits empty ones).
+    ///
+    /// # Errors
+    /// Returns an error when the request fails, the envelope reports a
+    /// non-success code, or `sid_sha1` expired (caller should refresh and
+    /// retry).
     pub async fn reseed_query(
         &self,
         hashes: &[String],
@@ -386,7 +444,7 @@ impl IyuuClient {
             .form(&form);
         let body = self.send(req, "查询辅种").await?;
 
-        match self.unwrap_envelope::<ReseedData>(reqwest::StatusCode::OK, &body, "查询辅种") {
+        match Self::unwrap_envelope::<ReseedData>(reqwest::StatusCode::OK, &body, "查询辅种") {
             Ok(data) => Ok(data
                 .per_hash
                 .into_iter()
@@ -405,8 +463,12 @@ impl IyuuClient {
         }
     }
 
-    /// Convenience wrapper: query with automatic chunking and one sid_sha1
+    /// Convenience wrapper: query with automatic chunking and one `sid_sha1`
     /// refresh-and-retry. Returns per-hash candidates plus non-fatal warnings.
+    ///
+    /// # Errors
+    /// Returns an error when a chunk cannot be queried even after refreshing
+    /// `sid_sha1`.
     pub async fn reseed_query_all(
         &self,
         hashes: &[String],
@@ -463,13 +525,14 @@ impl IyuuClient {
 
     /// Bind a site account. `passkey` must be the **sha1 hex of the site
     /// passkey**, not the passkey itself — IYUU stores only the digest.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails or IYUU rejects the credentials.
     pub async fn bind(&self, req: &BindRequest<'_>) -> Result<()> {
-        let form = reqwest::Client::new();
-        let _ = form;
         let request = self.http.post(self.url("/reseed/users/bind")).form(req);
         let body = self.send(request, "绑定站点").await?;
         let _: serde_json::Value =
-            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
+            Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
         // Binding changes which sites we hold, so both caches are now stale.
         self.invalidate_sid_sha1();
         let mut guard = self.cache.write();
@@ -478,6 +541,10 @@ impl IyuuClient {
     }
 
     /// Indexed torrent count for a site — useful to validate a site name.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails or the response cannot be
+    /// decoded.
     pub async fn site_torrent_total(&self, site: &str) -> Result<i64> {
         #[derive(Deserialize)]
         struct TotalData {
@@ -488,7 +555,7 @@ impl IyuuClient {
             .get(self.url("/spider/torrent/total"))
             .query(&[("site", site)]);
         let body = self.send(request, "查站点收录").await?;
-        let data: TotalData = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
+        let data: TotalData = Self::unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
         Ok(data.total)
     }
 }
@@ -500,6 +567,7 @@ impl IyuuClient {
 /// https to it fails at the handshake, and the failure looks like "the site is
 /// down" rather than "wrong scheme". Unknown values fall back to https, which is
 /// the safe default for anything modern.
+#[must_use]
 pub fn site_scheme(site: &IyuuSite) -> &'static str {
     match site.is_https {
         0 => "http",
@@ -513,6 +581,7 @@ pub fn site_scheme(site: &IyuuSite) -> &'static str {
 /// `{rsskey}`. Anything left unresolved means the template needs a mechanism we
 /// don't implement (usually an API call), so we return `None` and let the caller
 /// fall back to scraping the details page.
+#[must_use]
 pub fn render_download_template(
     template: &str,
     torrent_id: i64,
@@ -548,7 +617,7 @@ pub struct SiteCredentials {
     pub cookie: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
-    /// Some sites (TGG, HDCity) use an authkey instead of a passkey.
+    /// Some sites (TGG, `HDCity`) use an authkey instead of a passkey.
     #[serde(default)]
     pub torrent_key: Option<String>,
     /// Monika-style sites embed an rsskey in the RSS URL.

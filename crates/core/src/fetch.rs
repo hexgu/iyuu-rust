@@ -3,9 +3,9 @@
 //! This is the part every reimplementation gets subtly wrong. IYUU only gives us
 //! `sid` + `torrent_id`; turning that into a downloadable file is site-specific:
 //!
-//!  * Most NexusPHP sites: fill `download_page` with the passkey → one GET.
+//!  * Most `NexusPHP` sites: fill `download_page` with the passkey → one GET.
 //!  * Sites whose template has an unresolvable placeholder (TGG's `authkey`,
-//!    HDCity, GPW's per-user token): fetch `details_page` and scrape the
+//!    `HDCity`, GPW's per-user token): fetch `details_page` and scrape the
 //!    `torrents.php?action=download...` anchor.
 //!  * M-Team: no passkey download path; needs an `x-api-key` and a
 //!    `genDlToken` call, then a redirect.
@@ -38,6 +38,9 @@ pub struct FetchedTorrent {
 /// These are separate from the IYUU API client on purpose: site requests carry
 /// per-site cookies and must never leak the IYUU token header into a tracker
 /// request.
+///
+/// # Errors
+/// Returns an error when the TLS backend or client builder fails.
 pub fn site_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
@@ -59,10 +62,11 @@ pub enum SiteFlavor {
     MTeam,
     /// Monika design family (rsskey-derived path).
     Monika,
-    /// GreatPosterWall (details page, `torrents.php?torrentid=`).
+    /// `GreatPosterWall` (details page, `torrents.php?torrentid=`).
     GreatPosterWall,
 }
 
+#[must_use]
 pub fn classify(site: &IyuuSite) -> SiteFlavor {
     let host = site.host().to_ascii_lowercase();
     if host.contains("m-team") || host.contains("mteamtp") {
@@ -102,6 +106,11 @@ fn needs_scraping(host: &str) -> bool {
 }
 
 /// Fetch a torrent for `(site, torrent_id)`.
+///
+/// # Errors
+/// Returns [`CoreError::TorrentFetch`] when the site has no usable download
+/// route for the configured credentials, or [`CoreError::Http`] when the
+/// request fails.
 pub async fn fetch_torrent(
     http: &reqwest::Client,
     site: &IyuuSite,
@@ -135,7 +144,7 @@ pub async fn fetch_torrent(
     // Fall back to site-specific mechanisms.
     let from_page = match flavor {
         SiteFlavor::MTeam => fetch_mteam(http, site, torrent_id, creds).await,
-        SiteFlavor::Monika => fetch_monika(http, site, torrent_id, creds).await,
+        SiteFlavor::Monika => fetch_monika_url(site, torrent_id, creds),
         _ => fetch_from_details_page(http, site, torrent_id, creds).await,
     };
 
@@ -343,6 +352,7 @@ async fn fetch_from_details_page(
 
 /// Find the download anchor, preferring one whose `id=` matches `torrent_id`,
 /// because a details page can list several torrents (e.g. a pack plus its parts).
+#[must_use]
 pub fn extract_download_link(html: &str, site: &IyuuSite, torrent_id: i64) -> Option<String> {
     let doc = Html::parse_document(html);
     let selector = Selector::parse("a").ok()?;
@@ -369,14 +379,13 @@ pub fn extract_download_link(html: &str, site: &IyuuSite, torrent_id: i64) -> Op
     // Only fall back when the page offers exactly one download link: with
     // several candidates and no id match we cannot tell which release is ours,
     // and grabbing the wrong one would seed someone else's files.
-    match all.len() {
-        1 => all.pop(),
-        _ => {
-            // Some sites' pages carry the link in an inline script instead of an
-            // anchor. Same rule applies: only trust it when it's unambiguous.
-            let from_script = extract_from_script(html, site);
-            if all.is_empty() { from_script } else { None }
-        }
+    if all.len() == 1 {
+        all.pop()
+    } else {
+        // Some sites' pages carry the link in an inline script instead of an
+        // anchor. Same rule applies: only trust it when it's unambiguous.
+        let from_script = extract_from_script(html, site);
+        if all.is_empty() { from_script } else { None }
     }
 }
 
@@ -470,13 +479,10 @@ async fn fetch_mteam(
 }
 
 /// Monika: `torrents/download/{id}.{rsskey}` where rsskey comes from the RSS URL.
-async fn fetch_monika(
-    http: &reqwest::Client,
-    site: &IyuuSite,
-    torrent_id: i64,
-    creds: &SiteCredentials,
-) -> Result<String> {
-    let _ = http;
+///
+/// Synchronous by design: the URL is derived from stored credentials, so this
+/// needs no request of its own and must not be declared `async`.
+fn fetch_monika_url(site: &IyuuSite, torrent_id: i64, creds: &SiteCredentials) -> Result<String> {
     let rsskey = creds
         .rsskey
         .as_deref()

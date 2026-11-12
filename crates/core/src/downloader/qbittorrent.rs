@@ -1,4 +1,4 @@
-//! qBittorrent WebAPI v2 adapter.
+//! qBittorrent `WebAPI` v2 adapter.
 //!
 //! Version handling is the main hazard here. qB 5.x:
 //!   * renamed `torrents/pause` → `torrents/stop` and `resume` → `start`
@@ -68,6 +68,11 @@ struct QbTorrent {
 }
 
 impl QBittorrentClient {
+    /// Connect and log in.
+    ///
+    /// # Errors
+    /// Returns an error when the HTTP client cannot be built or the login
+    /// request is rejected by qBittorrent.
     pub async fn new(name: &str, base_url: &str, username: &str, password: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -212,15 +217,13 @@ impl QBittorrentClient {
         form: Vec<(String, String)>,
     ) -> Result<()> {
         if self.modern.load(Ordering::Relaxed) {
-            match self.post(modern_path, form.clone()).await {
-                Ok(_) => return Ok(()),
-                Err(_) => {
-                    // Fall through to the legacy name and remember the result.
-                    self.post(legacy_path, form).await?;
-                    self.modern.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
+            if self.post(modern_path, form.clone()).await.is_ok() {
+                return Ok(());
             }
+            // Fall through to the legacy name and remember the result.
+            self.post(legacy_path, form).await?;
+            self.modern.store(false, Ordering::Relaxed);
+            return Ok(());
         }
         self.post(legacy_path, form).await?;
         Ok(())
@@ -444,12 +447,11 @@ impl Downloader for QBittorrentClient {
 
         // Wait for the torrent to appear so callers can immediately act on it.
         // qB is asynchronous: the add returns before the torrent is queryable.
-        for attempt in 0..10 {
+        for attempt in 0..10u64 {
             if self
                 .torrents_by_hash(std::slice::from_ref(&hex_hash))
                 .await
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
+                .is_ok_and(|v| !v.is_empty())
             {
                 return Ok(hex_hash);
             }
@@ -461,7 +463,7 @@ impl Downloader for QBittorrentClient {
             {
                 return Ok(bencode::normalize_hash(&t.hash));
             }
-            tokio::time::sleep(Duration::from_millis(200 * (attempt + 1) as u64)).await;
+            tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
         }
 
         // Accept it anyway: the torrent is very likely there, just slow.
@@ -586,6 +588,7 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 
 /// Convenience: the qB marker tag for a specific site, e.g. `iyuu-springsunday`.
 /// Used to find our own add when qB computes a different hash.
+#[must_use]
 pub fn site_tag(site: &str) -> String {
     format!("{IYUU_TAG}:{site}")
 }

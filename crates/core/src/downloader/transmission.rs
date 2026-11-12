@@ -112,6 +112,11 @@ mod status {
 }
 
 impl TransmissionClient {
+    /// Connect and resolve the RPC session.
+    ///
+    /// # Errors
+    /// Returns an error when the client cannot be built, the host is
+    /// unreachable, or authentication fails.
     pub async fn new(
         name: &str,
         base_url: &str,
@@ -196,7 +201,7 @@ impl TransmissionClient {
                     .headers()
                     .get("X-Transmission-Session-Id")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+                    .map(std::string::ToString::to_string);
                 match sid {
                     Some(sid) if attempt == 0 => {
                         *self.session_id.write() = Some(sid);
@@ -380,8 +385,7 @@ impl Downloader for TransmissionClient {
             let hash = dup
                 .get("hashString")
                 .and_then(|v| v.as_str())
-                .map(bencode::normalize_hash)
-                .unwrap_or(hex_hash);
+                .map_or(hex_hash, bencode::normalize_hash);
             return Err(CoreError::Downloader {
                 client: self.name.clone(),
                 msg: format!("种子已存在：{hash}"),

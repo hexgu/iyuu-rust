@@ -103,7 +103,7 @@ impl AppState {
 ///
 /// Rebuilt per run on purpose: a config change (new token, different downloader)
 /// should take effect on the next run without restarting the process. The
-/// IyuuClient is recreated too, which also drops its cached `sid_sha1` — correct,
+/// `IyuuClient` is recreated too, which also drops its cached `sid_sha1` — correct,
 /// because that cache is scoped to the token that produced it.
 pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
     let cfg = state.config_snapshot();
@@ -226,7 +226,13 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
     state.is_running.store(true, Ordering::SeqCst);
 
     // Ensure an interrupted previous run's rows don't linger as "running".
-    let _ = state.db.reconcile_orphan_runs();
+    // Best-effort: a failure here must not abort a run the user just started,
+    // but it should be visible rather than swallowed.
+    match state.db.reconcile_orphan_runs() {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(orphans = n, "已把上次中断的任务标记为失败"),
+        Err(e) => tracing::warn!(error = %e, "清理残留任务记录失败"),
+    }
 
     // Deliver the result to the caller even on the error path.
     let result = run_inner(state, &run_id, &cancel).await;

@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    sched.shutdown().await;
+    sched.shutdown();
     Ok(())
 }
 
@@ -207,29 +207,28 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    // Either signal means the same thing: shut down.
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }
 
 /// Minimal extension→MIME map, covering what a Vite build actually emits.
 fn guess_content_type(path: &std::path::Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("mjs") => "text/javascript; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("html") => "text/html; charset=utf-8",
-        Some("json") => "application/json",
+        Some("json" | "map") => "application/json",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
         Some("ico") => "image/x-icon",
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
         Some("ttf") => "font/ttf",
-        Some("map") => "application/json",
         _ => "application/octet-stream",
     }
 }

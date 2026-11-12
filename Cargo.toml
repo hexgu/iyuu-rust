@@ -9,6 +9,22 @@ license = "MIT"
 authors = ["iyuu-reseed contributors"]
 repository = "https://github.com/iyuu-reseed/iyuu-reseed"
 
+# Lint policy (see rust-best-practices, chapter 2). Crates opt in with
+# `[lints] workspace = true`, so the plain gate
+#   cargo clippy --all-targets --all-features --locked -- -D warnings
+# already enforces everything below.
+[workspace.lints.rust]
+future_incompatible = { level = "warn", priority = 10 }
+nonstandard_style = { level = "deny", priority = 9 }
+unsafe_code = { level = "forbid", priority = 8 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "deny", priority = 8 }
+# Type names that repeat their module (`downloader::DownloaderClient`) read worse
+# than the plain name; the project already names modules after their domain.
+module_name_repetitions = { level = "allow", priority = 1 }
+
 [workspace.dependencies]
 # async runtime
 tokio = { version = "1", features = ["full"] }

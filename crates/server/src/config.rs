@@ -263,6 +263,12 @@ pub struct PublicDownloader {
     pub extra: DownloaderExtra,
 }
 
+// One `has_*` flag per stored secret so the UI can render "configured" badges
+// without ever receiving the secret itself.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one presence flag per credential; collapsing them would leak nothing but lose per-field UI state"
+)]
 #[derive(Debug, Serialize)]
 pub struct PublicCredentials {
     pub has_passkey: bool,
@@ -307,20 +313,12 @@ impl AppConfig {
                     (
                         k.clone(),
                         PublicCredentials {
-                            has_passkey: v
-                                .passkey
-                                .as_deref()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false),
+                            has_passkey: v.passkey.as_deref().is_some_and(|s| !s.is_empty()),
                             uid: v.uid.clone(),
-                            has_cookie: v.cookie.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                            has_cookie: v.cookie.as_deref().is_some_and(|s| !s.is_empty()),
                             user_agent: v.user_agent.clone(),
-                            has_api_key: v
-                                .api_key
-                                .as_deref()
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false),
-                            has_rsskey: v.rsskey.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                            has_api_key: v.api_key.as_deref().is_some_and(|s| !s.is_empty()),
+                            has_rsskey: v.rsskey.as_deref().is_some_and(|s| !s.is_empty()),
                         },
                     )
                 })

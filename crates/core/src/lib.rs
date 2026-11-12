@@ -3,8 +3,8 @@
 //! Layering:
 //!   `bencode`    — byte-exact torrent parsing and info-hash computation
 //!   `models`     — domain types and the cross-seed state machine
-//!   `iyuu`       — IYUU OpenAPI client
-//!   `fetch`      — turn (site, torrent_id) into a validated .torrent
+//!   `iyuu`       — IYUU `OpenAPI` client
+//!   `fetch`      — turn (site, `torrent_id`) into a validated .torrent
 //!   `downloader` — qBittorrent / Transmission adapters behind one trait
 //!   `engine`     — discovery + verification orchestration
 //!
