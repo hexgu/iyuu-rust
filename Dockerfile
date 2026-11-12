@@ -61,6 +61,9 @@ ENV TZ=Asia/Shanghai \
     IYUU_DATA_DIR=/data \
     IYUU_WEB_DIR=/app/web \
     IYUU_LISTEN=0.0.0.0:8098
+# IYUU_API_BASE is intentionally NOT set here. An empty value would look like an
+# override, and the UI never sees this variable anyway — set it from compose only
+# when you actually run a mirror or reverse proxy.
 
 WORKDIR /app
 COPY --from=builder /build/target/release/iyuu-reseed /usr/local/bin/iyuu-reseed

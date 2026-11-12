@@ -19,6 +19,15 @@ services:
     environment:
       TZ: Asia/Shanghai
       IYUU_LOG: info
+      # Optional: override the IYUU API base (self-hosted mirror / reverse proxy).
+      # Leave it commented out to follow the membership tier selected in the UI
+      # (free → 2025.iyuu.cn, SVIP → vip.iyuu.cn).
+      #
+      # This is intentionally an environment variable and not a settings field:
+      # it is a deployment concern, and it must never be echoed to the browser.
+      # The scheme is required — a value without http(s):// is ignored with a
+      # warning at startup rather than silently prefixed.
+      # IYUU_API_BASE: https://iyuu.example.com
       # Blank out the proxy that Docker injects from ~/.docker/config.json
       # (`proxies.default`). Inside the container 127.0.0.1 is the container
       # itself, not the host, so that proxy is unreachable and every outbound
