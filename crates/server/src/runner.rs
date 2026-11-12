@@ -69,6 +69,13 @@ pub struct AppState {
     pub run_gate: Arc<tokio::sync::Mutex<()>>,
     /// Set while a discovery run holds the gate, for a fast API-side check.
     pub is_running: Arc<AtomicBool>,
+    /// The live IYUU client of the current/last run.
+    ///
+    /// Kept because the quota mirror inside it carries state that only exists in
+    /// memory during this process (the rate-limit cooldown, the per-run counter).
+    /// The API reports from it so the UI shows what the engine will actually do
+    /// next, not a fresh budget.
+    pub iyuu: Arc<RwLock<Option<Arc<IyuuClient>>>>,
     pub started_at: chrono::DateTime<Utc>,
 }
 
@@ -81,6 +88,7 @@ impl AppState {
             cancel: Arc::new(RwLock::new(None)),
             run_gate: Arc::new(tokio::sync::Mutex::new(())),
             is_running: Arc::new(AtomicBool::new(false)),
+            iyuu: Arc::new(RwLock::new(None)),
             started_at: Utc::now(),
         }
     }
@@ -111,16 +119,28 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
     if cfg.iyuu.token.trim().is_empty() {
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
+    // Without an answered tier the engine would silently use the free server and
+    // a paying account would hit a 500/day ceiling for no visible reason.
+    if !cfg.iyuu.tier_chosen() {
+        return Err(ServerError::Config(
+            "请先选择 IYUU 会员类型（普通用户 / SVIP）".into(),
+        ));
+    }
 
-    let iyuu = match cfg
-        .iyuu
-        .base_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(base) => IyuuClient::with_base_url(cfg.iyuu.token.clone(), base)?,
-        None => IyuuClient::new(cfg.iyuu.token.clone())?,
-    };
+    // Host follows the declared tier unless overridden, and the daily counter is
+    // restored from the database: the client is rebuilt every run, the day's
+    // usage is not.
+    let usage = state.db.load_api_usage()?;
+    let iyuu = IyuuClient::build(
+        cfg.iyuu.token.clone(),
+        cfg.iyuu.effective_base_url(),
+        cfg.iyuu.tier(),
+    )?
+    .with_usage(&usage)
+    .shared();
+    // Publish it before it is used so the status endpoint can report the live
+    // quota mirror even while the run is in flight.
+    *state.iyuu.write() = Some(iyuu.clone());
 
     let kind = cfg.downloader.kind()?;
     let downloader: Arc<dyn Downloader> = downloader::build(
@@ -149,7 +169,7 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
     };
 
     Ok(EngineContext {
-        iyuu: Arc::new(iyuu),
+        iyuu,
         downloader,
         http: iyuu_core::fetch::site_http_client()?,
         config: (&cfg.reseed).into(),
@@ -239,6 +259,11 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
 
     *state.cancel.write() = None;
 
+    // Persist the quota mirror whether the run succeeded or not: a failed run
+    // still spent requests, and forgetting them is what lets the next run
+    // overrun the account's daily limit.
+    persist_api_usage(state);
+
     match result {
         Ok(outcome) => {
             run.stats = outcome.stats.clone();
@@ -298,6 +323,22 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
             drop(guard);
             Err(e)
         }
+    }
+}
+
+/// Snapshot the live quota mirror into the database.
+///
+/// Best-effort and logged: failing to save the counter costs at most one
+/// redundant request next run, so it must never fail a run that otherwise
+/// worked.
+fn persist_api_usage(state: &AppState) {
+    let client = state.iyuu.read().clone();
+    let Some(client) = client else {
+        return;
+    };
+    let usage = client.usage();
+    if let Err(e) = state.db.save_api_usage(&usage) {
+        tracing::warn!(error = %e, "保存 API 用量失败");
     }
 }
 

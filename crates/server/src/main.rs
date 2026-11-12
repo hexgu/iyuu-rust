@@ -6,6 +6,7 @@
 mod api;
 mod config;
 mod db;
+mod env_config;
 mod error;
 mod runner;
 mod scheduler;
@@ -93,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         %addr,
         data_dir = %args.data_dir.display(),
         web_dir = %args.web_dir.display(),
+        api_base_override = env_config::api_base().unwrap_or("-"),
         "iyuu-reseed 启动"
     );
 

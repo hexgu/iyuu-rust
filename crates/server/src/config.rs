@@ -11,6 +11,7 @@ use iyuu_core::downloader::DownloaderExtra;
 use iyuu_core::engine::DiscoveryConfig;
 use iyuu_core::iyuu::SiteCredentials;
 use iyuu_core::models::DownloaderKind;
+use iyuu_core::ratelimit::ApiTier;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -36,9 +37,64 @@ pub struct AppConfig {
 pub struct IyuuConfig {
     #[serde(default)]
     pub token: String,
-    /// Override the API base (mirrors exist; default is 2025.iyuu.cn).
+    /// Which membership the account holds. Decides both the host (free and SVIP
+    /// are served by different domains) and the daily quota the engine budgets
+    /// against.
+    ///
+    /// `None` means the user has not answered yet — the UI forces the choice when
+    /// a token is first saved, because defaulting silently is how a paying user
+    /// ends up on the free host wondering why their quota is 500.
     #[serde(default)]
-    pub base_url: Option<String>,
+    pub tier: Option<String>,
+    /// Obsolete: the base URL now comes from `IYUU_API_BASE` (see
+    /// [`crate::env_config`]). Kept only so an existing config file with this
+    /// field still deserializes instead of erroring out; it is dropped on the next
+    /// save. Never read — if it were, a stale value could override the
+    /// environment, which is precisely the ambiguity this change removes.
+    #[serde(default, skip_serializing, alias = "base_url")]
+    #[expect(
+        dead_code,
+        reason = "deserialization-only tombstone for the removed base_url field"
+    )]
+    pub legacy_base_url: Option<String>,
+}
+
+impl IyuuConfig {
+    /// Parsed membership tier. Missing → `Free`: an unanswered account must not
+    /// be assumed to have a paying one's budget.
+    #[must_use]
+    pub fn tier(&self) -> ApiTier {
+        self.tier.as_deref().map_or(ApiTier::Free, ApiTier::parse)
+    }
+
+    /// Whether the user has actually answered the tier question.
+    #[must_use]
+    pub fn tier_chosen(&self) -> bool {
+        self.tier.is_some()
+    }
+
+    /// Host to actually call: the environment override if set, otherwise the host
+    /// belonging to the tier.
+    ///
+    /// The override lives in the environment rather than this config on purpose —
+    /// it is a deployment concern (mirror, reverse proxy), it must not be a
+    /// user-facing field, and it must never be echoed back to the browser.
+    #[must_use]
+    pub fn effective_base_url(&self) -> &str {
+        Self::base_url_for(self.tier())
+    }
+
+    /// Host for an explicitly chosen tier.
+    ///
+    /// An associated function, not a method, because it reads no config: callers
+    /// sometimes need the host for a tier that is not saved yet (the setup dialog
+    /// tests a token against the tier the user just picked). The environment
+    /// override always wins — an operator running a mirror must have *every*
+    /// request go through it, including one-off probes.
+    #[must_use]
+    pub fn base_url_for(tier: ApiTier) -> &'static str {
+        crate::env_config::api_base().map_or_else(|| tier.base_url(), |base| base)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +271,27 @@ impl AppConfig {
         if self.iyuu.token.trim().is_empty() {
             return Err(ServerError::Config("IYUU Token 不能为空".into()));
         }
+        if let Some(tier) = self.iyuu.tier.as_deref() {
+            // Rejecting beats guessing: silently treating "vpi" as free would
+            // hand a paying user the free host with no explanation.
+            let normalized = tier.trim().to_ascii_lowercase();
+            if !matches!(
+                normalized.as_str(),
+                "free" | "vip" | "svip" | "member" | "premium"
+            ) {
+                return Err(ServerError::Config(format!(
+                    "未知的会员类型「{tier}」，可选 free / vip"
+                )));
+            }
+        }
+        // A token without an answered tier is a half-configured account: the
+        // engine would silently assume `free` and a paying user would wonder why
+        // their quota is 500. The UI collects both in one step for this reason.
+        if !self.iyuu.token.trim().is_empty() && !self.iyuu.tier_chosen() {
+            return Err(ServerError::Config(
+                "请选择 IYUU 会员类型（普通用户 / SVIP）".into(),
+            ));
+        }
         self.downloader.kind()?;
         if self.downloader.base_url.trim().is_empty() {
             return Err(ServerError::Config("下载器地址不能为空".into()));
@@ -245,12 +322,26 @@ pub struct PublicConfig {
     pub ui: UiConfig,
 }
 
+/// The IYUU part of the config as the browser sees it.
+///
+/// Note what is **not** here: the API host. It comes from the environment and is
+/// never serialized to the client — a deployment detail like an internal mirror
+/// hostname should not end up in a screenshot of the settings page. The UI shows
+/// the tier, which is the thing a user can actually act on.
 #[derive(Debug, Serialize)]
 pub struct PublicIyuu {
     /// `true` when a token is stored; the value itself is never sent.
     pub has_token: bool,
     pub token_hint: String,
-    pub base_url: Option<String>,
+    /// `free` or `vip` — what the user declared.
+    pub tier: String,
+    /// `false` when the account predates the tier question or skipped it. The UI
+    /// uses this to force the choice instead of guessing.
+    pub tier_chosen: bool,
+    /// Quota numbers for the declared tier, so the picker can show what the user
+    /// is getting without hardcoding the plan table in the bundle.
+    pub daily_requests: u32,
+    pub daily_hashes: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -295,7 +386,10 @@ impl AppConfig {
             iyuu: PublicIyuu {
                 has_token: !self.iyuu.token.is_empty(),
                 token_hint: hint,
-                base_url: self.iyuu.base_url.clone(),
+                tier: self.iyuu.tier().as_str().to_string(),
+                tier_chosen: self.iyuu.tier_chosen(),
+                daily_requests: self.iyuu.tier().daily_requests(),
+                daily_hashes: self.iyuu.tier().daily_hashes(),
             },
             downloader: PublicDownloader {
                 kind: self.downloader.kind.clone(),
@@ -346,7 +440,32 @@ pub struct ConfigPatch {
 pub struct IyuuPatch {
     /// Send an empty string to clear; omit to keep.
     pub token: Option<String>,
-    pub base_url: Option<String>,
+    /// `free` / `vip`. Anything else is rejected rather than coerced, so a typo
+    /// cannot silently downgrade a paying account to the free host.
+    pub tier: Option<String>,
+}
+
+impl IyuuPatch {
+    /// Reject unknown values *before* they are normalized.
+    ///
+    /// This has to happen here rather than in `AppConfig::validate`: patching
+    /// canonicalizes `tier` (`"SVIP"` → `"vip"`), and a typo like `"vpi"` would
+    /// canonicalize to `"free"` — valid by the time `validate` runs, so the user
+    /// would silently land on the free host with no error at all.
+    fn validate(&self) -> Result<()> {
+        if let Some(tier) = self.tier.as_deref() {
+            let normalized = tier.trim().to_ascii_lowercase();
+            if !matches!(
+                normalized.as_str(),
+                "free" | "vip" | "svip" | "member" | "premium"
+            ) {
+                return Err(ServerError::Config(format!(
+                    "未知的会员类型「{tier}」，可选 free / vip"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,14 +479,27 @@ pub struct DownloaderPatch {
 }
 
 impl AppConfig {
+    /// Validate the parts of a patch that normalization would otherwise hide.
+    ///
+    /// Called by the settings endpoint before `apply_patch`, because canonicalizing
+    /// a typo turns it into a *different valid* value.
+    pub fn validate_patch(patch: &ConfigPatch) -> Result<()> {
+        if let Some(p) = patch.iyuu.as_ref() {
+            p.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn apply_patch(&mut self, patch: ConfigPatch) {
         if let Some(p) = patch.iyuu {
             if let Some(t) = p.token {
                 // A blank token means "clear it", which is a legitimate action.
                 self.iyuu.token = t;
             }
-            if p.base_url.is_some() {
-                self.iyuu.base_url = p.base_url.filter(|s| !s.trim().is_empty());
+            if let Some(tier) = p.tier {
+                // Store the canonical spelling so the config file never carries
+                // "SVIP"/"vip "/"member" variants that later need normalizing.
+                self.iyuu.tier = Some(ApiTier::parse(&tier).as_str().to_string());
             }
         }
         if let Some(p) = patch.downloader {
@@ -415,5 +547,124 @@ impl AppConfig {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(token: &str, tier: Option<&str>) -> AppConfig {
+        AppConfig {
+            iyuu: IyuuConfig {
+                token: token.into(),
+                tier: tier.map(str::to_string),
+                ..IyuuConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn token_without_tier_is_rejected() {
+        // The whole point of asking: an unanswered tier would silently mean
+        // "free", which is a wrong answer for a paying user and an unsafe one for
+        // the quota budget.
+        let cfg = cfg_with("token", None);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("会员类型"), "{err}");
+    }
+
+    #[test]
+    fn token_with_tier_passes() {
+        assert!(cfg_with("token", Some("free")).validate().is_ok());
+        assert!(cfg_with("token", Some("vip")).validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_tier_is_rejected_by_patch_validation() {
+        // Rejecting at the patch layer is what stops "vpi" from being normalized
+        // into "free" — a valid value that means the opposite of the intent.
+        let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+            "iyuu": { "tier": "vpi" }
+        }))
+        .unwrap();
+        let err = AppConfig::validate_patch(&patch).unwrap_err().to_string();
+        assert!(err.contains("vpi"), "{err}");
+    }
+
+    #[test]
+    fn tier_aliases_are_canonicalized() {
+        for alias in ["SVIP", "vip", "member", "premium"] {
+            let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+                "iyuu": { "tier": alias }
+            }))
+            .unwrap();
+            let mut cfg = cfg_with("token", None);
+            cfg.apply_patch(patch);
+            assert_eq!(cfg.iyuu.tier.as_deref(), Some("vip"), "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn public_view_never_exposes_the_api_host() {
+        // The host is a deployment detail (env var); leaking it into the config
+        // response would put it in screenshots and in every browser's memory.
+        // Scoped to the `iyuu` subtree on purpose — the *downloader* legitimately
+        // has a `base_url`, and asserting globally would fail for the wrong reason.
+        let cfg = cfg_with("token", Some("vip"));
+        let view = serde_json::to_value(cfg.public_view()).unwrap();
+        let iyuu = view.get("iyuu").expect("iyuu section");
+
+        let serialized = iyuu.to_string();
+        assert!(
+            !serialized.contains("iyuu.cn"),
+            "API host leaked into the iyuu section: {serialized}"
+        );
+        assert!(
+            iyuu.get("base_url").is_none() && iyuu.get("effective_base_url").is_none(),
+            "API host field leaked: {serialized}"
+        );
+    }
+
+    #[test]
+    fn public_view_reports_tier_choice() {
+        let unchosen = cfg_with("token", None).public_view();
+        assert!(!unchosen.iyuu.tier_chosen, "UI must be told to ask");
+        // Still reports the effective tier, so quota math has a value to use.
+        assert_eq!(unchosen.iyuu.tier, "free");
+
+        let chosen = cfg_with("token", Some("vip")).public_view();
+        assert!(chosen.iyuu.tier_chosen);
+        assert_eq!(chosen.iyuu.daily_requests, 2500);
+    }
+
+    #[test]
+    fn legacy_base_url_field_still_deserializes() {
+        // An older config file carries `base_url`; it must load without error even
+        // though the field no longer has any effect.
+        let cfg: AppConfig = serde_json::from_value(serde_json::json!({
+            "iyuu": { "token": "t", "tier": "free", "base_url": "https://old.example" }
+        }))
+        .unwrap();
+        assert_eq!(cfg.iyuu.token, "t");
+        // And it is dropped on the next save rather than resurrecting the field.
+        let round_tripped = serde_json::to_value(&cfg).unwrap();
+        let iyuu = round_tripped.get("iyuu").expect("iyuu section");
+        assert!(
+            iyuu.get("base_url").is_none() && iyuu.get("legacy_base_url").is_none(),
+            "removed field came back: {iyuu}"
+        );
+    }
+
+    #[test]
+    fn base_url_follows_the_tier_without_override() {
+        // No environment override in the test process, so this is the tier's own
+        // host. The override path is covered in `env_config`.
+        let free = IyuuConfig::base_url_for(ApiTier::Free);
+        let vip = IyuuConfig::base_url_for(ApiTier::Vip);
+        assert_eq!(free, "https://2025.iyuu.cn");
+        assert_eq!(vip, "https://vip.iyuu.cn");
+        assert_ne!(free, vip, "the two tiers must not share a server");
     }
 }

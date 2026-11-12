@@ -12,6 +12,10 @@ use serde_json::json;
 pub enum ServerError {
     /// Bad or missing IYUU token / no sites bound → action required by the user.
     IyuuAuth(String),
+    /// IYUU's rate/quota limit was hit. Distinct from other failures because the
+    /// UI's advice differs: wait for the reset (or upgrade the account), and do
+    /// not retry now.
+    RateLimited(String),
     /// Misconfiguration (missing downloader, empty field, ...).
     Config(String),
     /// Downloader reachable but rejected credentials.
@@ -28,6 +32,7 @@ impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IyuuAuth(m) => write!(f, "IYUU 认证失败：{m}"),
+            Self::RateLimited(m) => write!(f, "IYUU 接口限流：{m}"),
             Self::Config(m) => write!(f, "配置错误：{m}"),
             Self::DownloaderAuth(m) => write!(f, "下载器认证失败：{m}"),
             Self::Downloader(m) => write!(f, "下载器错误：{m}"),
@@ -45,6 +50,7 @@ impl ServerError {
     fn kind(&self) -> &'static str {
         match self {
             Self::IyuuAuth(_) => "iyuu_auth",
+            Self::RateLimited(_) => "rate_limited",
             Self::Config(_) => "config",
             Self::DownloaderAuth(_) => "downloader_auth",
             Self::Downloader(_) => "downloader",
@@ -57,6 +63,9 @@ impl ServerError {
     fn status(&self) -> StatusCode {
         match self {
             Self::IyuuAuth(_) | Self::DownloaderAuth(_) => StatusCode::BAD_GATEWAY,
+            // 429 is the honest status for "stop calling": a proxy or a human
+            // reading logs sees the same signal the engine acts on.
+            Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Config(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,6 +116,10 @@ impl From<iyuu_core::CoreError> for ServerError {
             C::Config(m) => ServerError::Config(m),
             C::DownloaderAuth { msg, .. } => ServerError::DownloaderAuth(msg),
             C::Downloader { msg, .. } => ServerError::Downloader(msg),
+            // A quota problem is not a server bug, so it must not surface as a
+            // 500 with "internal error": the user needs the reset time and the
+            // upgrade path, not an apology.
+            C::RateLimited(m) => ServerError::RateLimited(m),
             C::Upstream { what, code, msg } => {
                 ServerError::Internal(format!("IYUU {what} 失败（code={code}）：{msg}"))
             }

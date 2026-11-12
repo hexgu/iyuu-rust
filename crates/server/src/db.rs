@@ -16,6 +16,7 @@ use crate::error::ServerError;
 use chrono::{DateTime, Utc};
 use iyuu_core::engine::AttemptStore;
 use iyuu_core::models::{ReseedAttempt, ReseedState, Run, RunStats, RunStatus, RunTrigger};
+use iyuu_core::ratelimit::QuotaUsage;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, params};
@@ -148,6 +149,36 @@ impl Db {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------- api usage
+
+    /// Persisted daily usage of the IYUU API.
+    ///
+    /// This has to outlive the client object, which is rebuilt per run so a
+    /// config change takes effect without a restart. Without a stored counter, a
+    /// mid-day restart would reset the budget to full and the next run would
+    /// spend requests the account no longer has.
+    pub fn load_api_usage(&self) -> Result<QuotaUsage, ServerError> {
+        const KEY: &str = "iyuu_api_usage";
+        let raw = self.get_setting(KEY)?;
+        match raw.as_deref().map(serde_json::from_str::<QuotaUsage>) {
+            Some(Ok(usage)) => Ok(usage),
+            // A corrupt counter must not block runs: starting from zero risks a
+            // rejected request, which is recoverable; refusing to run is not.
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "已保存的 API 用量无法解析，按 0 计");
+                Ok(QuotaUsage::default())
+            }
+            None => Ok(QuotaUsage::default()),
+        }
+    }
+
+    pub fn save_api_usage(&self, usage: &QuotaUsage) -> Result<(), ServerError> {
+        self.set_setting(
+            "iyuu_api_usage",
+            &serde_json::to_string(usage).unwrap_or_else(|_| "{}".into()),
+        )
     }
 
     // ----------------------------------------------------------------- runs
