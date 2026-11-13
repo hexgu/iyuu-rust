@@ -6,6 +6,7 @@
 
 [![CI](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![Vue](https://img.shields.io/badge/vue-3-42b883.svg)](web/package.json)
 [![GHCR](https://img.shields.io/badge/ghcr.io-hexgu%2Fiyuu--rust-2496ed?logo=docker&logoColor=white)](https://github.com/hexgu/iyuu-rust/pkgs/container/iyuu-rust)
@@ -48,6 +49,7 @@
 - [常见问题](#常见问题)
 - [使用注意](#使用注意)
 - [开发与贡献](#开发与贡献)
+- [更新日志](#更新日志)
 - [License](#license)
 
 ---
@@ -143,7 +145,8 @@ docker run -d \
   ghcr.io/hexgu/iyuu-rust:latest
 ```
 
-> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `main` / `sha-xxxxxxx` / `v1.2.3`。
+> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `main` / `sha-xxxxxxx` / `v0.2.1`。
+> 生产环境建议锁到具体版本（例如 `v0.2.1`）而不是 `latest`，升级时再改标签。
 > GHCR 在部分网络下需要登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin`。
 
 ### 首次配置
@@ -382,6 +385,10 @@ environment:
 ## 开发与贡献
 
 欢迎 Issue 与 PR。开发环境、从源码构建、项目结构、测试与代码质量门禁、构建/网络说明，都放在 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 更新日志
+
+各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.2.1**。
 
 ## License
 
