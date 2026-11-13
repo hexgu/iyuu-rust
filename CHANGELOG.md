@@ -3,6 +3,15 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.2.2] - 2026-11-13
+
+### 新增
+
+- **qBittorrent API Key 认证**：支持 qB ≥ 5.2（WebAPI ≥ 2.14.1）的
+  `Authorization: Bearer` 方式。无状态认证，不调 `auth/login`、不依赖 `SID` cookie，
+  因此 WebUI 重启不会再让定时任务因会话过期而失败。设置页可切换认证方式，密钥只写不回显。
+  密钥被轮换或版本过低时给出明确提示，而不是沿用「重新登录再试」的无效建议。
+
 ## [0.2.1] - 2026-11-13
 
 首个对外发布版本：把「发现 / 校验两阶段」的辅种流程、站点凭据管理与额度保护做成一个

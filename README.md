@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![Vue](https://img.shields.io/badge/vue-3-42b883.svg)](web/package.json)
 [![GHCR](https://img.shields.io/badge/ghcr.io-hexgu%2Fiyuu--rust-2496ed?logo=docker&logoColor=white)](https://github.com/hexgu/iyuu-rust/pkgs/container/iyuu-rust)
@@ -145,8 +145,8 @@ docker run -d \
   ghcr.io/hexgu/iyuu-rust:latest
 ```
 
-> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `main` / `sha-xxxxxxx` / `0.2.1` / `0.2`（版本标签不带 `v` 前缀）。
-> 生产环境建议锁到具体版本（例如 `0.2.1`）而不是 `latest`，升级时再改标签。
+> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `main` / `sha-xxxxxxx` / `0.2.2` / `0.2`（版本标签不带 `v` 前缀）。
+> 生产环境建议锁到具体版本（例如 `0.2.2`）而不是 `latest`，升级时再改标签。
 > GHCR 在部分网络下需要登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin`。
 
 ### 首次配置
@@ -281,6 +281,7 @@ IYUU 的辅种接口按天计量，普通用户和 SVIP 额度差 5 倍。这是
 | --- | --- |
 | 会员类型 | `free` / `vip`，决定默认入口与每日额度。保存 Token 时弹窗必选 |
 | 下载器类型 / 名称 / 地址 / 账号 | qBittorrent 或 Transmission；Transmission 可另填 RPC 路径 |
+| qBittorrent 认证方式 | 用户名密码，或 API Key（qB ≥ 5.2，免登录、重启不失效） |
 | 最小体积（GiB） | 小于该体积的源种子不参与辅种，0 表示不过滤 |
 | 并发获取数 | 同时下载 .torrent 的数量，站点有流控，默认 2，建议 1–3 |
 | 不辅种的标签 / 分类 | 命中的源种子跳过 |
@@ -336,6 +337,19 @@ environment:
 ## 常见问题
 
 <details>
+<summary><b>能用 qBittorrent 的 API Key 认证吗？</b></summary>
+
+能，需要 qBittorrent ≥ 5.2（WebAPI ≥ 2.14.1）。在 qB 的「设置 → WebUI → API Key」点生成，
+把 `qbt_…` 开头的 32 位密钥填进「设置 → 下载器 → 认证方式 = API Key」。
+
+和用户名密码相比，API Key 是**无状态**的：不调 `auth/login`、不依赖 `SID` cookie，
+所以 qB 重启 WebUI 之后定时任务照常工作，不会因为会话过期而失败一次。
+密钥轮换后旧密钥立即失效，此时日志会明确报「API Key 被拒绝」，重新生成即可。
+
+两种认证方式是多选一，表单上只能选一个；留着旧密码不会被用到，反之亦然。
+</details>
+
+<details>
 <summary><b>种子加进去了，但一直停在暂停状态？</b></summary>
 
 看「辅种记录」页的状态。`added` / `verifying` 表示还在等下载器校验结果；
@@ -388,7 +402,7 @@ environment:
 
 ## 更新日志
 
-各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.2.1**。
+各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.2.2**。
 
 ## License
 
