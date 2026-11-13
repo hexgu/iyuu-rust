@@ -46,7 +46,7 @@
 - [环境变量](#环境变量)
 - [API](#api)
 - [本地开发](#本地开发)
-- [中国网络环境](#中国网络环境)
+- [构建与网络环境](#构建与网络环境)
 - [项目结构](#项目结构)
 - [测试与代码质量](#测试与代码质量)
 - [常见问题](#常见问题)
@@ -169,7 +169,7 @@ cargo build --release
 
 需要 Rust stable 与 [bun](https://bun.sh)。
 
-也可以交给 Docker（构建参数见 [中国网络环境](#中国网络环境)）：
+也可以交给 Docker（见 [构建与网络环境](#构建与网络环境)）：
 
 ```bash
 docker build -t iyuu-reseed .
@@ -403,33 +403,49 @@ cargo run -- --data-dir ./data --web-dir ./web/dist --listen 0.0.0.0:8098
 cd web && bun install && bun dev --host   # 另一个终端
 ```
 
-## 中国网络环境
+## 构建与网络环境
 
-仓库已经把两处最主要的依赖源固定到国内镜像，**开箱即用，无需额外配置**：
+仓库只使用官方源：cargo 走 crates.io，前端走 registry.npmjs.org，镜像本身在 CI 里构建。
+**没有任何镜像站、代理或内网地址被写进仓库**——这类配置只对个人网络环境有意义，
+放在本机的未跟踪文件里即可（见下）。
 
-| 依赖 | 镜像 | 配置位置 |
-| --- | --- | --- |
-| Rust crate | [rsproxy.cn](https://rsproxy.cn)（字节跳动 Rust 团队的 crates.io 稀疏索引全量镜像） | `.cargo/config.toml` |
-| npm 包 | [registry.npmmirror.com](https://npmmirror.com) | `web/bunfig.toml` + Dockerfile `ENV` |
+如果用国内网络、希望加速依赖下载，可以在本机创建两个**不会提交**的文件
+（它们已在 `.gitignore` 中）：
 
-> **`[net] git-fetch-with-cli = true`** 是有意为之：libgit2 自带 HTTP 栈在某些环境会
-> 忽略代理配置，交给 git 二进制才可靠。
+```toml
+# .cargo/config.toml —— 只影响你自己这台机器
+[source.crates-io]
+replace-with = "local-mirror"
 
-**海外构建 / CI 请覆盖这两个源**（GitHub Actions 里就是这么做的，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）：
+[source.local-mirror]
+registry = "sparse+https://<你的 crate 镜像>/index/"
 
-```bash
-docker build \
-  --build-arg CARGO_SOURCE=global \
-  --build-arg NPM_REGISTRY=https://registry.npmjs.org \
-  -t iyuu-reseed .
+[net]
+git-fetch-with-cli = true
 ```
 
-国内拉 apt 慢的话再加 `--build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn`。
-基础镜像（`rust:1-slim`、`oven/bun:1-alpine`）只能从 Docker Hub 拉，建议先手动 `docker pull` 一次。
+```toml
+# web/bunfig.toml
+[install]
+registry = "https://<你的 npm 镜像>/"
+```
 
-### 为什么 cargo 还是觉得慢
+> **`[net] git-fetch-with-cli = true`** 值得保留：libgit2 自带 HTTP 栈在某些环境会
+> 忽略代理配置，交给 git 二进制才可靠。
 
-镜像只是解决了「下载」，实际耗时的大头通常是**编译**，尤其 `debug = 2`（cargo 默认）
+构建 Docker 镜像时同理。容器看不到宿主机的 `127.0.0.1`，如果你的构建机需要代理，
+用宿主在局域网里的地址，或者用 host 网络构建：
+
+```bash
+docker build --network=host -t iyuu-reseed .
+```
+
+基础镜像（`rust:1-slim`、`oven/bun:1-alpine`、`debian:bookworm-slim`）来自 Docker Hub，
+网络受限时建议先手动 `docker pull` 一次。
+
+### 为什么 cargo 编译慢
+
+依赖下载只是其中一项，实际耗时的大头通常是**编译**，尤其 `debug = 2`（cargo 默认）
 会生成完整 DWARF 调试信息。本仓库在 `Cargo.toml` 里设了 `[profile.dev] debug = 1`：
 保留行号表（断点和 backtrace 仍能对到源码行），丢掉类型/变量信息。
 
@@ -446,14 +462,6 @@ docker build \
 占着 target 目录的锁（`Blocking waiting for file lock on build directory`）。
 `dev.sh` 已经把 stdin 接到 `/dev/null`，避免 rustc 读 stdin 报
 `did not contain valid UTF-8`（这个问题在从管道/CI 里调用时才会暴露）。
-
-如果还没有 Rust 工具链，用镜像安装最快：
-
-```bash
-export RUSTUP_DIST_SERVER=https://rsproxy.cn
-export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-curl -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y --profile minimal
-```
 
 ## 项目结构
 

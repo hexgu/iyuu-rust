@@ -27,15 +27,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # 海外 runner 用官方 crates.io 更快；仓库里的 .cargo/config.toml 指向
-      # rsproxy.cn，那是给国内网络准备的，这里覆盖掉。
       - name: 恢复 cargo 缓存
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
-
-      - name: 移除国内镜像配置
-        run: rm -f .cargo/config.toml
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -56,9 +51,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
-
-      - name: 移除国内镜像配置
-        run: rm -f .cargo/config.toml
 
       - name: cargo test
         run: cargo test --all-features --locked
@@ -84,18 +76,11 @@ jobs:
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
           restore-keys: ${{ runner.os }}-bun-
 
-      # bunfig.toml 也指向 npmmirror，海外 runner 直接覆盖成官方源。
       - name: 安装依赖
         run: bun install --frozen-lockfile
-        env:
-          BUN_CONFIG_REGISTRY: https://registry.npmjs.org
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
 
       - name: 类型检查 + 构建
         run: bun run build
-        env:
-          BUN_CONFIG_REGISTRY: https://registry.npmjs.org
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
 
   # ------------------------------------------------------------------ 镜像
   # 构建并推送多架构镜像到 ghcr.io。只在 main 分支和 tag 上推送，PR 只验证
@@ -115,7 +100,6 @@ jobs:
       - name: 设置 Buildx
         uses: docker/setup-buildx-action@v3
 
-      # PR 只构建 amd64 验证可编译，快得多。
       - name: 生成镜像元数据
         id: meta
         uses: docker/metadata-action@v5
@@ -141,13 +125,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # PR 只构建 amd64 验证可编译，快得多。
           platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 海外构建机走 crates.io / npmjs，别绕国内镜像。
-          build-args: |
-            CARGO_SOURCE=global
-            NPM_REGISTRY=https://registry.npmjs.org
           cache-from: type=gha
           cache-to: type=gha,mode=max
