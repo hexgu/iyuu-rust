@@ -106,25 +106,43 @@ MoviePilot 的 `iyuuautoseed` 插件在长期运行中会出现"加了一堆辅�
 
 ## 快速开始
 
-### Docker（推荐）
+### Docker Compose（推荐）
 
-镜像由 GitHub Actions 构建并发布到 GitHub Container Registry，支持 `linux/amd64` 与 `linux/arm64`：
+镜像由 GitHub Actions 构建并发布到 GitHub Container Registry，支持 `linux/amd64` 与 `linux/arm64`。
+[`compose.yml`](compose.yml) 是一份可以直接上生产配置：只监听回环、只读根文件系统、
+日志轮转、健康检查、资源上限都已设好。
+
+```bash
+git clone https://github.com/hexgu/iyuu-rust.git
+cd iyuu-rust
+docker compose up -d
+```
+
+打开 <http://localhost:8098>。
+
+默认只绑定 `127.0.0.1:8098`，由宿主机上的反代对外提供服务。**这个界面没有账号体系，
+能访问到就等于能用你的凭据去辅种**，所以不要直接把它暴露到公网。
+
+```nginx
+# 反代示例（Nginx）
+location / {
+    proxy_pass http://127.0.0.1:8098;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+想自己构建镜像：`docker compose up -d --build`。
+不想用 compose 也可以直接跑：
 
 ```bash
 docker run -d \
   --name iyuu-reseed \
   --restart unless-stopped \
-  -p 8098:8098 \
+  -p 127.0.0.1:8098:8098 \
   -v ./data:/data \
   -e TZ=Asia/Shanghai \
   ghcr.io/hexgu/iyuu-rust:latest
-```
-
-或者用 compose（[`docker-compose.yml`](docker-compose.yml) 里有完整注释）：
-
-```bash
-docker compose up -d
-# 打开 http://localhost:8098
 ```
 
 > 镜像地址：`ghcr.io/hexgu/iyuu-rust`，可选标签 `latest` / `main` / `sha-xxxxxxx` / `v1.2.3`。
@@ -309,7 +327,7 @@ Token 在两边都能用：能返回数据不代表你有会员，报错也不�
 它是部署层面的事（镜像、反代），不该由浏览器决定，更不该出现在截图里：
 
 ```yaml
-# docker-compose.yml
+# compose.yml
 environment:
   IYUU_API_BASE: https://iyuu.example.com
 ```
@@ -481,6 +499,8 @@ crates/server/        axum 服务、SQLite、调度、API
   scheduler.rs        cron 解析与下次触发时间
   importer.rs         AutoSeed 备份导入
 web/                  Vue 3 + shadcn-vue + Tailwind v4 + Vite
+compose.yml           生产部署配置
+dev.sh                本地开发控制台
 docs/screenshots/     README 截图
 ```
 
