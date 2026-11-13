@@ -145,8 +145,8 @@ docker run -d \
   ghcr.io/hexgu/iyuu-rust:latest
 ```
 
-> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `main` / `sha-xxxxxxx` / `v0.2.1`。
-> 生产环境建议锁到具体版本（例如 `v0.2.1`）而不是 `latest`，升级时再改标签。
+> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `sha-xxxxxxx` / `0.2.1` / `0.2`。
+> 生产环境建议锁到具体版本（例如 `0.2.1`）而不是 `latest`，升级时再改标签。
 > GHCR 在部分网络下需要登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin`。
 
 ### 首次配置
