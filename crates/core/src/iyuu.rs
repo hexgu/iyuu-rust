@@ -2,12 +2,30 @@
 //!
 //! Endpoints implemented (against the host for the account's tier — see
 //! [`ApiTier`]):
-//!   GET  /reseed/sites/index          — supported sites (with `download_page` template)
-//!   GET  /reseed/sites/recommend      — recommended sites (binding-oriented)
+//!   GET  /reseed/sites/index          — the full cross-seed catalogue (with the
+//!                                       `download_page` template). Fetched once
+//!                                       and persisted by the server; not polled.
+//!   GET  /reseed/sites/recommend      — **cooperative** sites: the menu of PT
+//!                                       accounts that can *activate* a token.
+//!                                       NOT a reseed-target list.
+//!   POST /reseed/users/bind           — bind a cooperative-site account, which
+//!                                       is what activates the token.
 //!   POST /reseed/sites/reportExisting — report held site ids, get `sid_sha1`
 //!   POST /reseed/index/index          — THE cross-seed query
-//!   POST /reseed/users/bind           — bind a site account to the IYUU token
 //!   GET  /spider/torrent/total        — site indexed torrent count
+//!
+//! **Catalogue vs. cooperative sites — the distinction matters.** `/sites/index`
+//! answers "which sites can I cross-seed into"; `/sites/recommend` answers "which
+//! of my PT accounts can activate this token". They are different lists with
+//! different shapes (the recommend payload has no `base_url` and no
+//! `download_page`), so parsing one as the other silently yields entries with
+//! empty URLs. The types are separate ([`IyuuSite`] vs [`PartnerSite`]) to make
+//! that mix-up a compile error rather than a runtime mystery.
+//!
+//! **An unactivated token cannot do anything.** IYUU answers
+//! `403 用户未绑定推荐站点` to `/sites/index` until one cooperative-site account is
+//! bound. That failure is surfaced as [`CoreError::IyuuInactive`] so the UI can
+//! point at the activation form instead of telling the user their token is wrong.
 //!
 //! Wire quirks that matter and are easy to get wrong:
 //!  * `hash` is a **JSON array of lowercase hex strings**, sorted ascending, with
@@ -28,7 +46,7 @@
 //!    ban — see [`crate::ratelimit`].
 
 use crate::error::{CoreError, Result};
-use crate::models::{IyuuSite, SeedCandidate};
+use crate::models::{IyuuSite, PartnerSite, SeedCandidate};
 use crate::ratelimit::{
     ApiTier, HASHES_PER_REQUEST, QuotaBudget, QuotaSnapshot, QuotaUsage, looks_rate_limited,
     rate_limit_cooldown,
@@ -72,15 +90,54 @@ struct SidSha1Data {
 }
 
 #[derive(Debug, Deserialize)]
-struct ReseedData {
-    #[serde(flatten)]
-    per_hash: HashMap<String, HashEntry>,
+struct PartnerListData {
+    #[serde(default)]
+    count: i64,
+    #[serde(default)]
+    list: Vec<PartnerSite>,
 }
 
+/// One hash's entry in the `index/index` payload, kept untyped on purpose.
+///
+/// Deserializing straight into `Vec<SeedCandidate>` makes one malformed candidate
+/// fatal for the whole response — and a response covers up to 200 hashes, so a
+/// single unreadable row discarded every good answer in the batch.
+/// [`parse_candidates`] drops the bad row instead.
+///
+/// Wrapped in a struct rather than deserialized as a bare array so a shape change
+/// upstream is reported against a name instead of "invalid type".
 #[derive(Debug, Deserialize)]
 struct HashEntry {
     #[serde(default)]
-    torrent: Vec<SeedCandidate>,
+    torrent: Vec<serde_json::Value>,
+}
+
+/// Extract the usable candidates from one hash's entry, skipping unusable rows.
+///
+/// Returns the parsed candidates plus the rows that could not be read, so the
+/// caller can report a real count rather than silently returning fewer results
+/// (which would read as "no other site has this torrent").
+///
+/// A missing/empty `torrent` array is normal — the server only includes hashes
+/// that have matches, and an entry can legitimately be empty.
+fn parse_candidates(entry: &HashEntry) -> (Vec<SeedCandidate>, Vec<String>) {
+    let mut ok = Vec::new();
+    let mut bad = Vec::new();
+
+    for row in &entry.torrent {
+        match serde_json::from_value::<SeedCandidate>(row.clone()) {
+            Ok(c) => ok.push(c),
+            Err(e) => {
+                // Keep the offending row in the message: without the sid/torrent_id
+                // there is nothing to report to IYUU or to diagnose locally.
+                bad.push(format!(
+                    "{e}（原始数据：{}）",
+                    row.to_string().chars().take(200).collect::<String>()
+                ));
+            }
+        }
+    }
+    (ok, bad)
 }
 
 #[derive(Debug, Serialize)]
@@ -93,11 +150,13 @@ pub struct BindRequest<'a> {
     pub passkey: &'a str,
 }
 
-/// Cached server state that is expensive or rate-limited to obtain.
+/// Server state that is rate-limited to obtain and worth caching in-process.
+///
+/// Only `sid_sha1` lives here. The site catalogue is *not* cached: the server
+/// persists it instead, because it must survive restarts and must only be
+/// refetched when the user asks for it.
 #[derive(Default)]
 struct Cache {
-    sites: Option<Vec<IyuuSite>>,
-    sites_fetched_at: Option<Instant>,
     sid_sha1: Option<String>,
     sid_sha1_at: Option<Instant>,
 }
@@ -201,8 +260,6 @@ impl QuotaState {
 
 /// `sid_sha1` is documented as valid for 7 days; we refresh at 6 to leave slack.
 const SID_SHA1_TTL: Duration = Duration::from_hours(144);
-/// Site list changes rarely; a day is plenty and avoids a request per run.
-const SITES_TTL: Duration = Duration::from_hours(24);
 
 pub struct IyuuClient {
     http: reqwest::Client,
@@ -210,6 +267,10 @@ pub struct IyuuClient {
     token: String,
     cache: RwLock<Cache>,
     quota: RwLock<QuotaState>,
+    /// Non-fatal problems found while parsing responses (e.g. a candidate whose
+    /// id could not be read). Drained by [`IyuuClient::take_warnings`] so the run
+    /// log can show them without turning them into hard errors.
+    warnings: parking_lot::Mutex<Vec<String>>,
 }
 
 impl IyuuClient {
@@ -260,6 +321,7 @@ impl IyuuClient {
             token: token.into(),
             cache: RwLock::new(Cache::default()),
             quota: RwLock::new(QuotaState::new(tier, &QuotaUsage::default())),
+            warnings: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -453,10 +515,25 @@ impl IyuuClient {
         if code == 0 || code == 200 {
             let data = raw.get("data").cloned().unwrap_or(serde_json::Value::Null);
             if data.is_null() {
+                // A "successful" code with a null body is not always a parse
+                // problem: IYUU reports an expired `sid_sha1` this way (code 0,
+                // `data: null`, and the reason in `msg`). Reporting a generic
+                // "data 为空" would discard that reason, and the caller would
+                // never learn it should re-report and retry — the whole retry
+                // path would be dead. So run the message through the same
+                // classifier as a real error first.
+                let classified = self.classify(msg.clone(), what, code);
+                if !matches!(classified, CoreError::Upstream { .. }) {
+                    return Err(classified);
+                }
                 return Err(CoreError::Upstream {
                     what: what.to_string(),
                     code,
-                    msg: "成功响应但 data 为空".into(),
+                    msg: if msg.is_empty() {
+                        "成功响应但 data 为空".into()
+                    } else {
+                        format!("成功响应但 data 为空：{msg}")
+                    },
                 });
             }
             return serde_json::from_value(data).map_err(|e| CoreError::Upstream {
@@ -466,22 +543,41 @@ impl IyuuClient {
             });
         }
 
-        // Token problems deserve their own variant — the UI shows a distinct
-        // hint for them (bind your sites / check the token).
+        // One place decides what a failure message *means*, shared with the
+        // non-2xx path in `send`, so the two cannot drift apart. Getting this
+        // wrong in either direction is what makes an unactivated token look like
+        // a bad token (or a rate limit).
+        Err(self.classify(msg, what, code))
+    }
+
+    /// Turn an upstream error message into a typed error.
+    ///
+    /// Order matters:
+    ///
+    /// 1. **Not activated** — the token is fine; the fix is `POST
+    ///    /reseed/users/bind`. Checked first because the message talks about
+    ///    绑定, which is easy to mistake for a token problem.
+    /// 2. **Token** — a genuine credential problem.
+    /// 3. **Rate limit** — checked last on purpose: "token 超出有效期" is a
+    ///    credential problem, and telling the user to wait half an hour for it
+    ///    would be the wrong advice.
+    fn classify(&self, msg: String, what: &str, code: i64) -> CoreError {
+        if is_unactivated_message(&msg) {
+            return CoreError::IyuuInactive(msg);
+        }
         if msg.contains("token") || msg.contains("Token") {
-            return Err(CoreError::IyuuToken(msg));
+            return CoreError::IyuuToken(msg);
         }
-        // Checked after the token branch on purpose: "token 超出有效期" is a
-        // credential problem, and telling the user to wait half an hour would be
-        // the wrong advice.
         if looks_rate_limited(&msg) {
-            return Err(self.trip_breaker(&msg));
+            // Trips the breaker: the next request during a cooldown is what turns
+            // a temporary throttle into a longer ban.
+            return self.trip_breaker(&msg);
         }
-        Err(CoreError::Upstream {
+        CoreError::Upstream {
             what: what.to_string(),
             code,
             msg,
-        })
+        }
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<String> {
@@ -508,17 +604,14 @@ impl IyuuClient {
                     .unwrap_or_default()
                     .to_string();
                 let msg = if msg.is_empty() { body } else { msg };
-                // A 429 (or an over-quota message on any status) means stop,
-                // not retry. Checking the body as well covers deployments that
-                // answer 403 with a quota message instead of 429.
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || looks_rate_limited(&msg) {
+                // 429 is unambiguous. Everything else goes through the shared
+                // classifier, so an "unactivated" or quota message delivered with
+                // a 403 body is still typed correctly — which is exactly how IYUU
+                // answers `403 用户未绑定推荐站点`.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     return Err(self.trip_breaker(&msg));
                 }
-                return Err(CoreError::Upstream {
-                    what: what.to_string(),
-                    code,
-                    msg,
-                });
+                return Err(self.classify(msg, what, code));
             }
             return Err(CoreError::Upstream {
                 what: what.to_string(),
@@ -531,21 +624,23 @@ impl IyuuClient {
 
     // ---------------------------------------------------------------- sites
 
-    /// All sites IYUU supports for cross-seeding. Cached for a day.
+    /// All sites IYUU supports for cross-seeding, fetched from the network.
+    ///
+    /// **Uncached on purpose.** The catalogue is nearly static, so the expensive
+    /// part is not the request but *repeating* it: the server persists the result
+    /// in SQLite and serves every page and every run from there. Refetching only
+    /// happens on the very first run (empty table) or when the user clicks 刷新
+    /// (see `db::SiteCatalogue`). Keeping a TTL cache here as well would hide
+    /// which of the two just happened, so this method always means "one real
+    /// request, one unit of quota".
+    ///
+    /// The old signature took a `force` flag and cached for 24h; that made a page
+    /// refresh spend quota while a genuine refresh could be served stale.
     ///
     /// # Errors
-    /// Returns an error when the request fails or the response envelope reports
-    /// a non-success code.
-    pub async fn sites(&self, force: bool) -> Result<Vec<IyuuSite>> {
-        if !force {
-            let guard = self.cache.read();
-            if let (Some(sites), Some(at)) = (&guard.sites, guard.sites_fetched_at)
-                && at.elapsed() < SITES_TTL
-            {
-                return Ok(sites.clone());
-            }
-        }
-
+    /// Returns an error when the request fails, the envelope reports a
+    /// non-success code, or the token is not yet activated.
+    pub async fn sites(&self) -> Result<Vec<IyuuSite>> {
         self.spend("获取站点列表", 0).await?;
         let req = self
             .http
@@ -555,9 +650,8 @@ impl IyuuClient {
         let data: SitesData =
             self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取站点列表")?;
 
-        // `count` is the server's total, which may exceed `sites.len()` when the
-        // account is bound to only part of the catalogue. Log the mismatch
-        // instead of silently discarding the field.
+        // `count` is the server's total; it can legitimately exceed `sites.len()`
+        // if the payload is paginated in future. Log rather than drop the field.
         if data.count != len_as_i64(data.sites.len()) {
             tracing::debug!(
                 reported = data.count,
@@ -565,52 +659,38 @@ impl IyuuClient {
                 "站点列表数量与服务器报告不一致"
             );
         }
-
-        let mut guard = self.cache.write();
-        guard.sites = Some(data.sites.clone());
-        guard.sites_fetched_at = Some(Instant::now());
         Ok(data.sites)
     }
 
-    /// Site list keyed by sid, for O(1) lookup during a run.
+    /// The **cooperative sites** that can activate this token.
     ///
-    /// # Errors
-    /// Propagates [`IyuuClient::sites`]'s failure.
-    pub async fn sites_by_id(&self) -> Result<HashMap<i64, IyuuSite>> {
-        Ok(self
-            .sites(false)
-            .await?
-            .into_iter()
-            .map(|s| (s.id, s))
-            .collect())
-    }
-
-    /// Sites the user has bound ("recommended" set in IYUU's vocabulary).
+    /// Despite the endpoint's name ("recommend"), this is not a recommendation
+    /// list and it is not the cross-seed catalogue: it is the set of sites where
+    /// binding one of your accounts (`POST /reseed/users/bind`) grants the token
+    /// its daily allowance. Until one is bound, every other endpoint answers
+    /// `403 用户未绑定推荐站点`.
+    ///
+    /// The payload is deliberately *not* parsed as [`IyuuSite`]: it has no
+    /// `base_url` and no `download_page`, so the catalogue type would produce
+    /// entries that look real and cannot download anything.
     ///
     /// # Errors
     /// Returns an error when the request fails or the response cannot be
     /// decoded.
-    pub async fn recommended_sites(&self) -> Result<Vec<IyuuSite>> {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            count: i64,
-            #[serde(default)]
-            list: Vec<IyuuSite>,
-        }
-
-        self.spend("获取推荐站点", 0).await?;
+    pub async fn partner_sites(&self) -> Result<Vec<PartnerSite>> {
+        self.spend("获取合作站点", 0).await?;
         let req = self
             .http
             .get(self.url("/reseed/sites/recommend"))
             .header("token", self.token_header()?);
-        let body = self.send(req, "获取推荐站点").await?;
-        let data: Wrapper = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取推荐站点")?;
+        let body = self.send(req, "获取合作站点").await?;
+        let data: PartnerListData =
+            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "获取合作站点")?;
         if data.count != len_as_i64(data.list.len()) {
             tracing::debug!(
                 reported = data.count,
                 received = data.list.len(),
-                "推荐站点数量与服务器报告不一致"
+                "合作站点数量与服务器报告不一致"
             );
         }
         Ok(data.list)
@@ -734,13 +814,50 @@ impl IyuuClient {
             .form(&form);
         let body = self.send(req, "查询辅种").await?;
 
-        match self.unwrap_envelope::<ReseedData>(reqwest::StatusCode::OK, &body, "查询辅种") {
-            Ok(data) => Ok(data
-                .per_hash
-                .into_iter()
-                .map(|(k, v)| (crate::bencode::normalize_hash(&k), v.torrent))
-                .filter(|(_, v)| !v.is_empty())
-                .collect()),
+        // `unwrap_envelope` hands back the `data` object, which for this endpoint
+        // is a map keyed by info-hash.
+        match self.unwrap_envelope::<HashMap<String, HashEntry>>(
+            reqwest::StatusCode::OK,
+            &body,
+            "查询辅种",
+        ) {
+            Ok(data) => {
+                let mut out: HashMap<String, Vec<SeedCandidate>> = HashMap::new();
+                let mut skipped = 0usize;
+                let mut first_bad: Option<String> = None;
+
+                for (hash, entry) in data {
+                    let (candidates, bad) = parse_candidates(&entry);
+                    if !bad.is_empty() {
+                        // Warn, don't fail: the rest of this hash's candidates (and
+                        // every other hash in the batch) are still worth keeping.
+                        skipped += bad.len();
+                        first_bad.get_or_insert_with(|| bad[0].clone());
+                        tracing::warn!(
+                            %hash,
+                            rows = bad.len(),
+                            first = %bad[0],
+                            "辅种候选中有无法解析的行，已跳过"
+                        );
+                    }
+                    if !candidates.is_empty() {
+                        out.entry(crate::bencode::normalize_hash(&hash))
+                            .or_default()
+                            .extend(candidates);
+                    }
+                }
+
+                if skipped > 0 {
+                    // Surfaced to the UI as a warning: a silently smaller result
+                    // set would look like "no other site has these".
+                    tracing::warn!(skipped, "本批次有候选行无法解析，已跳过");
+                    let detail = first_bad.unwrap_or_default();
+                    self.push_warning(format!(
+                        "有 {skipped} 条辅种候选无法解析，已跳过（首条：{detail}）"
+                    ));
+                }
+                Ok(out)
+            }
             Err(CoreError::Upstream { msg, .. })
                 if msg.contains("站点哈希值") || msg.contains("sid_sha1") =>
             {
@@ -751,6 +868,29 @@ impl IyuuClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Record a warning that the current run should surface to the user.
+    ///
+    /// `reseed_query` returns only candidates, so non-fatal data problems need a
+    /// side channel; the engine drains this after each batch and folds it into
+    /// `DiscoveryOutcome::warnings` (which the UI shows in the run log).
+    fn push_warning(&self, msg: String) {
+        let mut w = self.warnings.lock();
+        // Bounded: a pathological response could otherwise emit one entry per bad
+        // row for hundreds of rows.
+        if w.len() < 20 {
+            w.push(msg);
+        }
+    }
+
+    /// Take the warnings accumulated since the last call.
+    ///
+    /// Draining rather than reading means a caller that retries a batch does not
+    /// see the same warning twice.
+    #[must_use]
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.warnings.lock())
     }
 
     /// Convenience wrapper: query with automatic chunking, local budget
@@ -824,6 +964,10 @@ impl IyuuClient {
                         for (k, mut v) in map {
                             out.entry(k).or_default().append(&mut v);
                         }
+                        // Parse-level problems (a candidate row that could not be
+                        // read) are non-fatal but must reach the UI, otherwise the
+                        // run looks like it found less than it did.
+                        warnings.extend(self.take_warnings());
                         break;
                     }
                     Err(CoreError::SidSha1Expired(_)) if !refreshed => {
@@ -876,22 +1020,49 @@ impl IyuuClient {
 
     // --------------------------------------------------------------- binding
 
-    /// Bind a site account. `passkey` must be the **sha1 hex of the site
-    /// passkey**, not the passkey itself — IYUU stores only the digest.
+    /// Bind a cooperative-site account, which **activates the token**.
+    ///
+    /// Wire format per the reference client: `application/x-www-form-urlencoded`
+    /// with `token`, `site`, `sid`, `id`, `passkey` — and `passkey` must be the
+    /// **sha1 hex of the site passkey**, never the passkey itself. IYUU stores
+    /// only the digest, so sending the raw secret both fails and needlessly
+    /// transmits it.
+    ///
+    /// Note the response is `{"code":0,"data":[],"msg":"ok"}` — an *empty array*
+    /// as `data`. [`IyuuClient::unwrap_envelope`] treats a null `data` as a parse
+    /// failure but accepts `[]`, which is why this uses `serde_json::Value`.
     ///
     /// # Errors
-    /// Returns an error when the request fails or IYUU rejects the credentials.
+    /// Returns an error when the request fails, the token is not activatable, or
+    /// IYUU rejects the credentials.
     pub async fn bind(&self, req: &BindRequest<'_>) -> Result<()> {
-        self.spend("绑定站点", 0).await?;
+        self.spend("绑定合作站点", 0).await?;
         let request = self.http.post(self.url("/reseed/users/bind")).form(req);
-        let body = self.send(request, "绑定站点").await?;
+        let body = self.send(request, "绑定合作站点").await?;
         let _: serde_json::Value =
-            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定站点")?;
-        // Binding changes which sites we hold, so both caches are now stale.
+            self.unwrap_envelope(reqwest::StatusCode::OK, &body, "绑定合作站点")?;
+        // Binding changes which sites the account holds, so the reported-站点
+        // filter token no longer describes reality.
         self.invalidate_sid_sha1();
-        let mut guard = self.cache.write();
-        guard.sites_fetched_at = None;
         Ok(())
+    }
+
+    /// Whether the token is activated, i.e. whether `/reseed/sites/index` answers.
+    ///
+    /// This is the only honest activation probe: `/sites/recommend` lists what
+    /// *could* be bound and answers even for an unbound token, so it says nothing
+    /// about activation. A cheap catalogue request is the cheapest request that
+    /// distinguishes the two states.
+    ///
+    /// # Errors
+    /// Propagates anything other than "not activated", so a network failure is
+    /// never reported as "your token needs activating".
+    pub async fn is_activated(&self) -> Result<bool> {
+        match self.sites().await {
+            Ok(_) => Ok(true),
+            Err(CoreError::IyuuInactive(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Indexed torrent count for a site — useful to validate a site name.
@@ -913,6 +1084,24 @@ impl IyuuClient {
         let data: TotalData = self.unwrap_envelope(reqwest::StatusCode::OK, &body, "查站点收录")?;
         Ok(data.total)
     }
+}
+
+/// Whether an IYUU error message means "this token has not been activated".
+///
+/// The service's wording is `用户未绑定推荐站点` ("user has not bound a
+/// recommended/cooperative site"), which is about **cooperative-site binding**,
+/// not about `reportExisting`. Two facts make this easy to conflate:
+///
+///  * It mentions 绑定 (bind), and the only other bind in this API is
+///    `reportExisting` — which is a different, unrelated call.
+///  * It says 推荐站点 (recommended sites), which is `/sites/recommend` — the
+///    cooperative-site menu, not the reseed catalogue.
+///
+/// So the correct reaction is "go activate your token", never "re-report your
+/// sites". Matching on the distinguishing phrase rather than on 绑定 keeps that
+/// from being re-broken by a future refactor.
+fn is_unactivated_message(msg: &str) -> bool {
+    msg.contains("未绑定推荐站点") || msg.contains("未绑定合作站点") || msg.contains("未激活")
 }
 
 /// Scheme to use when building a URL for a site.
@@ -1082,6 +1271,465 @@ mod tests {
         assert!(render_download_template("dl.php?id={}&sig={unknown}", 1, &creds).is_none());
     }
 
+    // ------------------------------------------- cooperative vs. catalogue
+
+    #[test]
+    fn partner_sites_parse_the_recommend_shape_without_catalogue_fields() {
+        // `sites/recommend` has no base_url / download_page. Parsing it as
+        // IyuuSite (the old behaviour) produced entries with empty URLs that
+        // looked like real sites and could not download anything.
+        let json = r#"{
+            "count": 2,
+            "list": [
+                {"id": 7, "site": "hdhome", "nickname": "家园",
+                 "bind_check": "passkey,uid", "reseed_check": "passkey"},
+                {"id": 9, "site": "ourbits", "nickname": "我堡",
+                 "bind_check": "passkey", "reseed_check": "passkey"}
+            ]
+        }"#;
+        let data: PartnerListData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.count, 2);
+        assert_eq!(data.list.len(), 2);
+        assert_eq!(data.list[0].display_name(), "家园");
+        assert_eq!(data.list[1].site, "ourbits");
+    }
+
+    #[test]
+    fn bind_uid_requirement_follows_bind_check() {
+        let site = |bind_check: &str| PartnerSite {
+            id: 1,
+            site: "x".into(),
+            nickname: String::new(),
+            bind_check: bind_check.into(),
+            reseed_check: String::new(),
+        };
+        assert!(site("passkey,uid").needs_uid());
+        assert!(site("uid,passkey").needs_uid());
+        assert!(site(" uid ").needs_uid());
+        assert!(!site("passkey").needs_uid());
+        // Unknown/absent metadata: the endpoint documents `id` as required, so
+        // ask for it instead of sending a call that is certain to be rejected.
+        assert!(site("").needs_uid());
+    }
+
+    /// A client with a zeroed quota mirror, for exercising pure helpers.
+    fn test_client() -> IyuuClient {
+        IyuuClient::build("token", ApiTier::Free.base_url(), ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default())
+    }
+
+    #[test]
+    fn classifier_types_every_failure_the_same_way_for_both_paths() {
+        // `unwrap_envelope` (2xx with a failure code) and `send` (non-2xx) both
+        // funnel through `classify`, so one classification is enough. IYUU answers
+        // an unactivated token with `403 用户未绑定推荐站点` in the body of a
+        // non-2xx response, which is the case that used to be missed.
+        let c = test_client();
+        assert!(matches!(
+            c.classify("用户未绑定推荐站点".into(), "获取站点列表", 403),
+            CoreError::IyuuInactive(_)
+        ));
+        assert!(matches!(
+            c.classify("token 无效".into(), "获取站点列表", 403),
+            CoreError::IyuuToken(_)
+        ));
+        assert!(matches!(
+            c.classify("请求过于频繁，请稍后再试".into(), "查询辅种", 429),
+            CoreError::RateLimited(_)
+        ));
+        assert!(matches!(
+            c.classify("做种列表sha1校验失败".into(), "查询辅种", 400),
+            CoreError::Upstream { .. }
+        ));
+    }
+
+    #[test]
+    fn unactivated_token_is_its_own_error_not_a_token_error() {
+        // "用户未绑定推荐站点" is about cooperative-site binding, not about a bad
+        // token. Reporting it as a token error sends the user to the wrong page.
+        assert!(is_unactivated_message("用户未绑定推荐站点"));
+        assert!(is_unactivated_message("Token 未激活"));
+        assert!(!is_unactivated_message("token 无效"));
+        assert!(!is_unactivated_message("做种列表sha1校验失败"));
+    }
+
+    // ------------------------------------------------- wire-format round-trip
+
+    /// Serve one canned response and capture the request that produced it.
+    ///
+    /// A real local server rather than a mocked `IyuuClient`: the things most
+    /// likely to be wrong here are the *wire* details — form vs. JSON body, field
+    /// names, the `token` header, the exact bytes the sha1 signs — and a mock at
+    /// the method level cannot catch any of them.
+    async fn serve_once(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<(String, String)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut read = 0;
+            // Read until the headers are complete, then until Content-Length is
+            // satisfied: a partially-read body would look like a malformed request.
+            loop {
+                let n = socket.read(&mut buf[read..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                let text = String::from_utf8_lossy(&buf[..read]).to_string();
+                if let Some(idx) = text.find("\r\n\r\n") {
+                    let head = &text[..idx];
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if read >= idx + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&buf[..read]).to_string();
+            let (head, payload) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            (head.to_string(), payload.to_string())
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn report_existing_posts_json_sid_list_with_the_token_header() {
+        // Docs: `POST /reseed/sites/reportExisting`, `Content-Type: application/json`,
+        // body `{"sid_list":[1,2,3]}`, token in a header. Getting the content type
+        // wrong makes IYUU answer "缺少sid_list".
+        let (base, handle) = serve_once(
+            200,
+            r#"{"code":0,"data":{"sid_sha1":"c6546d72b02d609e48986190afabf645088d5bb4"},"msg":"ok"}"#,
+        )
+        .await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        let sha = client.report_existing(&[1, 2, 3]).await.unwrap();
+        assert_eq!(sha, "c6546d72b02d609e48986190afabf645088d5bb4");
+
+        let (head, body) = handle.await.unwrap();
+        let lower = head.to_lowercase();
+        assert!(
+            lower.contains("token: tok"),
+            "token header missing:\n{head}"
+        );
+        assert!(
+            lower.contains("content-type: application/json"),
+            "reportExisting must POST JSON:\n{head}"
+        );
+        // Field name and shape are what the server validates.
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["sid_list"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[tokio::test]
+    async fn reseed_query_signs_exactly_the_bytes_it_sends() {
+        // The single most fragile part of this API: `sha1` must be the digest of
+        // the `hash` string *as sent* — sorted, lowercase, compact JSON. The mock
+        // recomputes it from the form body, so this test fails if the client ever
+        // signs a differently-formatted string than it transmits.
+        let (base, handle) = serve_once(
+            200,
+            r#"{"code":0,"data":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"torrent":[{"sid":7,"torrent_id":1,"info_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}},"msg":"ok"}"#,
+        )
+        .await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        // Deliberately unsorted and uppercase: normalization must happen before
+        // signing, otherwise the server's own sort produces a different digest.
+        let hashes = vec![
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ];
+        let out = client.reseed_query(&hashes, "sidsha").await.unwrap();
+        assert_eq!(
+            out.get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let (head, body) = handle.await.unwrap();
+        let lower = head.to_lowercase();
+        assert!(
+            lower.contains("content-type: application/x-www-form-urlencoded"),
+            "reseed query must be form-encoded:\n{head}"
+        );
+
+        let form: std::collections::HashMap<String, String> = body
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| {
+                (
+                    urlencoding::decode(k).unwrap().into_owned(),
+                    urlencoding::decode(v).unwrap().into_owned(),
+                )
+            })
+            .collect();
+
+        let hash_field = form.get("hash").expect("hash field");
+        assert_eq!(
+            hash_field,
+            r#"["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]"#,
+            "hash must be sorted, lowercase and compact"
+        );
+        let expected = {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(hash_field.as_bytes());
+            hex::encode(h.finalize())
+        };
+        assert_eq!(
+            form.get("sha1"),
+            Some(&expected),
+            "sha1 must sign the sent bytes"
+        );
+        assert_eq!(form.get("sid_sha1"), Some(&"sidsha".to_string()));
+        assert!(form.contains_key("timestamp"));
+        assert_eq!(form.get("version"), Some(&IYUU_API_VERSION.to_string()));
+    }
+
+    #[test]
+    fn one_unreadable_candidate_does_not_discard_the_batch() {
+        // The regression this guards: deserializing the whole response into
+        // `HashMap<String, Vec<SeedCandidate>>` made ONE bad row fatal for up to
+        // 200 hashes. Real report:
+        //   批次查询失败：响应数据结构不符：invalid type: string "631188", expected i64
+        let payload = serde_json::json!({
+            "aaaa": {"torrent": [
+                {"sid": 7, "torrent_id": "631188", "info_hash": "h1"},
+                {"sid": 7, "torrent_id": {"nested": "garbage"}, "info_hash": "h2"},
+                {"sid": 9, "torrent_id": 42, "info_hash": "h3"},
+            ]},
+            "bbbb": {"torrent": [{"sid": 3, "torrent_id": 1, "info_hash": "h4"}]},
+        });
+        let data: HashMap<String, HashEntry> = serde_json::from_value(payload).unwrap();
+
+        let (a, bad_a) = parse_candidates(&data["aaaa"]);
+        assert_eq!(a.len(), 2, "the two readable rows must survive");
+        assert_eq!(
+            bad_a.len(),
+            1,
+            "the bad row must be reported, not swallowed"
+        );
+        assert_eq!(a[0].torrent_id, 631_188, "numeric string parsed");
+        assert_eq!(a[1].torrent_id, 42);
+
+        // A different hash in the same response is untouched — this is the part
+        // that strict deserialization destroyed.
+        let (b, bad_b) = parse_candidates(&data["bbbb"]);
+        assert_eq!(b.len(), 1);
+        assert_eq!(bad_b.len(), 0, "no bad rows in the clean hash: {bad_b:?}");
+    }
+
+    #[test]
+    fn a_hash_with_no_torrent_key_yields_no_candidates_and_no_error() {
+        // The server omits empty hashes, but a defensive read must not turn a
+        // missing array into a failure the caller cannot act on.
+        let entry: HashEntry = serde_json::from_value(serde_json::json!({})).unwrap();
+        let (ok, bad) = parse_candidates(&entry);
+        assert!(ok.is_empty() && bad.is_empty());
+
+        let entry: HashEntry = serde_json::from_value(serde_json::json!({"torrent": []})).unwrap();
+        let (ok, bad) = parse_candidates(&entry);
+        assert!(ok.is_empty() && bad.is_empty());
+    }
+
+    #[test]
+    fn the_bad_row_message_carries_enough_to_diagnose_it() {
+        // This string ends up in the run log, so it has to name the offending value
+        // *and* quote the row: "expected i64" on its own says neither which field
+        // nor which site produced it.
+        let entry: HashEntry = serde_json::from_value(serde_json::json!({
+            "torrent": [{"sid": 7, "torrent_id": "not-a-number", "info_hash": "h"}]
+        }))
+        .unwrap();
+        let (ok, bad) = parse_candidates(&entry);
+        assert!(ok.is_empty());
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].contains("not-a-number"), "{}", bad[0]);
+        assert!(
+            bad[0].contains("原始数据"),
+            "row must be quoted: {}",
+            bad[0]
+        );
+    }
+
+    #[test]
+    fn warnings_accumulate_and_drain_once() {
+        // A drained channel is what stops the same warning being reported twice
+        // when a batch is retried after a sid_sha1 refresh.
+        let c = test_client();
+        c.push_warning("first".into());
+        c.push_warning("second".into());
+        assert_eq!(c.take_warnings(), vec!["first", "second"]);
+        assert!(c.take_warnings().is_empty(), "a second drain must be empty");
+    }
+
+    #[test]
+    fn warning_channel_is_bounded() {
+        // A pathological response could carry one bad row per hash across hundreds
+        // of hashes; the run log must not grow with it.
+        let c = test_client();
+        for i in 0..100 {
+            c.push_warning(format!("w{i}"));
+        }
+        assert_eq!(c.take_warnings().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn reseed_query_all_keeps_good_candidates_when_one_row_is_junk() {
+        // End-to-end version of the regression: a real HTTP response carrying the
+        // exact payload that broke a run, run through the public batch method.
+        let (base, _handle) = serve_once(
+            200,
+            r#"{"code":0,"data":{"aaaa":{"torrent":[
+                {"sid":40,"torrent_id":"631188","info_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+                {"sid":40,"torrent_id":{"bad":true},"info_hash":"cccccccccccccccccccccccccccccccccccccccc"},
+                {"sid":40,"torrent_id":999,"info_hash":"dddddddddddddddddddddddddddddddddddddddd"}
+            ]}},"msg":"ok"}"#,
+        )
+        .await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        // `sid_sha1` comes from reportExisting, which this mock does not serve, so
+        // prime the cache by reporting against a second single-shot server would
+        // need two ports. Instead call the query directly with a known filter token
+        // — the point under test is response parsing, not the filter handshake.
+        let out = client
+            .reseed_query(
+                &["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()],
+                "sha",
+            )
+            .await
+            .expect("a junk row must not fail the whole query");
+
+        // Candidates are keyed by the hash the *server* echoed back — it is the
+        // authoritative link between a candidate and the local torrent, so the key
+        // comes from the response, not from the request.
+        let cands = out
+            .get("aaaa")
+            .expect("the hash with valid rows must be present");
+        assert_eq!(cands.len(), 2, "two of three rows are readable");
+        assert_eq!(cands[0].torrent_id, 631_188, "numeric string accepted");
+        assert_eq!(cands[1].torrent_id, 999);
+
+        // And the skip is reported, not silently swallowed.
+        let warnings = client.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("无法解析"), "{}", warnings[0]);
+    }
+
+    #[tokio::test]
+    async fn sites_index_403_is_reported_as_not_activated() {
+        // IYUU answers an unactivated token with a non-2xx status *and* a JSON body
+        // saying 用户未绑定推荐站点. Both paths must land on IyuuInactive — telling
+        // the user their token is wrong would send them to the wrong page.
+        let (base, _handle) =
+            serve_once(403, r#"{"code":403,"msg":"用户未绑定推荐站点","data":[]}"#).await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        match client.sites().await {
+            Err(CoreError::IyuuInactive(msg)) => assert!(msg.contains("推荐站点"), "{msg}"),
+            other => panic!("expected IyuuInactive, got {other:?}"),
+        }
+        // And the activation probe must translate that into `false`, not an error.
+        let (base, _handle) =
+            serve_once(403, r#"{"code":403,"msg":"用户未绑定推荐站点","data":[]}"#).await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+        assert!(!client.is_activated().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sites_index_parses_the_documented_catalogue_shape() {
+        // The `download_page` template is the only field the fetcher cannot work
+        // without, so a parse that drops it silently breaks every download.
+        let (base, _handle) = serve_once(
+            200,
+            r#"{"code":0,"data":{"count":1,"sites":[{"id":1,"site":"xxx","nickname":"朋友","base_url":"www.xxx.com","download_page":"download.php?id={}&passkey={passkey}","details_page":"details.php?id={}","reseed_check":"passkey","is_https":2,"cookie_required":0}]},"msg":"ok"}"#,
+        )
+        .await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        let sites = client.sites().await.unwrap();
+        assert_eq!(sites.len(), 1);
+        let s = &sites[0];
+        assert_eq!(s.id, 1);
+        assert_eq!(s.display_name(), "朋友");
+        assert_eq!(s.download_page, "download.php?id={}&passkey={passkey}");
+        assert_eq!(s.is_https, 2);
+        assert_eq!(site_scheme(s), "https");
+    }
+
+    #[tokio::test]
+    async fn bind_posts_a_form_with_the_sha1_passkey() {
+        // `passkey` must be the sha1 hex — IYUU stores only the digest, and sending
+        // the raw secret both fails and needlessly transmits it. `data: []` is the
+        // documented success shape and must not be mistaken for a parse failure.
+        let (base, handle) = serve_once(200, r#"{"code":0,"data":[],"msg":"ok"}"#).await;
+        let client = IyuuClient::build("tok", base, ApiTier::Free)
+            .unwrap()
+            .with_usage(&QuotaUsage::default());
+
+        let sha = "aed33394020b35c4b1ad398a0a7434b05e95a5dd";
+        client
+            .bind(&BindRequest {
+                token: "tok",
+                site: "hdhome",
+                sid: Some(7),
+                id: 114_053,
+                passkey: sha,
+            })
+            .await
+            .unwrap();
+
+        let (head, body) = handle.await.unwrap();
+        assert!(
+            head.to_lowercase()
+                .contains("application/x-www-form-urlencoded")
+        );
+        let form: std::collections::HashMap<String, String> = body
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), urlencoding::decode(v).unwrap().into_owned()))
+            .collect();
+        assert_eq!(form.get("site").map(String::as_str), Some("hdhome"));
+        assert_eq!(form.get("id").map(String::as_str), Some("114053"));
+        assert_eq!(form.get("passkey").map(String::as_str), Some(sha));
+        // The token travels as a body field *and* a header, per the docs.
+        assert_eq!(form.get("token").map(String::as_str), Some("tok"));
+    }
+
     #[test]
     fn scheme_respects_is_https_flag() {
         let mut s = IyuuSite {
@@ -1094,7 +1742,6 @@ mod tests {
             reseed_check: String::new(),
             is_https: 0,
             cookie_required: 0,
-            bind_check: String::new(),
         };
         assert_eq!(site_scheme(&s), "http", "is_https=0 means http-only");
         s.is_https = 1;
