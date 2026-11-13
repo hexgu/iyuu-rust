@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一个分支只保留最新一次运行：新 push 会取消还在跑的旧任务，省 runner。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- Rust 门禁
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 海外 runner 用官方 crates.io 更快；仓库里的 .cargo/config.toml 指向
+      # rsproxy.cn，那是给国内网络准备的，这里覆盖掉。
+      - name: 恢复 cargo 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+
+      - name: 移除国内镜像配置
+        run: rm -f .cargo/config.toml
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy（pedantic，警告即错误）
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 恢复 cargo 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+
+      - name: 移除国内镜像配置
+        run: rm -f .cargo/config.toml
+
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+  # ------------------------------------------------------------- 前端门禁
+  web:
+    name: 前端类型检查 + 构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 恢复 bun 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      # bunfig.toml 也指向 npmmirror，海外 runner 直接覆盖成官方源。
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+        env:
+          BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+
+      - name: 类型检查 + 构建
+        run: bun run build
+        env:
+          BUN_CONFIG_REGISTRY: https://registry.npmjs.org
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+
+  # ------------------------------------------------------------------ 镜像
+  # 构建并推送多架构镜像到 ghcr.io。只在 main 分支和 tag 上推送，PR 只验证
+  # 能否构建（不推），这样 fork 来的 PR 拿不到写权限也不会失败。
+  image:
+    name: 镜像 → ghcr.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 QEMU（arm64 交叉构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # PR 只构建 amd64 验证可编译，快得多。
+      - name: 生成镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 登录 ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 海外构建机走 crates.io / npmjs，别绕国内镜像。
+          build-args: |
+            CARGO_SOURCE=global
+            NPM_REGISTRY=https://registry.npmjs.org
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
