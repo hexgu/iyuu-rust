@@ -15,7 +15,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use iyuu_core::downloader::Downloader;
 use iyuu_core::iyuu::IyuuClient;
-use iyuu_core::models::RunTrigger;
+use iyuu_core::models::{IyuuSite, RunTrigger};
 use iyuu_core::ratelimit::ApiTier;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,8 +35,15 @@ pub fn router(state: AppState) -> Router {
         // connectivity tests
         .route("/test/iyuu", post(test_iyuu))
         .route("/test/downloader", post(test_downloader))
+        // The catalogue is served from the database; `POST /sites/refresh` is the
+        // only thing that spends quota on `/reseed/sites/index`.
         .route("/sites", get(list_sites))
-        .route("/sites/bound", get(list_bound_sites))
+        .route("/sites/refresh", post(refresh_sites))
+        // Cooperative sites + token activation. A distinct concept from the
+        // catalogue: these are the PT accounts that activate the token.
+        .route("/partners", get(list_partners))
+        .route("/partners/bind", post(bind_partner))
+        .route("/partners/activated", get(check_activation))
         // Credentials are edited one site at a time: the settings page used to
         // submit the whole catalogue in one patch, which meant one site's
         // re-save could not be reasoned about on its own.
@@ -229,9 +236,24 @@ async fn put_config(
     let mut cfg = state.config_snapshot();
     cfg.apply_patch(patch);
     cfg.validate()?;
+    // Detect "a token was just saved" *before* overwriting the state: that is the
+    // moment the catalogue becomes fetchable, and waiting for the user to find the
+    // 刷新 button leaves an empty site picker that looks like a bug.
+    let token_newly_set =
+        !cfg.iyuu.token.trim().is_empty() && !state.db.catalogue_initialised().unwrap_or(false);
+
     cfg.save(&state.db)?;
     *state.config.write() = cfg.clone();
     state.push_log("配置已更新");
+
+    // One attempt, best-effort, in the background: a slow IYUU must not hold up
+    // the save response, and a failure is recoverable with the 刷新 button.
+    if token_newly_set {
+        let s = state.clone();
+        tokio::spawn(async move {
+            crate::runner::bootstrap_site_catalogue(s).await;
+        });
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -276,20 +298,42 @@ async fn test_iyuu(
     // than `for_tier` so an operator's mirror override is honoured here too — a
     // probe that bypassed it would reach the real IYUU while every real run goes
     // through the mirror.
-    let client = IyuuClient::build(token, crate::config::IyuuConfig::base_url_for(tier), tier)?;
+    // Seeded with the day's spend: the probe is metered like any other request, so
+    // reporting the resulting position is only honest if it starts from the truth.
+    let client = IyuuClient::build(token, crate::config::IyuuConfig::base_url_for(tier), tier)?
+        .with_usage(&state.db.load_api_usage()?);
 
-    // `sites()` proves the host answers and fills the catalogue.
-    let sites = client.sites(true).await?;
-
-    // `recommended_sites()` is the token-scoped call: it is what actually proves
-    // the token is real, so its failure is fatal here rather than defaulted away.
-    // Swallowing it is what let an invalid token report success.
+    // The probe is `/reseed/sites/index` and nothing else, because it is the only
+    // endpoint that distinguishes the states a user actually needs told apart:
     //
-    // Rate limiting is reported separately because it is not a verdict on the
-    // token — the request never got as far as being judged, and telling the user
-    // to "check your token" because of a throttle would be wrong advice.
-    let bound = match client.recommended_sites().await {
-        Ok(list) => list,
+    //   ok                 → token works and is activated
+    //   IyuuInactive       → token is fine but no cooperative site is bound yet
+    //   IyuuToken          → token itself is rejected
+    //
+    // The earlier version probed `/sites/recommend` and treated its result as
+    // "the sites this token has bound". That endpoint lists the **cooperative
+    // sites that could activate the token**, answers even for an unbound token,
+    // and has nothing to do with which sites the user reseeds into. Using it as
+    // an auth verdict meant an unactivated token reported success and then failed
+    // every real run.
+    let sites = match client.sites().await {
+        Ok(s) => s,
+        // Nothing is wrong with the token — it just needs activating. Returning
+        // an error here would be technically right and practically misleading.
+        Err(iyuu_core::CoreError::IyuuInactive(msg)) => {
+            persist_usage(&state, &client);
+            return Ok(Json(json!({
+                "ok": false,
+                "tier": tier.as_str(),
+                "activated": false,
+                "message": format!(
+                    "Token 有效，但尚未激活：需要在「合作站点」里绑定一个 PT 站账号（IYUU 返回：{msg}）"
+                ),
+                "quota": client.quota(),
+            })));
+        }
+        // Rate limiting is not a verdict on the token: the request never got as
+        // far as being judged, so "check your token" would be wrong advice.
         Err(iyuu_core::CoreError::RateLimited(msg)) => {
             return Err(ServerError::RateLimited(msg));
         }
@@ -300,27 +344,25 @@ async fn test_iyuu(
         }
     };
 
-    // A valid token with no bound sites cannot produce candidates, so a "success"
-    // here would be a setup that silently adds nothing.
-    if bound.is_empty() {
-        return Err(ServerError::IyuuAuth(
-            "此 Token 尚未在 IYUU 绑定任何站点，辅种查询结果会为空。请先在 IYUU 里完成站点绑定"
-                .into(),
-        ));
+    // Keep the catalogue this probe just downloaded. Discarding it would leave the
+    // user in the worst possible state: a verified, activated token and still an
+    // empty site picker. It is the same data the bootstrap and 刷新 would fetch, so
+    // throwing it away means spending a second request for nothing.
+    persist_usage(&state, &client);
+    if let Err(e) = state.db.replace_sites(&sites) {
+        tracing::warn!(error = %e, "测试连接成功，但写入站点目录失败");
+    } else {
+        state.push_log(format!("站点目录已更新：{} 个站点", sites.len()));
     }
 
     Ok(Json(json!({
         "ok": true,
         "tier": tier.as_str(),
+        "activated": true,
         "site_count": sites.len(),
-        "bound_count": bound.len(),
-        "bound_sites": bound.iter().map(|s| json!({
-            "id": s.id,
-            "site": s.site,
-            "nickname": s.nickname,
-        })).collect::<Vec<_>>(),
-        // Two probe requests were spent; report the resulting position so the UI
-        // can warn instead of the user discovering it from a failed run.
+        "message": format!("Token 已激活，IYUU 已适配 {} 个辅种站点", sites.len()),
+        // One probe request was spent; report the resulting position so the UI can
+        // warn instead of the user discovering it from a failed run.
         "quota": client.quota(),
     })))
 }
@@ -418,34 +460,265 @@ async fn test_downloader(
     })))
 }
 
+/// Save a throwaway client's spend into the shared quota ledger.
+///
+/// Every endpoint that builds its own [`IyuuClient`] (`refresh`, `test`, `bind`)
+/// spends real quota, and those clients are dropped at the end of the request —
+/// so without this the ledger never learns about them and the next run plans
+/// against budget the account no longer has. `runner::build_engine` does the same
+/// for runs.
+fn persist_usage(state: &AppState, client: &IyuuClient) {
+    let usage = client.usage();
+    if let Err(e) = state.db.save_api_usage(&usage) {
+        // Losing a counter costs at most one redundant request; it must not turn
+        // a successful action into an error.
+        tracing::warn!(error = %e, "保存 API 用量失败");
+    }
+}
+
+fn site_json(s: &IyuuSite, cfg: &crate::config::AppConfig) -> Value {
+    let has_cred = cfg.credentials.get(&s.id.to_string()).is_some_and(|c| {
+        c.passkey.as_deref().is_some_and(|v| !v.is_empty())
+            || c.cookie.as_deref().is_some_and(|v| !v.is_empty())
+            || c.api_key.as_deref().is_some_and(|v| !v.is_empty())
+            || c.rsskey.as_deref().is_some_and(|v| !v.is_empty())
+    });
+    json!({
+        "id": s.id,
+        "site": s.site,
+        "nickname": s.nickname,
+        "base_url": s.base_url,
+        "is_https": s.is_https,
+        "reseed_check": s.reseed_check,
+        "cookie_required": s.cookie_required,
+        "has_credentials": has_cred,
+    })
+}
+
+/// The cross-seed catalogue, read from the database.
+///
+/// No network call, deliberately. `/reseed/sites/index` costs quota, and this
+/// endpoint is hit every time the 站点凭据 page or the add-site dialog opens —
+/// fetching on read is what made an earlier version spend a request per page
+/// view. `POST /sites/refresh` is the only path that refetches: the user's
+/// explicit action, behind a button.
+///
+/// `initialised: false` tells the UI that no fetch has ever succeeded, so it can
+/// prompt "点刷新拉取" instead of rendering an unexplained empty list. It does not
+/// fetch on the UI's behalf: a page load must not spend quota.
 async fn list_sites(State(state): State<AppState>) -> Result<Json<Value>> {
     let cfg = state.config_snapshot();
-    let client = client_for(&cfg)?;
-    let sites = client.sites(false).await?;
-    // Mark which sites already have credentials so the UI can highlight gaps.
-    let creds = cfg.credentials;
-    let out: Vec<Value> = sites
+    let sites = state.db.load_sites()?;
+    let out: Vec<Value> = sites.iter().map(|s| site_json(s, &cfg)).collect();
+    Ok(Json(json!({
+        "sites": out,
+        "initialised": state.db.catalogue_initialised()?,
+        "synced_at": state.db.catalogue_synced_at()?,
+    })))
+}
+
+/// Fetch `/reseed/sites/index` and persist it — the user's 刷新 button.
+///
+/// The only endpoint that spends quota on the catalogue. Rows are replaced
+/// wholesale (see [`crate::db::Db::replace_sites`]) so a site IYUU has dropped
+/// does not linger and keep failing to produce download URLs.
+async fn refresh_sites(State(state): State<AppState>) -> Result<Json<Value>> {
+    let cfg = state.config_snapshot();
+    let client = metered_client_for(&state, &cfg)?;
+    let sites = client.sites().await?;
+    persist_usage(&state, &client);
+    state.db.replace_sites(&sites)?;
+    state.push_log(format!("站点目录已刷新：{} 个站点", sites.len()));
+
+    let out: Vec<Value> = sites.iter().map(|s| site_json(s, &cfg)).collect();
+    Ok(Json(json!({
+        "sites": out,
+        "initialised": true,
+        "synced_at": state.db.catalogue_synced_at()?,
+        "count": out.len(),
+        "quota": client.quota(),
+    })))
+}
+
+/// Cooperative sites: the PT accounts that can **activate** this token.
+///
+/// Not the reseed catalogue. Binding one of these (`POST /partners/bind`) is a
+/// prerequisite for every other endpoint — an unactivated token answers
+/// `403 用户未绑定推荐站点`.
+async fn list_partners(State(state): State<AppState>) -> Result<Json<Value>> {
+    let cfg = state.config_snapshot();
+    let client = metered_client_for(&state, &cfg)?;
+    let partners = client.partner_sites().await?;
+    persist_usage(&state, &client);
+    // Cross-referenced with the catalogue so the UI can show a domain: the
+    // `sites/recommend` payload carries no `base_url` of its own.
+    let catalogue = state.db.load_sites()?;
+    let by_id: std::collections::HashMap<i64, &IyuuSite> =
+        catalogue.iter().map(|s| (s.id, s)).collect();
+
+    let out: Vec<Value> = partners
         .iter()
-        .map(|s| {
-            let has_cred = creds.get(&s.id.to_string()).is_some_and(|c| {
-                c.passkey.as_deref().is_some_and(|v| !v.is_empty())
-                    || c.cookie.as_deref().is_some_and(|v| !v.is_empty())
-                    || c.api_key.as_deref().is_some_and(|v| !v.is_empty())
-                    || c.rsskey.as_deref().is_some_and(|v| !v.is_empty())
-            });
+        .map(|p| {
             json!({
-                "id": s.id,
-                "site": s.site,
-                "nickname": s.nickname,
-                "base_url": s.base_url,
-                "is_https": s.is_https,
-                "reseed_check": s.reseed_check,
-                "cookie_required": s.cookie_required,
-                "has_credentials": has_cred,
+                "id": p.id,
+                "site": p.site,
+                "nickname": p.nickname,
+                "bind_check": p.bind_check,
+                "reseed_check": p.reseed_check,
+                "needs_uid": p.needs_uid(),
+                "base_url": by_id.get(&p.id).map_or("", |s| s.base_url.as_str()),
             })
         })
         .collect();
-    Ok(Json(json!({"sites": out})))
+
+    Ok(Json(json!({
+        "partners": out,
+        "count": out.len(),
+        "quota": client.quota(),
+    })))
+}
+
+/// Body of `POST /partners/bind`.
+#[derive(Deserialize)]
+struct BindBody {
+    /// Cooperative site slug (`hdhome`), as listed by `GET /partners`.
+    site: String,
+    /// Site id from the same listing. Optional because it can be resolved from
+    /// the catalogue by slug — but an explicit one still works when the catalogue
+    /// is stale.
+    sid: Option<i64>,
+    /// The site's numeric user id.
+    uid: String,
+    /// The site **passkey**, in clear. Hashed to sha1 before it leaves this
+    /// process: IYUU stores only the digest, so sending the raw value would both
+    /// fail and needlessly transmit the secret.
+    passkey: String,
+}
+
+/// Bind a cooperative-site account — i.e. **activate the IYUU token**.
+///
+/// Two details that are easy to get wrong, and the reason this is a dedicated
+/// endpoint rather than a proxy:
+///
+/// * `passkey` must go over the wire as **sha1 hex**. The reference client does
+///   `sha1($passkey)`; the raw passkey is rejected.
+/// * `token` is a **form field** here in addition to the `token` header. The
+///   documented body includes it, and the call is about linking that token to the
+///   site account.
+async fn bind_partner(
+    State(state): State<AppState>,
+    Json(body): Json<BindBody>,
+) -> Result<Json<Value>> {
+    let cfg = state.config_snapshot();
+    if cfg.iyuu.token.trim().is_empty() {
+        return Err(ServerError::IyuuAuth("尚未配置 IYUU Token".into()));
+    }
+
+    let site = body.site.trim().to_string();
+    if site.is_empty() {
+        return Err(ServerError::Config("请选择要绑定的合作站点".into()));
+    }
+    let uid = body.uid.trim().to_string();
+    if uid.is_empty() {
+        return Err(ServerError::Config("站点用户数字 ID 不能为空".into()));
+    }
+    let passkey = body.passkey.trim().to_string();
+    if passkey.is_empty() {
+        return Err(ServerError::Config("站点密钥（passkey）不能为空".into()));
+    }
+
+    // Validate before hashing so a pasted URL or username fails loudly instead of
+    // being hashed into a value IYUU rejects with an opaque message.
+    let user_id = uid
+        .parse::<i64>()
+        .map_err(|_| ServerError::Config(format!("站点用户 ID 必须是纯数字（收到「{uid}」）")))?;
+
+    // Prefer the explicit sid; otherwise resolve the slug against the catalogue.
+    let sid = match body.sid {
+        Some(id) if id > 0 => Some(id),
+        _ => state
+            .db
+            .load_sites()?
+            .into_iter()
+            .find(|s| s.site.eq_ignore_ascii_case(&site))
+            .map(|s| s.id),
+    };
+
+    let passkey_sha1 = {
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(passkey.as_bytes());
+        hex::encode(h.finalize())
+    };
+
+    let client = metered_client_for(&state, &cfg)?;
+    let req = iyuu_core::iyuu::BindRequest {
+        token: &cfg.iyuu.token,
+        site: &site,
+        sid,
+        id: user_id,
+        passkey: &passkey_sha1,
+    };
+    client.bind(&req).await?;
+    persist_usage(&state, &client);
+    state.push_log(format!("已绑定合作站点「{site}」"));
+
+    // Activation is exactly the precondition the catalogue endpoint needs, so a
+    // successful bind is the right moment to fetch it — otherwise the user is left
+    // with "activated" and still nothing to pick from in 添加辅种站点.
+    let needs_catalogue = !state.db.catalogue_initialised().unwrap_or(false);
+
+    // Verify rather than declare success: the response is only "accepted".
+    let result = match client.is_activated().await {
+        Ok(activated) => {
+            if activated {
+                if needs_catalogue {
+                    match client.sites().await {
+                        Ok(sites) => {
+                            let n = sites.len();
+                            if let Err(e) = state.db.replace_sites(&sites) {
+                                tracing::warn!(error = %e, "绑定后写入站点目录失败");
+                            } else {
+                                state.push_log(format!("已顺带拉取站点目录：{n} 个站点"));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "绑定后拉取站点目录失败");
+                        }
+                    }
+                }
+                json!({
+                    "ok": true,
+                    "activated": true,
+                    "message": "合作站点已绑定，IYUU Token 已激活",
+                    "quota": client.quota(),
+                })
+            } else {
+                json!({
+                    "ok": true,
+                    "activated": false,
+                    "message": "绑定请求已被接受，但 Token 仍显示未激活：请确认站点用户 ID 与密钥正确",
+                    "quota": client.quota(),
+                })
+            }
+        }
+        // A throttled verification is not a failed bind — the binding itself
+        // succeeded, we just cannot confirm it yet.
+        Err(iyuu_core::CoreError::RateLimited(msg)) => json!({
+            "ok": true,
+            "activated": Value::Null,
+            "message": format!("绑定请求已被接受，但校验激活状态时被限流（{msg}），稍后可点「检查激活状态」"),
+            "quota": client.quota(),
+        }),
+        Err(e) => json!({
+            "ok": true,
+            "activated": Value::Null,
+            "message": format!("绑定请求已被接受，但校验激活状态失败：{e}"),
+            "quota": client.quota(),
+        }),
+    };
+
+    Ok(Json(result))
 }
 
 /// Build a throwaway client from the saved config, for read-only endpoints.
@@ -469,14 +742,35 @@ fn client_for(cfg: &crate::config::AppConfig) -> Result<IyuuClient> {
     )?)
 }
 
-async fn list_bound_sites(State(state): State<AppState>) -> Result<Json<Value>> {
+/// Same as [`client_for`], but seeded with the day's persisted spend.
+///
+/// Any endpoint that actually sends a request must use this: a fresh client starts
+/// at zero, and a page that shows "500 left" after 400 were already spent is worse
+/// than showing nothing.
+fn metered_client_for(state: &AppState, cfg: &crate::config::AppConfig) -> Result<IyuuClient> {
+    let usage = state.db.load_api_usage()?;
+    Ok(client_for(cfg)?.with_usage(&usage))
+}
+
+/// Whether the token is activated right now, without spending more than one
+/// request.
+///
+/// The UI's 「检查激活状态」button. Cheap enough to be a user action and honest
+/// enough to be believed: it asks the catalogue endpoint, which is the call IYUU
+/// gates behind activation.
+async fn check_activation(State(state): State<AppState>) -> Result<Json<Value>> {
     let cfg = state.config_snapshot();
-    let client = client_for(&cfg)?;
-    let bound = client.recommended_sites().await?;
+    let client = metered_client_for(&state, &cfg)?;
+    let activated = client.is_activated().await?;
+    persist_usage(&state, &client);
     Ok(Json(json!({
-        "sites": bound.iter().map(|s| json!({
-            "id": s.id, "site": s.site, "nickname": s.nickname,
-        })).collect::<Vec<_>>()
+        "activated": activated,
+        "message": if activated {
+            "Token 已激活，可以查询辅种"
+        } else {
+            "Token 尚未激活：请在下方绑定一个合作站点的账号"
+        },
+        "quota": client.quota(),
     })))
 }
 
@@ -722,6 +1016,15 @@ async fn start_run(
         return Err(ServerError::Config("尚未配置 IYUU Token".into()));
     }
     cfg.downloader.kind()?;
+
+    // Without the catalogue the engine has no download-URL templates, so every
+    // candidate would fail one at a time. Say it now, at the click, with the fix.
+    if !state.db.catalogue_initialised()? {
+        return Err(ServerError::Config(
+            "还没有 IYUU 站点目录：请到「站点凭据 → 添加站点」点刷新拉取一次（若提示未激活，先在设置里绑定合作站点）"
+                .into(),
+        ));
+    }
 
     // Refuse to start with no IYUU budget. Every discovery run spends at least
     // one request, so with the day's allowance gone the run can only waste a
