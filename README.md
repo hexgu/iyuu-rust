@@ -153,15 +153,25 @@ docker run -d \
 
 打开页面后进入「设置」：
 
-1. 填 IYUU Token（[iyuu.cn](https://iyuu.cn) 获取），**选择会员类型**（普通 / SVIP），点「测试连接」。测试会按所选等级真实请求一次，并扣掉 2 次额度。
-2. 选下载器类型，填地址与账号，点「测试连接」。
-3. 到「站点凭据」页点「添加站点」，从 IYUU 站点目录里挑要辅种的站点，再填它真正需要的字段（多数站点只要 passkey；M-Team 要 API Key，Monika 要 RSS 链接）。
+1. 填 IYUU Token（[iyuu.cn](https://iyuu.cn) 获取），**选择会员类型**（普通 / SVIP），保存后点「测试连接」。
+   测试只发一次请求，「已激活」与否会直接告诉你下一步该做什么。
+
+2. **激活 Token**：IYUU 的 Token 必须用一个**合作站点**的账号激活，否则所有接口都会返回
+   `403 用户未绑定推荐站点`。在「设置 → 合作站点与 Token 激活」里获取合作站点列表，选一个你有的站，
+   填站点用户数字 ID 与 passkey 绑定即可（passkey 只在本机做 sha1，原始值不出本机）。
+   激活后会自动拉一次站点目录，不用再手点刷新。
+
+   > **合作站点 ≠ 可辅种站点**。`/reseed/sites/recommend` 是「能让 Token 生效的站点」，
+   > `/reseed/sites/index` 才是「IYUU 已适配、可以往里辅种的站点」。两者是不同的列表。
+
+3. 选下载器类型，填地址与账号，点「测试连接」。
+4. 到「站点凭据」页点「添加站点」，从 IYUU 站点目录里挑要辅种的站点，再填它真正需要的字段（多数站点只要 passkey；M-Team 要 API Key，Monika 要 RSS 链接）。
 
    > 默认一个站点都不启用。只有你添加过的站点才会被查询——没添加的站点即使 IYUU 有资源也不会碰，避免把额度花在不需要的站上。
 
    > 从 IYUU AutoSeed（或 MoviePilot 的辅种插件）迁移过来时，可以点「导入备份」选 `cn_sites_*.json`。导入先列出「会导入谁 / 跳过谁 / 为什么跳过」让你确认；AutoSeed 里处于禁用状态的站点只会被报告，不会被悄悄开启。
 
-4. 回概览页点「开始辅种」。
+5. 回概览页点「开始辅种」。
 
 > **容器里的地址怎么写**：辅种服务在容器内，`127.0.0.1` 指容器自己。qBittorrent 跑在宿主机或局域网其他机器上时，
 > 要填宿主的局域网 IP（例如 `http://192.168.1.10:8080`），或用 `host.docker.internal`（macOS / Windows）配合 `--add-host`。
@@ -264,6 +274,16 @@ IYUU 的辅种接口按天计量，普通用户和 SVIP 额度差 5 倍。这是
 
 「站点凭据」页只显示你添加过的站点。添加时从 IYUU 目录里挑一个，表单按该站点的 `reseed_check` 元数据只显示它真正需要的字段（passkey、authkey、uid、cookie 等），其余收进「其他字段」，没有哪个站点会因为字段特殊而配不了。
 
+### 站点目录只拉一次
+
+`/reseed/sites/index` 每次都算一次额度，而这份目录几个月才变一次，所以它的策略是**一次性保留**：
+
+- 安装后第一次运行（或第一次保存 Token、第一次绑定合作站点）自动拉取，写入本地 SQLite `iyuu_sites` 表；
+- 之后每次打开页面、每次辅种，都从库里读，**不再请求 IYUU**；
+- 只有在「添加辅种站点」弹窗里点**刷新**按钮时才会重新拉取并覆盖整张表（消耗 1 次额度）。
+
+也就是说，页面刷新、重启容器都不会多花额度；想更新目录只有你那一下点击。库里的目录为空时，辅种会直接报错提示去刷新，而不是带着空模板逐个去站点下载失败。
+
 下载机制按站点特征自动选路：
 
 | 类型 | 处理方式 |
@@ -315,15 +335,22 @@ environment:
 
 ## HTTP API
 
-所有接口在 `/api` 下，错误统一返回 `{error: {kind, message}}`。`kind` 取 `iyuu_auth` / `rate_limited` / `config` / `downloader_auth` / `downloader` / `not_found` / `internal`，前端据此给出可操作提示而不是笼统的「出错了」。其中 `rate_limited` 对应 HTTP 429，含义是**现在别请求，等重置或换服务器**，不是「再试一次」的信号。
+所有接口在 `/api` 下，错误统一返回 `{error: {kind, message}}`。`kind` 取 `iyuu_auth` / `iyuu_inactive` / `rate_limited` / `config` / `downloader_auth` / `downloader` / `not_found` / `internal`，前端据此给出可操作提示而不是笼统的「出错了」。其中：
+
+- `rate_limited` 对应 HTTP 429，含义是**现在别请求，等重置或换服务器**，不是「再试一次」的信号。
+- `iyuu_inactive` 对应 HTTP 403：Token 本身有效，但还没有绑定合作站点（IYUU 返回 `403 用户未绑定推荐站点`）。修法是去设置里绑定一个合作站点，**不是**「检查 Token」。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` `/version` `/status` | 健康检查与运行概况 |
 | GET | `/quota` | 会员等级、今日额度与重置时间（不含接口主机） |
 | GET/PUT | `/config` | 读写配置（密钥只写不回显） |
-| POST | `/test/iyuu` `/test/downloader` | 连通性测试 |
-| GET | `/sites` `/sites/bound` | IYUU 支持 / 已绑定站点 |
+| POST | `/test/iyuu` `/test/downloader` | 连通性测试（IYUU 侧同时判定 Token 是否已激活，成功时顺带把站点目录写库） |
+| GET | `/sites` | 本地库里的 IYUU 辅种站点目录（**不消耗额度**），附 `initialised` / `synced_at` |
+| POST | `/sites/refresh` | 重新拉取 `/reseed/sites/index` 并写库（消耗 1 次额度，前端「刷新」按钮） |
+| GET | `/partners` | **合作站点**（`/reseed/sites/recommend`）—— 能激活 Token 的站点，不是可辅种站点 |
+| POST | `/partners/bind` | 绑定合作站点账号以激活 Token（passkey 在服务端做 sha1 后上行） |
+| GET | `/partners/activated` | 检查 Token 是否已激活（消耗 1 次额度） |
 | PUT/DELETE | `/sites/{sid}/credentials` | 单站点凭据：合并保存 / 删除（删除即停止辅种该站） |
 | POST | `/sites/import` | 导入 AutoSeed 站点备份（`apply: false` 为预览，不写入） |
 | GET/POST | `/runs` | 任务列表 / 触发任务 |
