@@ -11,6 +11,12 @@
 //! We therefore (a) probe `app/webapiVersion` once, (b) prefer the new endpoint
 //! names and fall back to the old ones, and (c) never rely on `skip_checking` to
 //! mean "done" — verification state is always read back from the torrent itself.
+//!
+//! Authentication has two modes. Password mode logs in and rides the `SID`
+//! cookie, which qB invalidates on restart — hence the re-login paths below.
+//! API-key mode (qB ≥ 5.2 / `WebAPI` ≥ 2.14.1) sends `Authorization: Bearer <key>`
+//! on every request instead: stateless, survives restarts, and `auth/login`
+//! must *not* be called because API keys are barred from the auth endpoints.
 
 use crate::bencode;
 use crate::downloader::{AddTorrentOptions, Downloader};
@@ -18,7 +24,7 @@ use crate::error::{CoreError, Result};
 use crate::models::{DownloaderKind, TorrentInfo};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use reqwest::header::USER_AGENT;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,12 +33,59 @@ use std::time::Duration;
 /// and are never tricked into a duplicate add by a race.
 pub const IYUU_TAG: &str = "iyuu-reseed";
 
+/// How to authenticate against the `WebUI`.
+#[derive(Debug, Clone)]
+pub enum QbAuth {
+    /// `POST auth/login` + the `SID` cookie.
+    Password { username: String, password: String },
+    /// `Authorization: Bearer <key>` (qB ≥ 5.2).
+    ApiKey(String),
+}
+
+impl QbAuth {
+    /// Pick the right mode from persisted settings.
+    ///
+    /// A key wins over a username even when both are stored, because the key is
+    /// the more specific choice and a stale username must not silently take over.
+    /// Whitespace-only values are treated as absent so a stray space in the form
+    /// cannot select a mode that then fails to authenticate.
+    #[must_use]
+    pub fn from_settings(username: &str, password: &str, api_key: Option<&str>) -> Self {
+        match api_key.map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => Self::ApiKey(key.to_string()),
+            None => Self::Password {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+        }
+    }
+
+    fn is_api_key(&self) -> bool {
+        matches!(self, Self::ApiKey(_))
+    }
+
+    /// Headers this mode adds to every request. Empty for password mode: the
+    /// cookie jar injects `SID` on its own.
+    fn headers(&self, client: &str) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        if let Self::ApiKey(key) = self {
+            let value = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
+                CoreError::DownloaderAuth {
+                    client: client.to_string(),
+                    msg: "API Key 含有非法字符（不能包含空格或换行）".into(),
+                }
+            })?;
+            headers.insert(AUTHORIZATION, value);
+        }
+        Ok(headers)
+    }
+}
+
 pub struct QBittorrentClient {
     http: reqwest::Client,
     base: String,
     name: String,
-    username: String,
-    password: String,
+    auth: QbAuth,
     /// True once we know the API speaks the 5.x dialect.
     modern: AtomicBool,
     /// Cached `webapiVersion` as a comparable tuple, e.g. (2, 11, 0).
@@ -68,17 +121,22 @@ struct QbTorrent {
 }
 
 impl QBittorrentClient {
-    /// Connect and log in.
+    /// Connect and authenticate.
+    ///
+    /// In password mode this logs in; in API-key mode it verifies the key with a
+    /// single authenticated call, so a wrong key fails here instead of on the
+    /// first real query.
     ///
     /// # Errors
-    /// Returns an error when the HTTP client cannot be built or the login
-    /// request is rejected by qBittorrent.
-    pub async fn new(name: &str, base_url: &str, username: &str, password: &str) -> Result<Self> {
+    /// Returns an error when the HTTP client cannot be built or qBittorrent
+    /// rejects the credentials.
+    pub async fn new(name: &str, base_url: &str, auth: QbAuth) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            // qB authenticates with the `SID` cookie; a cookie store keeps the
-            // session alive across the hundreds of calls one run makes.
+            // qB authenticates with the `SID` cookie in password mode; a cookie
+            // store keeps the session alive across the hundreds of calls one run
+            // makes. Harmless in API-key mode, where no cookie is ever set.
             .cookie_store(true)
             .user_agent(concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -91,12 +149,11 @@ impl QBittorrentClient {
             http,
             base: normalize_base(base_url),
             name: name.to_string(),
-            username: username.to_string(),
-            password: password.to_string(),
+            auth,
             modern: AtomicBool::new(true),
             webapi: parking_lot::RwLock::new(None),
         };
-        client.login().await?;
+        client.authenticate().await?;
         Ok(client)
     }
 
@@ -104,11 +161,49 @@ impl QBittorrentClient {
         format!("{}api/v2/{}", self.base, path.trim_start_matches('/'))
     }
 
+    /// Establish (or verify) authentication for the configured mode.
+    async fn authenticate(&self) -> Result<()> {
+        if self.auth.is_api_key() {
+            // API keys cannot call the auth endpoints, so probe a cheap private
+            // endpoint instead: 200 means the key is good.
+            self.probe().await
+        } else {
+            self.login().await
+        }
+    }
+
+    /// One authenticated GET used to validate an API key.
+    async fn probe(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(self.api("app/version"))
+            .headers(self.auth.headers(&self.name)?)
+            .send()
+            .await
+            .map_err(|e| CoreError::DownloaderAuth {
+                client: self.name.clone(),
+                msg: format!("无法连接：{e}"),
+            })?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        Err(CoreError::DownloaderAuth {
+            client: self.name.clone(),
+            msg: api_key_rejection(resp.status()),
+        })
+    }
+
     async fn login(&self) -> Result<()> {
+        let (username, password) = match &self.auth {
+            QbAuth::Password { username, password } => (username, password),
+            // A caller asked for a password session but the stored mode is
+            // key-based: nothing to do.
+            QbAuth::ApiKey(_) => return Ok(()),
+        };
         let resp = self
             .http
             .post(self.api("auth/login"))
-            .form(&[("username", &self.username), ("password", &self.password)])
+            .form(&[("username", username), ("password", password)])
             .send()
             .await
             .map_err(|e| CoreError::DownloaderAuth {
@@ -144,30 +239,41 @@ impl QBittorrentClient {
         Ok(())
     }
 
-    /// Ensure the session cookie is still valid. qB expires SID on restart,
-    /// which is exactly when a scheduled run tends to fire.
+    /// Ensure we are still authenticated.
+    ///
+    /// qB expires the `SID` cookie on restart, which is exactly when a scheduled
+    /// run tends to fire — so password mode re-logs in on a 403. An API key never
+    /// expires, and a 403 there means the key was rotated or revoked: retrying
+    /// the same key cannot help, so the error is surfaced as-is.
     async fn ensure_alive(&self) -> Result<()> {
         let resp = self
             .http
             .get(self.api("app/version"))
+            .headers(self.auth.headers(&self.name)?)
             .send()
             .await
             .map_err(|e| CoreError::Downloader {
                 client: self.name.clone(),
                 msg: format!("{e}"),
             })?;
-        // 403 == not authenticated anymore.
         if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            if self.auth.is_api_key() {
+                return Err(CoreError::DownloaderAuth {
+                    client: self.name.clone(),
+                    msg: api_key_rejection(resp.status()),
+                });
+            }
             self.login().await?;
-            return Ok(());
         }
         Ok(())
     }
 
     async fn post(&self, path: &str, form: Vec<(String, String)>) -> Result<String> {
+        let headers = self.auth.headers(&self.name)?;
         let resp = self
             .http
             .post(self.api(path))
+            .headers(headers.clone())
             .form(&form)
             .send()
             .await
@@ -178,11 +284,20 @@ impl QBittorrentClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::FORBIDDEN {
-            // Session died mid-run; re-auth once and retry.
+            // Session died mid-run; re-auth once and retry. With an API key there
+            // is no session to revive, so report the revocation instead of
+            // hammering qB with a key it already rejected.
+            if self.auth.is_api_key() {
+                return Err(CoreError::DownloaderAuth {
+                    client: self.name.clone(),
+                    msg: api_key_rejection(status),
+                });
+            }
             self.login().await?;
             let resp = self
                 .http
                 .post(self.api(path))
+                .headers(headers)
                 .form(&form)
                 .send()
                 .await
@@ -274,6 +389,7 @@ impl QBittorrentClient {
         let resp = self
             .http
             .get(self.api("torrents/info"))
+            .headers(self.auth.headers(&self.name)?)
             .query(params)
             .send()
             .await
@@ -284,6 +400,12 @@ impl QBittorrentClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::FORBIDDEN {
+            if self.auth.is_api_key() {
+                return Err(CoreError::DownloaderAuth {
+                    client: self.name.clone(),
+                    msg: api_key_rejection(status),
+                });
+            }
             self.login().await?;
             return Box::pin(self.info(params)).await;
         }
@@ -312,19 +434,32 @@ impl Downloader for QBittorrentClient {
 
     async fn version(&self) -> Result<String> {
         self.ensure_alive().await?;
+        let headers = self.auth.headers(&self.name)?;
         let resp = self
             .http
             .get(self.api("app/version"))
+            .headers(headers.clone())
             .send()
             .await
             .map_err(|e| CoreError::Downloader {
                 client: self.name.clone(),
                 msg: format!("{e}"),
             })?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN && self.auth.is_api_key() {
+            return Err(CoreError::DownloaderAuth {
+                client: self.name.clone(),
+                msg: api_key_rejection(resp.status()),
+            });
+        }
         let app = resp.text().await.unwrap_or_default().trim().to_string();
 
         // WebAPI version drives which endpoint names / params exist.
-        if let Ok(r) = self.http.get(self.api("app/webapiVersion")).send().await
+        if let Ok(r) = self
+            .http
+            .get(self.api("app/webapiVersion"))
+            .headers(headers)
+            .send()
+            .await
             && let Ok(v) = r.text().await
         {
             let parsed = parse_version(v.trim());
@@ -409,6 +544,7 @@ impl Downloader for QBittorrentClient {
         let resp = self
             .http
             .post(self.api("torrents/add"))
+            .headers(self.auth.headers(&self.name)?)
             .header(
                 USER_AGENT,
                 concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")),
@@ -424,6 +560,12 @@ impl Downloader for QBittorrentClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::FORBIDDEN {
+            if self.auth.is_api_key() {
+                return Err(CoreError::DownloaderAuth {
+                    client: self.name.clone(),
+                    msg: api_key_rejection(status),
+                });
+            }
             self.login().await?;
             return Err(CoreError::Downloader {
                 client: self.name.clone(),
@@ -567,6 +709,20 @@ impl Downloader for QBittorrentClient {
     }
 }
 
+/// Explain an authentication failure in API-key mode.
+///
+/// An API key is stateless — there is no session to renew — so a 401/403 can
+/// only mean the key is wrong, was rotated (rotating invalidates the old key
+/// immediately), or the server predates 5.2 and does not understand the header
+/// at all. Say that instead of "re-login and retry", which cannot help.
+fn api_key_rejection(status: reqwest::StatusCode) -> String {
+    format!(
+        "API Key 被拒绝（HTTP {}）。请确认 qBittorrent ≥ 5.2 且密钥未被轮换，\
+         可在「设置 → WebUI → API Key」重新生成",
+        status.as_u16()
+    )
+}
+
 /// Strip trailing slashes and re-add exactly one before `api/v2`.
 fn normalize_base(base: &str) -> String {
     let trimmed = base.trim().trim_end_matches('/');
@@ -606,11 +762,129 @@ mod tests {
     }
 
     #[test]
+    fn picks_api_key_when_one_is_configured() {
+        // A non-empty key wins over a stored username: the key is the more
+        // specific choice, and password-mode fields are often left over.
+        let auth = QbAuth::from_settings("admin", "adminadmin", Some("qbt_abc"));
+        assert!(
+            matches!(&auth, QbAuth::ApiKey(k) if k == "qbt_abc"),
+            "expected API-key mode"
+        );
+        assert!(auth.is_api_key());
+
+        // Blank / whitespace keys fall back to password mode instead of sending
+        // an empty Bearer token that could only ever be rejected.
+        for blank in [None, Some(""), Some("   ")] {
+            let auth = QbAuth::from_settings("admin", "pw", blank);
+            assert!(
+                !auth.is_api_key(),
+                "blank key {blank:?} must not select API-key mode"
+            );
+        }
+    }
+
+    #[test]
+    fn api_key_mode_sends_a_bearer_header() {
+        let headers = QbAuth::ApiKey("qbt_test".into())
+            .headers("qBittorrent")
+            .expect("valid header");
+        assert_eq!(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            Some("Bearer qbt_test")
+        );
+
+        // Password mode adds nothing: the cookie jar supplies `SID`.
+        let headers = QbAuth::Password {
+            username: "u".into(),
+            password: "p".into(),
+        }
+        .headers("qBittorrent")
+        .expect("valid header");
+        assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn newline_in_api_key_is_rejected() {
+        // Header values cannot carry CR/LF; failing here beats sending a request
+        // that reqwest would refuse with a much less obvious error.
+        let err = QbAuth::ApiKey("qbt_bad\nkey".into())
+            .headers("qBittorrent")
+            .unwrap_err();
+        assert!(err.to_string().contains("API Key"), "{err}");
+    }
+
+    #[test]
     fn parses_webapi_versions() {
         assert_eq!(parse_version("2.11.2"), Some((2, 11, 2)));
         assert_eq!(parse_version("2.8.3"), Some((2, 8, 3)));
         assert_eq!(parse_version("2.4"), Some((2, 4, 0)));
         assert!(parse_version("garbage").is_none());
+    }
+
+    /// Minimal fake `WebUI`: records every request, answers `app/version` only to a
+    /// valid bearer token, and rejects anything that touches `auth/login`.
+    async fn fake_server(expected_key: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Bind on an ephemeral port and hand the address back to the caller.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    continue;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // The bare minimum protocol handling: this only needs to prove
+                // what the client sends, not to serve a real WebUI.
+                let ok = req.starts_with("GET /api/v2/app/version ")
+                    && req
+                        .to_ascii_lowercase()
+                        .contains(&format!("authorization: bearer {expected_key}"));
+                let (status, body) = if ok {
+                    ("200 OK", "v5.2.0")
+                } else {
+                    ("401 Unauthorized", "")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn api_key_mode_authenticates_without_logging_in() {
+        // The fake server only accepts the exact Bearer header, so a client that
+        // tried `auth/login` (which API keys are barred from) could not pass.
+        let (base, server) = fake_server("qbt_test_key").await;
+        let client = QBittorrentClient::new("t", &base, QbAuth::ApiKey("qbt_test_key".into()))
+            .await
+            .expect("API key should authenticate");
+        assert!(client.auth.is_api_key());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_api_key_fails_at_construction() {
+        let (base, server) = fake_server("qbt_right_key").await;
+        let err = QBittorrentClient::new("t", &base, QbAuth::ApiKey("qbt_wrong".into()))
+            .await
+            .err()
+            .expect("a wrong key must not authenticate");
+        let msg = err.to_string();
+        assert!(msg.contains("API Key 被拒绝"), "{msg}");
+        // The advice must point at the one action that can fix it.
+        assert!(msg.contains("轮换") || msg.contains("重新生成"), "{msg}");
+        server.abort();
     }
 
     #[test]

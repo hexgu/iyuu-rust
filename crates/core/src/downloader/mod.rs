@@ -20,7 +20,7 @@ use async_trait::async_trait;
 pub mod qbittorrent;
 pub mod transmission;
 
-pub use qbittorrent::QBittorrentClient;
+pub use qbittorrent::{QBittorrentClient, QbAuth};
 pub use transmission::TransmissionClient;
 
 /// Options for adding a cross-seed torrent.
@@ -105,6 +105,11 @@ pub trait Downloader: Send + Sync {
 
 /// Build a downloader from persisted settings.
 ///
+/// `api_key` selects qBittorrent's stateless API-key authentication when it is
+/// present and non-empty; otherwise the username/password pair is used. The
+/// caller decides which one is intended (the stored `auth` mode), because a
+/// lingering saved key must not silently take over a password setup.
+///
 /// # Errors
 /// Returns an error when the configured client cannot be constructed or fails
 /// to authenticate; the message names the client so the UI can point at the
@@ -115,12 +120,16 @@ pub async fn build(
     base_url: &str,
     username: &str,
     password: &str,
+    api_key: Option<&str>,
     extra: &DownloaderExtra,
 ) -> Result<std::sync::Arc<dyn Downloader>> {
     match kind {
-        DownloaderKind::Qbittorrent => Ok(std::sync::Arc::new(
-            QBittorrentClient::new(name, base_url, username, password).await?,
-        )),
+        DownloaderKind::Qbittorrent => {
+            let auth = QbAuth::from_settings(username, password, api_key);
+            Ok(std::sync::Arc::new(
+                QBittorrentClient::new(name, base_url, auth).await?,
+            ))
+        }
         DownloaderKind::Transmission => Ok(std::sync::Arc::new(
             TransmissionClient::new(
                 name,

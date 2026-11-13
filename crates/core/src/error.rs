@@ -45,7 +45,9 @@ pub enum CoreError {
     #[error("下载器错误（{client}）：{msg}")]
     Downloader { client: String, msg: String },
 
-    #[error("下载器认证失败（{client}），请检查用户名/密码：{msg}")]
+    /// The downloader rejected our credentials — either a wrong username/password
+    /// pair or, for qBittorrent ≥ 5.2, a rejected API key. The message says which.
+    #[error("下载器认证失败（{client}）：{msg}")]
     DownloaderAuth { client: String, msg: String },
 
     /// Could not obtain a usable .torrent file from the target site.
