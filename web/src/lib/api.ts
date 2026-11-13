@@ -135,6 +135,15 @@ export interface StatusResponse {
  */
 export type ApiTier = 'free' | 'vip'
 
+/**
+ * How the downloader authenticates.
+ *
+ * `api_key` is qBittorrent ≥ 5.2 only: a stateless `Authorization: Bearer`
+ * header instead of the `SID` cookie, so a WebUI restart no longer breaks a
+ * scheduled run. Transmission has no equivalent and always uses password auth.
+ */
+export type DownloaderAuthMode = 'password' | 'api_key'
+
 export interface TierInfo {
   id: ApiTier
   label: string
@@ -260,8 +269,12 @@ export interface PublicConfig {
     kind: string
     name: string
     base_url: string
+    /** `password` or `api_key`. */
+    auth: DownloaderAuthMode
     username: string
     has_password: boolean
+    /** Presence only — the key itself is never returned. */
+    has_api_key: boolean
     extra: { transmission_rpc_path: string | null }
   }
   reseed: ReseedConfig
@@ -339,6 +352,8 @@ export interface TestIyuuResult {
 export interface TestDownloaderResult {
   ok: boolean
   kind: string
+  /** Which mode actually authenticated — the form may be mid-edit. */
+  auth: DownloaderAuthMode
   version: string
   torrent_count: number
   complete_count: number
@@ -374,11 +389,14 @@ export const api = {
       }),
     }),
 
+  /** A blank `password` / `api_key` means "use the saved one", as with the patch. */
   testDownloader: (body: {
     kind?: string
     base_url?: string
+    auth?: DownloaderAuthMode
     username?: string
     password?: string
+    api_key?: string
     rpc_path?: string
   }) =>
     request<TestDownloaderResult>('/test/downloader', {

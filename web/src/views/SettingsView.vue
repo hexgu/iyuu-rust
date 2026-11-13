@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, reactive } from 'vue'
+import { computed, onMounted, ref, reactive, watch } from 'vue'
 import {
   AlertCircle,
   CheckCircle2,
@@ -15,6 +15,7 @@ import {
   api,
   ApiError,
   type ApiTier,
+  type DownloaderAuthMode,
   type PublicConfig,
   type QuotaResponse,
 } from '@/lib/api'
@@ -50,8 +51,10 @@ const form = reactive({
   dlKind: 'qbittorrent',
   dlName: '',
   dlUrl: '',
+  dlAuth: 'password' as DownloaderAuthMode,
   dlUser: '',
   dlPass: '',
+  dlApiKey: '',
   rpcPath: '',
   minSize: '0',
   excludeTags: '',
@@ -77,8 +80,10 @@ function seedForm(c: PublicConfig) {
   form.dlKind = c.downloader.kind
   form.dlName = c.downloader.name
   form.dlUrl = c.downloader.base_url
+  form.dlAuth = c.downloader.auth
   form.dlUser = c.downloader.username
   form.dlPass = '' // never returned by the API
+  form.dlApiKey = '' // neither is the key
   form.rpcPath = c.downloader.extra.transmission_rpc_path ?? ''
   form.minSize = String(c.reseed.min_size_gib)
   form.excludeTags = c.reseed.exclude_tags.join(', ')
@@ -202,8 +207,11 @@ async function commitSave() {
         kind: form.dlKind,
         name: form.dlName,
         base_url: form.dlUrl,
+        auth: form.dlAuth,
         username: form.dlUser,
         password: form.dlPass || undefined,
+        // Blank means "keep the saved key", matching the server's patch rule.
+        api_key: form.dlApiKey || undefined,
         extra: { transmission_rpc_path: form.rpcPath || null },
       },
       reseed: {
@@ -283,12 +291,15 @@ async function testDownloader() {
     const r = await api.testDownloader({
       kind: form.dlKind,
       base_url: form.dlUrl,
+      auth: form.dlAuth,
       username: form.dlUser,
       password: form.dlPass || undefined,
+      api_key: form.dlApiKey || undefined,
       rpc_path: form.rpcPath || undefined,
     })
     dlResult.ok = true
-    dlResult.text = `连接成功：${r.kind} ${r.version}，共 ${r.torrent_count} 个种子（已完成 ${r.complete_count}）`
+    const via = r.auth === 'api_key' ? '（API Key）' : ''
+    dlResult.text = `连接成功：${r.kind} ${r.version}${via}，共 ${r.torrent_count} 个种子（已完成 ${r.complete_count}）`
   } catch (e) {
     dlResult.ok = false
     dlResult.text = e instanceof ApiError ? e.message : String(e)
@@ -301,6 +312,16 @@ const dlOptions = [
   { value: 'qbittorrent', label: 'qBittorrent' },
   { value: 'transmission', label: 'Transmission' },
 ]
+
+// Transmission has no API-key auth. Switching to it silently keeps the field at
+// `api_key` would make 保存 fail with a server-side error the user cannot see a
+// cause for, so fall back to password auth the moment the type changes.
+watch(
+  () => form.dlKind,
+  (kind) => {
+    if (kind !== 'qbittorrent') form.dlAuth = 'password'
+  },
+)
 
 /** How many sites are already added — a summary only, the list lives on /sites. */
 const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).length)
@@ -439,24 +460,58 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                 qBittorrent 填 WebUI 地址即可（不要带 /api/v2）
               </p>
             </div>
-            <div class="space-y-1.5">
-              <Label>用户名</Label>
-              <Input v-model="form.dlUser" autocomplete="off" />
+            <div v-if="form.dlKind === 'qbittorrent'" class="space-y-1.5">
+              <Label>认证方式</Label>
+              <select
+                v-model="form.dlAuth"
+                class="border-input focus-visible:border-ring focus-visible:ring-ring/50 flex h-9 w-full cursor-pointer rounded-md border bg-transparent px-3 py-1 text-sm shadow-xs outline-none focus-visible:ring-[3px]"
+              >
+                <option value="password">用户名 / 密码</option>
+                <option value="api_key">API Key（qB ≥ 5.2）</option>
+              </select>
+              <p class="text-muted-foreground text-[11px]">
+                API Key 不需要登录、重启 WebUI 也不失效；生成位置：设置 → WebUI → API Key
+              </p>
             </div>
-            <div class="space-y-1.5">
-              <Label>
-                密码
-                <span v-if="cfg?.downloader.has_password" class="text-muted-foreground ml-1 font-normal">
-                  （已保存，留空表示不修改）
-                </span>
-              </Label>
-              <Input
-                v-model="form.dlPass"
-                type="password"
-                autocomplete="new-password"
-                :placeholder="cfg?.downloader.has_password ? '••••••••' : ''"
-              />
-            </div>
+            <template v-if="form.dlAuth === 'api_key' && form.dlKind === 'qbittorrent'">
+              <div class="space-y-1.5 sm:col-span-2">
+                <Label>
+                  API Key
+                  <span v-if="cfg?.downloader.has_api_key" class="text-muted-foreground ml-1 font-normal">
+                    （已保存，留空表示不修改）
+                  </span>
+                </Label>
+                <Input
+                  v-model="form.dlApiKey"
+                  type="password"
+                  autocomplete="off"
+                  spellcheck="false"
+                  :placeholder="
+                    cfg?.downloader.has_api_key ? '••••••••（已保存）' : 'qbt_xxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+                  "
+                />
+              </div>
+            </template>
+            <template v-else>
+              <div class="space-y-1.5">
+                <Label>用户名</Label>
+                <Input v-model="form.dlUser" autocomplete="off" />
+              </div>
+              <div class="space-y-1.5">
+                <Label>
+                  密码
+                  <span v-if="cfg?.downloader.has_password" class="text-muted-foreground ml-1 font-normal">
+                    （已保存，留空表示不修改）
+                  </span>
+                </Label>
+                <Input
+                  v-model="form.dlPass"
+                  type="password"
+                  autocomplete="new-password"
+                  :placeholder="cfg?.downloader.has_password ? '••••••••' : ''"
+                />
+              </div>
+            </template>
             <div v-if="form.dlKind === 'transmission'" class="space-y-1.5">
               <Label>RPC 路径</Label>
               <Input v-model="form.rpcPath" placeholder="/transmission/rpc" />
