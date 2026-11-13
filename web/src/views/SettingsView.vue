@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, reactive, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   AlertCircle,
   CheckCircle2,
   Download,
   KeyRound,
   Loader2,
-  Save,
   Server,
   ShieldCheck,
   Timer,
@@ -41,11 +40,20 @@ import PartnerBindCard from '@/components/iyuu/PartnerBindCard.vue'
 
 const cfg = ref<PublicConfig | null>(null)
 const loading = ref(true)
-const saving = ref(false)
-const saveMsg = reactive<{ kind: 'ok' | 'err' | null; text: string }>({
-  kind: null,
-  text: '',
-})
+
+// ---- 自动保存状态 ------------------------------------------------------
+//
+// 这个页面没有「保存」按钮：改了就算数。文本框停下 600ms 写一次，开关和下拉也一样
+// ——请求本身是合并的，所以多写一次不会覆盖别的字段。
+//
+// 两种情况不进防抖队列：
+//   * 密文（密码 / API Key）：打字停顿的那一下就会把半截密码写进库，而且成功后字段
+//     要被清空，正好把用户还没敲完的密码抹掉。它们改为失焦时提交。
+//   * Token：它必须和会员类型一起提交（类型决定打哪台服务器），所以单独走弹窗。
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+const saveState = ref<SaveState>('idle')
+const saveError = ref('')
+const saving = computed(() => saveState.value === 'saving')
 
 // ---- local form state, seeded from the server config -------------------
 const form = reactive({
@@ -100,6 +108,7 @@ function seedForm(c: PublicConfig) {
   form.scheduleEnabled = c.schedule.enabled
   form.cron = c.schedule.cron
   form.token = '' // write-only
+  rememberSaved()
 }
 
 // ---- 会员类型选择 -------------------------------------------------------
@@ -108,41 +117,57 @@ function seedForm(c: PublicConfig) {
 // not a form field because it is not a preference: it selects the server the
 // token is valid against, and it cannot be inferred.
 const tierDialogOpen = ref(false)
-/** Tier confirmed in the dialog, waiting to be written by the save. */
-const pendingTier = ref<ApiTier | null>(null)
 
 function openTierDialog() {
   tierDialogOpen.value = true
 }
 
 /**
- * The dialog confirmed a choice (already probed, for VIP). Store it and, when a
- * token is waiting to be saved, continue the save immediately — making the user
- * click 保存 twice for one action would be a pointless trap.
+ * A new token cannot be saved without a tier: the tier decides which server the
+ * token is valid against, and guessing one is how a paying user silently ends up
+ * on the free host. That is the one place auto-save stops and asks — everything
+ * else in the form writes itself.
  */
+function submitToken() {
+  if (!form.token.trim()) return
+  openTierDialog()
+}
+
+/** The dialog answered: store the token together with the tier it was picked for. */
 async function onTierConfirmed(payload: { tier: ApiTier; token: string | null }) {
-  pendingTier.value = payload.tier
   if (form.token.trim()) {
-    await commitSave()
+    await saveToken(payload.tier)
     return
   }
   // Re-picking a tier on an already-saved token: patch just that field.
-  saving.value = true
-  saveMsg.kind = null
+  saveState.value = 'saving'
+  saveError.value = ''
   try {
     const r = await api.putConfig({ iyuu: { tier: payload.tier } })
     cfg.value = r.config
-    saveMsg.kind = 'ok'
-    saveMsg.text = '会员类型已更新'
+    flashSaved()
     await loadQuota()
   } catch (e) {
-    saveMsg.kind = 'err'
-    saveMsg.text = e instanceof ApiError ? e.message : String(e)
-  } finally {
-    saving.value = false
-    // Keep the confirmed tier only for this save; a later save must re-ask if the
-    // token changed again.
-    pendingTier.value = null
+    failSave(e)
+  }
+}
+
+async function saveToken(tier: ApiTier) {
+  const token = form.token.trim()
+  if (!token) return
+  saveState.value = 'saving'
+  saveError.value = ''
+  try {
+    const r = await api.putConfig({ iyuu: { token, tier } })
+    cfg.value = r.config
+    // The token is stored now; keep the field blank so nothing re-sends it.
+    form.token = ''
+    flashSaved()
+    await loadQuota()
+    // Anything edited before the token existed was held back; it can go now.
+    void flushSave()
+  } catch (e) {
+    failSave(e)
   }
 }
 
@@ -163,9 +188,10 @@ async function loadConfig() {
   try {
     cfg.value = await api.getConfig()
     seedForm(cfg.value)
+    saveState.value = 'idle'
+    saveError.value = ''
   } catch (e) {
-    saveMsg.kind = 'err'
-    saveMsg.text = e instanceof ApiError ? e.message : String(e)
+    failSave(e)
   } finally {
     loading.value = false
   }
@@ -176,6 +202,11 @@ onMounted(async () => {
   loadQuota()
 })
 
+onUnmounted(() => {
+  if (saveTimer) clearTimeout(saveTimer)
+  if (idleTimer) clearTimeout(idleTimer)
+})
+
 function splitList(v: string): string[] {
   return v
     .split(/[,\n]/)
@@ -183,79 +214,220 @@ function splitList(v: string): string[] {
     .filter(Boolean)
 }
 
+// ---- 表单 → 请求体 -----------------------------------------------------
+
+function downloaderSection() {
+  return {
+    kind: form.dlKind,
+    name: form.dlName,
+    base_url: form.dlUrl,
+    auth: form.dlAuth,
+    username: form.dlUser,
+    extra: { transmission_rpc_path: form.rpcPath || null },
+  }
+}
+
+function reseedSection() {
+  return {
+    min_size_gib: Number(form.minSize) || 0,
+    exclude_tags: splitList(form.excludeTags),
+    exclude_paths: splitList(form.excludePaths),
+    reuse_category: form.reuseCategory,
+    default_category: form.defaultCategory || null,
+    tags: splitList(form.tags),
+    tag_with_site: form.tagWithSite,
+    auto_start_after_verify: form.autoStart,
+    fetch_concurrency: Number(form.concurrency) || 2,
+    verify_interval_secs: Number(form.verifyInterval) || 15,
+  }
+}
+
+function scheduleSection() {
+  return { enabled: form.scheduleEnabled, cron: form.cron }
+}
+
+type SectionName = 'downloader' | 'reseed' | 'schedule'
+
+const SECTIONS: Record<SectionName, () => unknown> = {
+  downloader: downloaderSection,
+  reseed: reseedSection,
+  schedule: scheduleSection,
+}
+
+const SECTION_NAMES = Object.keys(SECTIONS) as SectionName[]
+
 /**
- * Save entry point.
- *
- * A new token cannot be saved without a tier: the tier decides which server the
- * token is valid against, and guessing one is how a paying user silently ends up
- * on the free host. So instead of validating here, we open the selection dialog
- * and let `commitSave` run once the user has answered.
+ * `reseed` and `schedule` are replaced wholesale server-side, `downloader` is
+ * merged field by field. Sending the whole section would be correct either way,
+ * but diffing first means changing a tag does not rewrite the entire config —
+ * which matters once two tabs have the page open.
  */
-async function save() {
-  saveMsg.kind = null
-  if (form.token.trim() && !pendingTier.value) {
-    openTierDialog()
+function currentSnapshot(): Record<SectionName, string> {
+  return Object.fromEntries(
+    SECTION_NAMES.map((n) => [n, JSON.stringify(SECTIONS[n]())]),
+  ) as Record<SectionName, string>
+}
+
+/** What the server is known to hold — the baseline "has this changed?" is measured against. */
+let savedSnapshot = currentSnapshot()
+
+function rememberSaved() {
+  savedSnapshot = currentSnapshot()
+}
+
+function changedSections(): SectionName[] {
+  const cur = currentSnapshot()
+  return SECTION_NAMES.filter((n) => cur[n] !== savedSnapshot[n])
+}
+
+/**
+ * The server rejects any config whose IYUU token is empty, so on a fresh install
+ * every keystroke would paint a red error on a field that is perfectly fine. Until
+ * a token exists, section edits are held instead of sent — `saveToken` flushes
+ * them the moment the token lands.
+ */
+function tokenPresent(): boolean {
+  // The *stored* token, not the one being typed: a half-typed token cannot make
+  // the server accept anything, so section edits wait for the real save.
+  return cfg.value?.iyuu.has_token === true
+}
+
+/**
+ * Some states are "not typed yet", not "typed wrong": an address caught in the
+ * middle of being retyped, an API key not pasted yet, a cron with three fields so
+ * far. The server rejects all three outright, and flashing a red error at someone
+ * who is still typing is worse than sending nothing — so those sections wait for
+ * the next flush.
+ */
+function isSendable(name: SectionName): boolean {
+  if (name === 'downloader') {
+    if (form.dlUrl.trim() === '') return false
+    if (
+      form.dlAuth === 'api_key' &&
+      form.dlKind === 'qbittorrent' &&
+      !cfg.value?.downloader.has_api_key &&
+      form.dlApiKey.trim() === ''
+    ) {
+      return false
+    }
+  }
+  if (name === 'schedule' && form.scheduleEnabled) {
+    return form.cron.trim().split(/\s+/).length === 5
+  }
+  return true
+}
+
+/**
+ * Secrets are committed on blur, not by the debounce: a pause mid-typing would
+ * otherwise store half a password, and clearing the field after the save would
+ * eat the rest of what the user was typing. `secretDirty` says "these fields have
+ * content that still needs to go out", so a retry after a failure still carries it.
+ */
+let secretDirty = false
+let inFlight = false
+let queued = false
+let saveTimer: ReturnType<typeof setTimeout> | undefined
+let idleTimer: ReturnType<typeof setTimeout> | undefined
+
+function flashSaved() {
+  saveState.value = 'saved'
+  if (idleTimer) clearTimeout(idleTimer)
+  // Back to the quiet hint after a beat, so "已保存" does not sit there forever.
+  idleTimer = setTimeout(() => {
+    if (saveState.value === 'saved') saveState.value = 'idle'
+  }, 2000)
+}
+
+function failSave(e: unknown) {
+  saveState.value = 'error'
+  saveError.value = e instanceof ApiError ? e.message : String(e)
+}
+
+/**
+ * The single write path. Safe to call concurrently: a call that arrives while a
+ * request is in flight only raises a flag, and the loop replays once it lands, so
+ * the last thing the user typed is always the last thing written.
+ */
+async function flushSave() {
+  if (loading.value) return
+  const cur = currentSnapshot()
+  const dirty = tokenPresent() ? changedSections().filter(isSendable) : []
+  const hasSecret = secretDirty && (form.dlPass !== '' || form.dlApiKey !== '')
+  if (dirty.length === 0 && !hasSecret) {
+    if (saveState.value === 'saving') return
+    saveState.value = saveState.value === 'error' ? 'error' : 'idle'
     return
   }
-  await commitSave()
-}
+  if (inFlight) {
+    queued = true
+    return
+  }
+  inFlight = true
+  saveState.value = 'saving'
+  saveError.value = ''
 
-/** Run the save with everything the form + dialog have collected so far. */
-async function commitSave() {
-  saving.value = true
+  const patch: Record<string, unknown> = {}
+  for (const name of dirty) patch[name] = SECTIONS[name]()
+  if (hasSecret) {
+    // Blank means "unchanged" server-side, so only the filled-in ones go out.
+    const dl = { ...(patch.downloader as Record<string, unknown> | undefined) }
+    if (form.dlPass) dl.password = form.dlPass
+    if (form.dlApiKey) dl.api_key = form.dlApiKey
+    patch.downloader = dl
+  }
+
   try {
-    const patch: Record<string, unknown> = {
-      downloader: {
-        kind: form.dlKind,
-        name: form.dlName,
-        base_url: form.dlUrl,
-        auth: form.dlAuth,
-        username: form.dlUser,
-        password: form.dlPass || undefined,
-        // Blank means "keep the saved key", matching the server's patch rule.
-        api_key: form.dlApiKey || undefined,
-        extra: { transmission_rpc_path: form.rpcPath || null },
-      },
-      reseed: {
-        min_size_gib: Number(form.minSize) || 0,
-        exclude_tags: splitList(form.excludeTags),
-        exclude_paths: splitList(form.excludePaths),
-        reuse_category: form.reuseCategory,
-        default_category: form.defaultCategory || null,
-        tags: splitList(form.tags),
-        tag_with_site: form.tagWithSite,
-        auto_start_after_verify: form.autoStart,
-        fetch_concurrency: Number(form.concurrency) || 2,
-        verify_interval_secs: Number(form.verifyInterval) || 15,
-      },
-      schedule: { enabled: form.scheduleEnabled, cron: form.cron },
-    }
-
-    // A new token is always saved together with its tier — the server rejects one
-    // without the other, because the tier decides which server the token is valid
-    // against. `save()` guarantees `pendingTier` is set before we get here.
-    if (form.token.trim() && pendingTier.value) {
-      patch.iyuu = { token: form.token.trim(), tier: pendingTier.value }
-    }
-
     const r = await api.putConfig(patch)
     cfg.value = r.config
-    seedForm(r.config)
-    // The token is stored now; a later save must not resend it.
-    form.token = ''
-    saveMsg.kind = 'ok'
-    saveMsg.text = '已保存'
-    loadQuota()
+    // Only the sections that were actually sent are now stored. Marking the rest
+    // would make a section that was skipped as "not typed yet" look saved and it
+    // would never be sent again.
+    const applied: Record<SectionName, string> = { ...savedSnapshot }
+    for (const name of dirty) applied[name] = cur[name]
+    savedSnapshot = applied
+    // Do not re-seed the form: the user may already be typing the next field, and
+    // writing the server copy back would reset the caret and clobber that input.
+    if (hasSecret) {
+      secretDirty = false
+      form.dlPass = ''
+      form.dlApiKey = ''
+    }
+    flashSaved()
   } catch (e) {
-    saveMsg.kind = 'err'
-    saveMsg.text = e instanceof ApiError ? e.message : String(e)
+    failSave(e)
   } finally {
-    saving.value = false
-    // The token (if any) is stored now; a second save must ask for the tier again
-    // only if the token field is filled in again.
-    pendingTier.value = null
+    inFlight = false
+    if (queued) {
+      queued = false
+      void flushSave()
+    }
   }
 }
+
+const AUTO_SAVE_DEBOUNCE_MS = 600
+
+function scheduleSave() {
+  if (loading.value) return
+  if (saveTimer) clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    saveTimer = undefined
+    void flushSave()
+  }, AUTO_SAVE_DEBOUNCE_MS)
+}
+
+/**
+ * Commit whatever is in the two masked fields. Called on blur and on Enter — the
+ * only moments we can tell the value is finished.
+ */
+function flushSecrets() {
+  if (form.dlPass === '' && form.dlApiKey === '') return
+  secretDirty = true
+  void flushSave()
+}
+
+// Everything but the token: the token needs its tier, so it goes through the
+// dialog (see `submitToken`).
+watch(form, scheduleSave, { deep: true })
 
 /**
  * Activation state learned from the last probe, so the 合作站点 card can show it
@@ -353,26 +525,33 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
       <div>
         <h1 class="text-base font-semibold">设置</h1>
         <p class="text-muted-foreground mt-0.5 text-xs">
-          敏感信息只保存在本地数据库，保存后不会回显
+          改动即时生效，无需手动保存；敏感信息只存在本地数据库，写入后不回显
         </p>
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-2">
         <span
-          v-if="saveMsg.kind"
-          :class="cn(
-            'flex items-center gap-1 text-xs',
-            saveMsg.kind === 'ok' ? 'text-status-success' : 'text-status-error',
-          )"
+          v-if="saveState === 'saving'"
+          class="text-muted-foreground flex items-center gap-1 text-xs"
         >
-          <CheckCircle2 v-if="saveMsg.kind === 'ok'" class="size-3.5" />
-          <AlertCircle v-else class="size-3.5" />
-          {{ saveMsg.text }}
+          <Loader2 class="size-3.5 animate-spin" /> 保存中…
         </span>
-        <Button :disabled="saving || loading" @click="save">
-          <Loader2 v-if="saving" class="animate-spin" />
-          <Save v-else />
-          保存
-        </Button>
+        <span
+          v-else-if="saveState === 'saved'"
+          class="text-status-success flex items-center gap-1 text-xs"
+        >
+          <CheckCircle2 class="size-3.5" /> 已保存
+        </span>
+        <template v-else-if="saveState === 'error'">
+          <span class="text-status-error flex max-w-[22rem] items-start gap-1 text-xs">
+            <AlertCircle class="mt-0.5 size-3.5 shrink-0" />
+            <span>{{ saveError }}</span>
+          </span>
+          <Button variant="outline" size="sm" @click="flushSave">重试</Button>
+        </template>
+        <span v-else-if="!cfg?.iyuu.has_token" class="text-status-warn text-xs">
+          先保存 IYUU Token，其它设置才能写入
+        </span>
+        <span v-else class="text-muted-foreground text-xs">更改会自动保存</span>
       </div>
     </div>
 
@@ -406,10 +585,11 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
               type="password"
               autocomplete="off"
               :placeholder="cfg?.iyuu.has_token ? '••••••••（已保存）' : 'IYUU0812xxxxxxx'"
-              @keyup.enter="save"
+              @blur="submitToken"
+              @keyup.enter="submitToken"
             />
             <p class="text-muted-foreground text-[11px]">
-              保存时会让你选择会员类型（普通用户 / SVIP）——两者额度差 5 倍，且无法从 Token 判断
+              离开输入框时会让你选择会员类型（普通用户 / SVIP）——两者额度差 5 倍，且无法从 Token 判断
             </p>
           </div>
 
@@ -547,6 +727,7 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                   <span v-if="cfg?.downloader.has_api_key" class="text-muted-foreground ml-1 font-normal">
                     （已保存，留空表示不修改）
                   </span>
+                  <span v-else class="text-muted-foreground ml-1 font-normal">（离开输入框即保存）</span>
                 </Label>
                 <Input
                   v-model="form.dlApiKey"
@@ -556,6 +737,8 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                   :placeholder="
                     cfg?.downloader.has_api_key ? '••••••••（已保存）' : 'qbt_xxxxxxxxxxxxxxxxxxxxxxxxxxxx'
                   "
+                  @blur="flushSecrets"
+                  @keyup.enter="flushSecrets"
                 />
               </div>
             </template>
@@ -570,12 +753,15 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                   <span v-if="cfg?.downloader.has_password" class="text-muted-foreground ml-1 font-normal">
                     （已保存，留空表示不修改）
                   </span>
+                  <span v-else class="text-muted-foreground ml-1 font-normal">（离开输入框即保存）</span>
                 </Label>
                 <Input
                   v-model="form.dlPass"
                   type="password"
                   autocomplete="new-password"
                   :placeholder="cfg?.downloader.has_password ? '••••••••' : ''"
+                  @blur="flushSecrets"
+                  @keyup.enter="flushSecrets"
                 />
               </div>
             </template>
