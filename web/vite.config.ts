@@ -5,7 +5,7 @@ import tailwindcss from '@tailwindcss/vite'
 
 // `bun dev --host` binds 0.0.0.0 so LAN clients (and the Windows browser when
 // this runs in WSL2) can reach the dev server. Vite validates the Host header:
-// bare IPs are always fine, but a hostname like `jarry-win.local` is rejected
+// bare IPs are always fine, but a hostname like `dev-host.local` is rejected
 // unless it is listed here. IYUU_ALLOWED_HOSTS takes a comma-separated list;
 // a leading dot matches the domain and all of its subdomains.
 const allowedHosts = (process.env.IYUU_ALLOWED_HOSTS ?? '')

@@ -114,7 +114,7 @@ wsl_hint() {
 # 显示给用户看的 URL：绑 0.0.0.0 时给局域网地址，否则给回环地址。
 # 主用地址。WSL2 mirrored 模式下 Windows 和 WSL 共用同一个 loopback，
 # 所以 localhost 在这里是「WSL 里、Windows 浏览器里都能打开」的那个地址，
-# 比局域网 IP 更稳（Windows 自己也占着 192.168.0.215，直连那个会打到宿主回环）。
+# 比局域网 IP 更稳（Windows 自己也占着宿主的局域网 IP，直连那个会打到宿主回环）。
 url_for() {
 	local port=$1
 	if [ "$HOST" = "0.0.0.0" ] || [ "$HOST" = "127.0.0.1" ]; then
