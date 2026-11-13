@@ -333,7 +333,7 @@ restart_backend() {
 # ---------------------------------------------------------------- 前端 ------ #
 ensure_deps() {
 	[ -d "$ROOT/web/node_modules" ] && return 0
-	say '安装前端依赖（bun install，已配置 npmmirror 镜像）…'
+	say '安装前端依赖（bun install）…'
 	(cd "$ROOT/web" && bun install) || { err 'bun install 失败'; return 1; }
 }
 

@@ -30,18 +30,6 @@ services:
       # The scheme is required — a value without http(s):// is ignored with a
       # warning at startup rather than silently prefixed.
       # IYUU_API_BASE: https://iyuu.example.com
-      # Blank out the proxy that Docker injects from ~/.docker/config.json
-      # (`proxies.default`). Inside the container 127.0.0.1 is the container
-      # itself, not the host, so that proxy is unreachable and every outbound
-      # call fails with "error sending request for url (...)". Blank values
-      # override the injected ones; setting them here keeps working even when
-      # the host proxy is off.
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      http_proxy: ""
-      https_proxy: ""
-      NO_PROXY: "*"
-      no_proxy: "*"
     healthcheck:
       # Must run under bash: /dev/tcp is a bash feature and Debian's /bin/sh is
       # dash, which reports "cannot create /dev/tcp/...: Directory nonexistent".

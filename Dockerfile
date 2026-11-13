@@ -7,11 +7,9 @@
 #   2. builder  Rust release 二进制
 #   3. runtime  只带二进制 + 静态文件
 #
-# 两个与网络有关的开关，默认值面向中国大陆，海外（含 GitHub Actions）可覆盖：
-#   --build-arg CARGO_SOURCE=global   # 用 crates.io，不用 rsproxy 镜像
-#   --build-arg NPM_REGISTRY=https://registry.npmjs.org
-#
-# 国内构建直接 `docker build .` 即可，无需额外配置。
+# 构建走官方源（crates.io / registry.npmjs.org），不预设任何镜像或代理：
+# 镜像站点和代理属于个人网络环境，应该留在本机的 gitignore 文件里，而不是
+# 随仓库分发。网络受限时请自行为构建机配置代理，或在本机临时覆盖。
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -19,11 +17,6 @@
 # ---------------------------------------------------------------------------
 FROM oven/bun:1-alpine AS web
 WORKDIR /build/web
-
-# npmmirror 是 npm 的国内全量镜像，比 registry.npmjs.org 快一到两个数量级。
-ARG NPM_REGISTRY=https://registry.npmmirror.com
-ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY} \
-    BUN_CONFIG_REGISTRY=${NPM_REGISTRY}
 
 # 先拷清单：只改源码不会让 install 层失效。
 COPY web/package.json web/bun.lock ./
@@ -41,13 +34,7 @@ WORKDIR /build
 # rusqlite 用 `bundled`（SQLite 编进二进制）、reqwest 用 rustls，所以不需要
 # libsqlite3-dev / pkg-config / OpenSSL 头文件，这一层完全不碰 apt。
 COPY Cargo.toml Cargo.lock ./
-COPY .cargo/ ./.cargo/
 COPY crates/ ./crates/
-
-# `.cargo/config.toml` 把 crates.io 指向 rsproxy.cn。CI 和海外用户走 crates.io
-# 反而更快，所以提供开关；删掉配置文件即可回落到官方源。
-ARG CARGO_SOURCE=cn
-RUN if [ "$CARGO_SOURCE" != "cn" ]; then rm -f .cargo/config.toml; fi
 
 RUN cargo build --release --locked && \
     strip target/release/iyuu-reseed
@@ -56,16 +43,10 @@ RUN cargo build --release --locked && \
 # Stage 3: 运行时
 # ---------------------------------------------------------------------------
 # 刻意不用 rust:1-slim 当运行时：它 1.2 GB，而这里只需要 glibc + CA 证书 +
-# 时区数据。debian bookworm-slim 加两个包约 90 MB。
+# 时区数据。
 FROM debian:bookworm-slim
 
-# 国内拉 apt 包慢时覆盖，例如：
-#   --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG DEBIAN_MIRROR=deb.debian.org
-RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
-        sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
-    fi && \
-    apt-get update && \
+RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates tzdata && \
     rm -rf /var/lib/apt/lists/*
 
