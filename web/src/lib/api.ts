@@ -10,6 +10,12 @@
 
 export type ErrorKind =
   | 'iyuu_auth'
+  /**
+   * Token is valid but not **activated**: no cooperative-site account is bound to
+   * it. A distinct kind because the remedy is a different screen (bind a partner
+   * site), not "check your token".
+   */
+  | 'iyuu_inactive'
   | 'rate_limited'
   | 'config'
   | 'downloader_auth'
@@ -343,9 +349,72 @@ export interface DownloaderSummary {
 export interface TestIyuuResult {
   ok: boolean
   tier: ApiTier
-  site_count: number
-  bound_count: number
-  bound_sites: { id: number; site: string; nickname: string }[]
+  /**
+   * Whether the token is **activated**.
+   *
+   * `false` means the token itself is fine but no cooperative-site account has
+   * been bound yet — IYUU answers `403 用户未绑定推荐站点` until one is. The UI must
+   * point at the 合作站点 card, not at "check your token".
+   */
+  activated: boolean
+  /** Human-readable outcome, already phrased for display. */
+  message: string
+  /** Only present when activated: how many sites IYUU can cross-seed into. */
+  site_count?: number
+  quota: Omit<QuotaResponse, 'tiers' | 'tier_chosen'>
+}
+
+/** Threshold/summary of the catalogue, plus whether it has ever been fetched. */
+export interface SitesResponse {
+  sites: SiteInfo[]
+  /**
+   * `false` = `/reseed/sites/index` has never succeeded. The UI shows a "pull the
+   * list" prompt instead of an unexplained empty picker.
+   */
+  initialised: boolean
+  /** ISO-8601 of the last successful fetch, or null. */
+  synced_at: string | null
+}
+
+/**
+ * A **cooperative** site (`/reseed/sites/recommend`).
+ *
+ * Not a cross-seed target: these are the sites whose accounts can *activate* an
+ * IYUU token by binding. The payload has no `base_url` — the server fills it in
+ * from the catalogue when it can.
+ */
+export interface PartnerSite {
+  id: number
+  site: string
+  nickname: string
+  /** Comma-separated fields the bind call needs, e.g. `passkey,uid`. */
+  bind_check: string
+  reseed_check: string
+  /** Whether the form should ask for the numeric user id. */
+  needs_uid: boolean
+  base_url: string
+}
+
+export interface PartnersResponse {
+  partners: PartnerSite[]
+  count: number
+  quota: Omit<QuotaResponse, 'tiers' | 'tier_chosen'>
+}
+
+export interface BindPartnerResult {
+  ok: boolean
+  /**
+   * Result of verifying activation right after the bind. `null` = the bind was
+   * accepted but the check could not run (rate limit / network).
+   */
+  activated: boolean | null
+  message: string
+  quota: Omit<QuotaResponse, 'tiers' | 'tier_chosen'>
+}
+
+export interface ActivationResult {
+  activated: boolean
+  message: string
   quota: Omit<QuotaResponse, 'tiers' | 'tier_chosen'>
 }
 
@@ -404,7 +473,43 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  sites: () => request<{ sites: SiteInfo[] }>('/sites'),
+  /**
+   * The catalogue, read from the server's database.
+   *
+   * Never spends IYUU quota — that is the point. `initialised: false` means the
+   * first fetch has not succeeded yet, so the UI must prompt the user to refresh
+   * rather than quietly showing an empty list.
+   */
+  sites: () => request<SitesResponse>('/sites'),
+
+  /**
+   * Refetch `/reseed/sites/index` and persist it. **Costs one IYUU request**, so
+   * it belongs behind an explicit button, never on mount.
+   */
+  refreshSites: () => request<SitesResponse & { count: number }>('/sites/refresh', { method: 'POST' }),
+
+  /**
+   * Cooperative sites — the accounts that can activate the token.
+   *
+   * A different list from `sites()`: no `base_url` of its own, and it exists to
+   * drive the bind form. **Costs one IYUU request.**
+   */
+  partners: () => request<PartnersResponse>('/partners'),
+
+  /**
+   * Bind a cooperative-site account, which activates the IYUU token.
+   *
+   * The passkey is sent in clear to our own server, which sha1s it before calling
+   * IYUU — IYUU stores only the digest, and the raw value never leaves the host.
+   */
+  bindPartner: (body: { site: string; sid?: number | null; uid: string; passkey: string }) =>
+    request<BindPartnerResult>('/partners/bind', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Cheap one-request check of whether the token is activated yet. */
+  checkActivation: () => request<ActivationResult>('/partners/activated'),
 
   /**
    * Save one site's credentials.
@@ -438,9 +543,6 @@ export const api = {
     request<{ ok: boolean; config: PublicConfig }>(`/sites/${sid}/credentials`, {
       method: 'DELETE',
     }),
-
-  boundSites: () =>
-    request<{ sites: { id: number; site: string; nickname: string }[] }>('/sites/bound'),
 
   runs: (limit = 20) => request<Run[]>(`/runs?limit=${limit}`),
   startRun: () =>

@@ -8,6 +8,7 @@ import {
   Loader2,
   Save,
   Server,
+  ShieldCheck,
   Timer,
   Zap,
 } from 'lucide-vue-next'
@@ -36,6 +37,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import TierPicker from '@/components/iyuu/TierPicker.vue'
 import TierSetupDialog from '@/components/iyuu/TierSetupDialog.vue'
+import PartnerBindCard from '@/components/iyuu/PartnerBindCard.vue'
 
 const cfg = ref<PublicConfig | null>(null)
 const loading = ref(true)
@@ -256,9 +258,20 @@ async function commitSave() {
 }
 
 /**
+ * Activation state learned from the last probe, so the 合作站点 card can show it
+ * without spending a request of its own on mount.
+ */
+const activationKnown = ref<boolean | null>(null)
+
+/**
  * Test against the saved tier. There is no tier selector in the form anymore, so
  * this only proves "the token I already saved still works"; choosing a server is
  * the dialog's job, and it probes before it saves.
+ *
+ * One request: `/reseed/sites/index` is the only endpoint whose answer separates
+ * "token rejected" from "token valid but not activated". Probing
+ * `/sites/recommend` (as this used to) proved nothing — it answers for unbound
+ * tokens too, which is why an inactive setup used to report success.
  */
 async function testIyuu() {
   testingIyuu.value = true
@@ -266,8 +279,14 @@ async function testIyuu() {
   iyuuResult.text = ''
   try {
     const r = await api.testIyuu({})
-    iyuuResult.ok = true
-    iyuuResult.text = `连接成功：支持 ${r.site_count} 个站点，已绑定 ${r.bound_count} 个 · 本次消耗 2 次额度`
+    // The server distinguishes "token invalid" (throws) from "token valid but not
+    // activated" (`ok: false`), because the fix differs: one is a typo, the other
+    // is a bind step. Collapsing them told users to check a token that was fine.
+    iyuuResult.ok = r.ok
+    iyuuResult.text = r.message
+    // Reflect activation in the badge above without a second request.
+    if (r.activated === false) activationKnown.value = false
+    else if (r.activated) activationKnown.value = true
     quota.value = null
     await loadQuota()
   } catch (e) {
@@ -412,17 +431,65 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
             </Button>
             <span
               v-if="iyuuResult.ok !== null"
-              :class="cn(
-                'text-xs',
-                iyuuResult.ok ? 'text-status-success' : 'text-status-error',
-              )"
+              :class="
+                cn(
+                  'flex items-start gap-1 text-xs',
+                  iyuuResult.ok ? 'text-status-success' : 'text-status-warn',
+                )
+              "
             >
-              {{ iyuuResult.text }}
+              <CheckCircle2 v-if="iyuuResult.ok" class="mt-0.5 size-3.5 shrink-0" />
+              <AlertCircle v-else class="mt-0.5 size-3.5 shrink-0" />
+              <span>{{ iyuuResult.text }}</span>
             </span>
             <span v-else class="text-muted-foreground text-[11px]">
-              使用已保存的会员类型真实请求一次
+              使用已保存的会员类型真实请求一次，同时确认 Token 是否已激活
             </span>
           </div>
+        </CardContent>
+      </Card>
+
+      <!-- 合作站点 / Token 激活 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2 text-sm">
+            <ShieldCheck class="size-4" /> 合作站点与 Token 激活
+          </CardTitle>
+          <CardDescription>
+            IYUU 的 Token 需要用一个<span class="text-foreground">合作站点</span>的账号激活；
+            激活前所有查询都会被拒绝。这里列的是合作站点，不是"可以辅种的站点"
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-3">
+          <div
+            v-if="activationKnown !== null"
+            :class="
+              cn(
+                'flex items-start gap-1.5 rounded-md border px-3 py-2 text-[11px] leading-relaxed',
+                activationKnown
+                  ? 'border-status-success/30 bg-status-success/5'
+                  : 'border-status-warn/30 bg-status-warn/5',
+              )
+            "
+          >
+            <CheckCircle2
+              v-if="activationKnown"
+              class="text-status-success mt-0.5 size-3.5 shrink-0"
+            />
+            <AlertCircle v-else class="text-status-warn mt-0.5 size-3.5 shrink-0" />
+            <span>
+              {{
+                activationKnown
+                  ? '上次检查：Token 已激活'
+                  : '上次检查：Token 未激活 —— 在下方绑定一个合作站点账号即可'
+              }}
+            </span>
+          </div>
+
+          <PartnerBindCard
+            :has-token="!!cfg?.iyuu.has_token"
+            @quota-changed="loadQuota"
+          />
         </CardContent>
       </Card>
 

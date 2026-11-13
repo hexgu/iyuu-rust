@@ -59,6 +59,25 @@ const sites = ref<SiteInfo[]>([])
 const sitesLoading = ref(false)
 const sitesError = ref<string | null>(null)
 
+// Declared up here because `refreshSites` clears them: the two action slots are
+// shared by "refresh", "import" and "remove", and a stale success line from one
+// action must not survive into another.
+const busySid = ref<number | null>(null)
+const actionError = ref<string | null>(null)
+const actionOk = ref<string | null>(null)
+
+/**
+ * Whether `/reseed/sites/index` has ever been fetched successfully.
+ *
+ * `false` on a fresh install is normal, not an error: the catalogue is pulled
+ * once (first start, or the first click on 刷新) and then persisted, so pages and
+ * runs read it from SQLite without spending quota. Without this flag an empty
+ * picker would look like a broken token.
+ */
+const sitesInitialised = ref(true)
+/** ISO-8601 of the last successful fetch. */
+const sitesSyncedAt = ref<string | null>(null)
+
 /** Sid → catalogue metadata, so an added site can show its real name. */
 const siteById = computed(() => {
   const map = new Map<number, SiteInfo>()
@@ -98,9 +117,12 @@ async function loadConfig() {
 }
 
 /**
- * The catalogue is optional: without a saved token (or during an IYUU outage)
- * the added sites still render by their sid, and only the "add" flow needs the
- * full list — hence the separate error slot instead of failing the page.
+ * Read the persisted catalogue. **Does not spend IYUU quota** — the server serves
+ * it from SQLite, which is why this is safe on every mount.
+ *
+ * The catalogue is optional for rendering: without it the added sites still show
+ * by their sid, and only the "add" flow needs the full list — hence the separate
+ * error slot instead of failing the page.
  */
 async function loadSites() {
   sitesLoading.value = true
@@ -108,6 +130,8 @@ async function loadSites() {
   try {
     const r = await api.sites()
     sites.value = r.sites
+    sitesInitialised.value = r.initialised
+    sitesSyncedAt.value = r.synced_at
   } catch (e) {
     sites.value = []
     sitesError.value = e instanceof ApiError ? e.message : String(e)
@@ -116,8 +140,72 @@ async function loadSites() {
   }
 }
 
+/**
+ * Refetch `/reseed/sites/index` and persist it — the 刷新 button.
+ *
+ * The only action in this view that spends an IYUU request, so it is never
+ * automatic. Two reasons a user needs it: the first fetch failed (usually an
+ * unactivated token), or IYUU added a site they want to seed into.
+ */
+async function refreshSites() {
+  sitesLoading.value = true
+  sitesError.value = null
+  actionError.value = null
+  actionOk.value = null
+  try {
+    const r = await api.refreshSites()
+    sites.value = r.sites
+    sitesInitialised.value = r.initialised
+    sitesSyncedAt.value = r.synced_at
+    actionOk.value = `站点目录已刷新：${r.count} 个站点（消耗 1 次额度）`
+    loadQuota()
+  } catch (e) {
+    sitesError.value = e instanceof ApiError ? e.message : String(e)
+    // An unactivated token is the most common first-run cause, and the fix is a
+    // different page — say so instead of leaving a bare 403 on screen.
+    if (e instanceof ApiError && e.kind === 'iyuu_inactive') {
+      sitesError.value = `${e.message}（去「设置 → 合作站点与 Token 激活」绑定一个合作站点）`
+    }
+  } finally {
+    sitesLoading.value = false
+  }
+}
+
+/**
+ * Today's spend, shown next to the refresh buttons.
+ *
+ * Refresh is the only action on this page that costs an IYUU request, so the
+ * counter belongs right there: a metered button with no visible meter is how you
+ * end up surprised at the limit. Read from the local ledger, so it is free.
+ */
+const quotaUsed = ref<number | null>(null)
+const quotaDaily = ref<number | null>(null)
+async function loadQuota() {
+  try {
+    const q = await api.quota()
+    quotaUsed.value = q.used_requests
+    quotaDaily.value = q.daily_requests
+  } catch {
+    quotaUsed.value = null
+    quotaDaily.value = null
+  }
+}
+
+/** Human-readable age of the catalogue, so "stale" is visible rather than guessed. */
+const syncedLabel = computed(() => {
+  if (!sitesSyncedAt.value) return ''
+  const at = new Date(sitesSyncedAt.value)
+  if (Number.isNaN(at.getTime())) return ''
+  const days = Math.floor((Date.now() - at.getTime()) / 86_400_000)
+  if (days <= 0) return '今天'
+  if (days === 1) return '昨天'
+  return `${days} 天前`
+})
+
 onMounted(async () => {
-  await Promise.all([loadConfig(), loadSites()])
+  // `loadSites` reads the persisted catalogue and `loadQuota` reads the local
+  // counter — neither spends an IYUU request, so both are safe on every mount.
+  await Promise.all([loadConfig(), loadSites(), loadQuota()])
 })
 
 // ---------------------------------------------------------------- add flow
@@ -179,10 +267,6 @@ function onImported(config: unknown) {
 
 // ------------------------------------------------------------- delete flow
 
-const busySid = ref<number | null>(null)
-const actionError = ref<string | null>(null)
-const actionOk = ref<string | null>(null)
-
 async function remove(sid: number) {
   const label = siteById.value.get(sid)?.nickname || `站点 ${sid}`
   if (
@@ -220,7 +304,14 @@ const readyCount = computed(
           只辅种这里添加过的站点；凭据保存在本地，保存后不会回显
         </p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <span
+          v-if="quotaUsed !== null && quotaDaily"
+          class="text-muted-foreground font-mono text-[10px]"
+          title="今日已用的 IYUU 请求次数。打开页面不消耗，只有点刷新才会"
+        >
+          今日额度 {{ quotaUsed }}/{{ quotaDaily }}
+        </span>
         <Button variant="outline" @click="importOpen = true">
           <Upload />
           导入备份
@@ -344,17 +435,35 @@ const readyCount = computed(
         </CardContent>
       </Card>
 
+      <!-- Never fetched: normal on a fresh install, and the fix is one click. -->
+      <Alert v-if="!sitesInitialised && !sitesLoading">
+        <AlertCircle />
+        <AlertDescription>
+          还没有拉取过 IYUU 的辅种站点目录
+          <span v-if="!cfg?.iyuu.has_token">（先在设置里填写并保存 IYUU Token）</span>
+          <button
+            v-else
+            type="button"
+            class="ml-1 underline underline-offset-2"
+            :disabled="sitesLoading"
+            @click="refreshSites"
+          >
+            立即拉取（消耗 1 次额度）
+          </button>
+        </AlertDescription>
+      </Alert>
+
       <Alert v-if="sitesError" variant="warning">
         <AlertCircle />
         <AlertDescription>
-          无法获取 IYUU 站点目录：{{ sitesError }}
-          <span v-if="!cfg?.iyuu.has_token">（先在设置里填写并保存 IYUU Token）</span>
+          {{ sitesError }}
           <button
             type="button"
             class="ml-1 underline underline-offset-2"
-            @click="loadSites"
+            :disabled="sitesLoading"
+            @click="refreshSites"
           >
-            重试
+            重新拉取
           </button>
         </AlertDescription>
       </Alert>
@@ -374,12 +483,18 @@ const readyCount = computed(
             placeholder="搜索站点名 / 域名…"
             class="flex-1"
           />
+          <!--
+            Real refresh: refetches `/reseed/sites/index` and rewrites the stored
+            catalogue. Distinct from re-reading the page, which is free and
+            happens on mount — this one costs an IYUU request, so it is only ever
+            an explicit click, never automatic.
+          -->
           <Button
             variant="outline"
             size="icon"
-            title="重新获取站点目录"
+            title="重新拉取 IYUU 站点目录（消耗 1 次额度）"
             :disabled="sitesLoading"
-            @click="loadSites"
+            @click="refreshSites"
           >
             <RefreshCw :class="cn('size-4', sitesLoading && 'animate-spin')" />
           </Button>
@@ -435,13 +550,18 @@ const readyCount = computed(
             {{
               sites.length
                 ? '所有站点都已添加，或者没有匹配的结果'
-                : '站点目录为空，先确认 IYUU Token 是否已保存'
+                : sitesInitialised
+                  ? '站点目录为空，点右上角刷新重新拉取'
+                  : '还没有拉取站点目录，点右上角刷新拉取（消耗 1 次额度）'
             }}
           </div>
         </div>
 
-        <p class="text-muted-foreground text-[11px]">
-          列表来自 IYUU 的站点目录；添加后此处不再显示该站点。
+        <p class="text-muted-foreground text-[11px] leading-relaxed">
+          列表来自 IYUU 的站点目录，已保存在本地，打开页面不会消耗额度；
+          点右上角刷新才会重新拉取（消耗 1 次额度）。
+          <span v-if="syncedLabel">上次更新：{{ syncedLabel }}。</span>
+          添加后此处不再显示该站点。
         </p>
       </div>
     </Dialog>
