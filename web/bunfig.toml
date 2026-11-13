@@ -1,5 +1,0 @@
-# Pin the package registry to a CN mirror so `bun install` is fast and reliable
-# on mainland networks. npmmirror.com is the official npm mirror operated by
-# Alibaba; it is a full read-through cache of registry.npmjs.org.
-[install]
-registry = "https://registry.npmmirror.com"

@@ -18,6 +18,14 @@ web/dist
 *.db-shm
 *.db-wal
 
+# --- 本地开发环境 -----------------------------------------------------------
+# 这些文件只对当前机器有意义，不随仓库分发：
+#   .cargo/config.toml   个人 crate 镜像 / 代理
+#   web/bunfig.toml      个人 npm 镜像
+# 别人 clone 下来就应该走官方源，用本地文件覆盖即可。
+/.cargo/config.toml
+/web/bunfig.toml
+
 # 本地环境变量与覆盖配置
 .env
 .env.*
