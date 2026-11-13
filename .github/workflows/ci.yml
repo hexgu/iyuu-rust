@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # 打 tag 也要跑：镜像的 semver 标签（v0.2.1 / 0.2 / latest）只在 tag 上生成，
+    # 不监听 tags 的话发版就只更新了代码、没有对应的镜像。
+    tags: ["v*.*.*"]
   pull_request:
   workflow_dispatch:
 
