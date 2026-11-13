@@ -153,6 +153,7 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
         &cfg.downloader.base_url,
         &cfg.downloader.username,
         &cfg.downloader.password,
+        cfg.downloader.effective_api_key(),
         &cfg.downloader.extra,
     )
     .await?;

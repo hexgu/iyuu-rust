@@ -329,8 +329,11 @@ async fn test_iyuu(
 struct TestDownloaderBody {
     kind: Option<String>,
     base_url: Option<String>,
+    /// `password` / `api_key`. Absent means "use the saved mode".
+    auth: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    api_key: Option<String>,
     rpc_path: Option<String>,
 }
 
@@ -348,6 +351,14 @@ async fn test_downloader(
     let base_url = body
         .base_url
         .unwrap_or_else(|| cfg.downloader.base_url.clone());
+    let auth = match body.auth.as_deref() {
+        Some(raw) => crate::config::DownloaderAuthMode::parse(raw).ok_or_else(|| {
+            ServerError::Config(format!(
+                "未知的下载器认证方式「{raw}」，可选 password / api_key"
+            ))
+        })?,
+        None => cfg.downloader.auth_mode(),
+    };
     let username = body
         .username
         .unwrap_or_else(|| cfg.downloader.username.clone());
@@ -356,14 +367,43 @@ async fn test_downloader(
         .password
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| cfg.downloader.password.clone());
+    // Same rule for the key: blank means "keep the saved key". Testing a mode
+    // without any key at all is a setup mistake worth naming, not a 403 later.
+    let api_key = match auth {
+        crate::config::DownloaderAuthMode::ApiKey => {
+            let key = body
+                .api_key
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| cfg.downloader.api_key.trim().to_string());
+            if key.is_empty() {
+                return Err(ServerError::Config("请先填写 qBittorrent API Key".into()));
+            }
+            if kind != iyuu_core::models::DownloaderKind::Qbittorrent {
+                return Err(ServerError::Config(
+                    "API Key 认证仅 qBittorrent ≥ 5.2 支持".into(),
+                ));
+            }
+            Some(key)
+        }
+        crate::config::DownloaderAuthMode::Password => None,
+    };
     let extra = iyuu_core::downloader::DownloaderExtra {
         transmission_rpc_path: body
             .rpc_path
             .or_else(|| cfg.downloader.extra.transmission_rpc_path.clone()),
     };
 
-    let dl =
-        iyuu_core::downloader::build(kind, "test", &base_url, &username, &password, &extra).await?;
+    let dl = iyuu_core::downloader::build(
+        kind,
+        "test",
+        &base_url,
+        &username,
+        &password,
+        api_key.as_deref(),
+        &extra,
+    )
+    .await?;
     let version = dl.version().await?;
     let torrents = dl.list_torrents().await?;
     let complete = torrents.iter().filter(|t| t.is_verified_complete()).count();
@@ -371,6 +411,7 @@ async fn test_downloader(
     Ok(Json(json!({
         "ok": true,
         "kind": kind.as_str(),
+        "auth": auth.as_str(),
         "version": version,
         "torrent_count": torrents.len(),
         "complete_count": complete,

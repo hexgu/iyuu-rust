@@ -105,10 +105,23 @@ pub struct DownloaderConfig {
     pub name: String,
     #[serde(default = "default_qb_url")]
     pub base_url: String,
+    /// Which credential the client should present.
+    ///
+    /// qBittorrent 5.2 added stateless API keys, which survive a `WebUI` restart
+    /// that invalidates a `SID` cookie session. Stored as an explicit mode rather
+    /// than inferred from "is `api_key` non-empty", because a leftover key from a
+    /// previous attempt must not silently override a password that currently
+    /// works — and vice versa when the key is rotated.
+    #[serde(default = "default_downloader_auth")]
+    pub auth: String,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub password: String,
+    /// qBittorrent API key (`qbt_…`, 32 chars). Only used when `auth` is
+    /// `api_key`; Transmission has no equivalent and never reads it.
+    #[serde(default)]
+    pub api_key: String,
     #[serde(default)]
     pub extra: DownloaderExtra,
 }
@@ -119,6 +132,38 @@ fn default_downloader_kind() -> String {
 fn default_qb_url() -> String {
     "http://127.0.0.1:8080".into()
 }
+fn default_downloader_auth() -> String {
+    DownloaderAuthMode::Password.as_str().to_string()
+}
+
+/// The two ways to authenticate against a downloader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloaderAuthMode {
+    Password,
+    ApiKey,
+}
+
+impl DownloaderAuthMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::ApiKey => "api_key",
+        }
+    }
+
+    /// Parse a stored/patched value. Unknown strings are `None` so the caller can
+    /// reject them instead of silently falling back to password auth — a typo
+    /// would otherwise look like "the key is ignored" with no explanation.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "password" | "basic" => Some(Self::Password),
+            "api_key" | "apikey" | "key" => Some(Self::ApiKey),
+            _ => None,
+        }
+    }
+}
 
 impl Default for DownloaderConfig {
     fn default() -> Self {
@@ -126,8 +171,10 @@ impl Default for DownloaderConfig {
             kind: default_downloader_kind(),
             name: "qBittorrent".into(),
             base_url: default_qb_url(),
+            auth: default_downloader_auth(),
             username: String::new(),
             password: String::new(),
+            api_key: String::new(),
             extra: DownloaderExtra::default(),
         }
     }
@@ -137,6 +184,22 @@ impl DownloaderConfig {
     pub fn kind(&self) -> std::result::Result<DownloaderKind, ServerError> {
         DownloaderKind::parse(&self.kind)
             .ok_or_else(|| ServerError::Config(format!("未知的下载器类型：{}", self.kind)))
+    }
+
+    /// Effective authentication mode. An unparsable stored value resolves to
+    /// password auth so a corrupted config still boots; `validate` is what
+    /// rejects a bad *patch*.
+    #[must_use]
+    pub fn auth_mode(&self) -> DownloaderAuthMode {
+        DownloaderAuthMode::parse(&self.auth).unwrap_or(DownloaderAuthMode::Password)
+    }
+
+    /// The API key to hand the client, and only when that is the chosen mode.
+    #[must_use]
+    pub fn effective_api_key(&self) -> Option<&str> {
+        (self.auth_mode() == DownloaderAuthMode::ApiKey)
+            .then(|| self.api_key.trim())
+            .filter(|k| !k.is_empty())
     }
 }
 
@@ -288,9 +351,24 @@ impl AppConfig {
                 "请选择 IYUU 会员类型（普通用户 / SVIP）".into(),
             ));
         }
-        self.downloader.kind()?;
+        let kind = self.downloader.kind()?;
         if self.downloader.base_url.trim().is_empty() {
             return Err(ServerError::Config("下载器地址不能为空".into()));
+        }
+        if self.downloader.auth_mode() == DownloaderAuthMode::ApiKey {
+            // Say it now rather than letting the engine build a client with no
+            // credential and fail on the first query with a 403.
+            if self.downloader.api_key.trim().is_empty() {
+                return Err(ServerError::Config(
+                    "已选择 API Key 认证，但还没有填写密钥".into(),
+                ));
+            }
+            if kind != DownloaderKind::Qbittorrent {
+                return Err(ServerError::Config(
+                    "API Key 认证仅 qBittorrent ≥ 5.2 支持，请改用用户名密码或切换下载器类型"
+                        .into(),
+                ));
+            }
         }
         if self.schedule.enabled {
             // Validate the cron by attempting a parse in the scheduler module;
@@ -345,8 +423,12 @@ pub struct PublicDownloader {
     pub kind: String,
     pub name: String,
     pub base_url: String,
+    /// `password` or `api_key` — the form needs it to render the right fields.
+    pub auth: String,
     pub username: String,
     pub has_password: bool,
+    /// Presence only. The key itself never leaves the server.
+    pub has_api_key: bool,
     pub extra: DownloaderExtra,
 }
 
@@ -393,8 +475,10 @@ impl AppConfig {
                 kind: self.downloader.kind.clone(),
                 name: self.downloader.name.clone(),
                 base_url: self.downloader.base_url.clone(),
+                auth: self.downloader.auth_mode().as_str().to_string(),
                 username: self.downloader.username.clone(),
                 has_password: !self.downloader.password.is_empty(),
+                has_api_key: !self.downloader.api_key.is_empty(),
                 extra: self.downloader.extra.clone(),
             },
             reseed: self.reseed.clone(),
@@ -475,8 +559,10 @@ pub struct DownloaderPatch {
     pub kind: Option<String>,
     pub name: Option<String>,
     pub base_url: Option<String>,
+    pub auth: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub api_key: Option<String>,
     pub extra: Option<DownloaderExtra>,
 }
 
@@ -488,6 +574,14 @@ impl AppConfig {
     pub fn validate_patch(patch: &ConfigPatch) -> Result<()> {
         if let Some(p) = patch.iyuu.as_ref() {
             p.validate()?;
+        }
+        if let Some(p) = patch.downloader.as_ref()
+            && let Some(auth) = p.auth.as_deref()
+            && DownloaderAuthMode::parse(auth).is_none()
+        {
+            return Err(ServerError::Config(format!(
+                "未知的下载器认证方式「{auth}」，可选 password / api_key"
+            )));
         }
         Ok(())
     }
@@ -514,6 +608,11 @@ impl AppConfig {
             if let Some(v) = p.base_url {
                 self.downloader.base_url = v;
             }
+            if let Some(v) = p.auth {
+                // `validate_patch` already rejected anything unparsable.
+                self.downloader.auth = DownloaderAuthMode::parse(&v)
+                    .map_or_else(|| self.downloader.auth.clone(), |m| m.as_str().to_string());
+            }
             if let Some(v) = p.username {
                 self.downloader.username = v;
             }
@@ -523,6 +622,15 @@ impl AppConfig {
                 && !v.is_empty()
             {
                 self.downloader.password = v;
+            }
+            // The API key follows the same blank-means-unchanged rule: the form
+            // renders the key as a masked write-only field, so an untouched field
+            // posts blank and must not wipe a working key. Switching `auth` back
+            // to `password` is what stops the key from being used.
+            if let Some(v) = p.api_key.map(|k| k.trim().to_string())
+                && !v.is_empty()
+            {
+                self.downloader.api_key = v;
             }
             if let Some(v) = p.extra {
                 self.downloader.extra = v;
@@ -657,6 +765,102 @@ mod tests {
             iyuu.get("base_url").is_none() && iyuu.get("legacy_base_url").is_none(),
             "removed field came back: {iyuu}"
         );
+    }
+
+    #[test]
+    fn api_key_mode_requires_a_key() {
+        let mut cfg = cfg_with("token", Some("free"));
+        cfg.downloader.auth = "api_key".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("API Key"), "{err}");
+
+        cfg.downloader.api_key = "qbt_abc".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn api_key_mode_is_qbittorrent_only() {
+        let mut cfg = cfg_with("token", Some("free"));
+        cfg.downloader.kind = "transmission".into();
+        cfg.downloader.auth = "api_key".into();
+        cfg.downloader.api_key = "qbt_abc".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("qBittorrent"), "{err}");
+    }
+
+    #[test]
+    fn unknown_auth_mode_is_rejected_by_patch_validation() {
+        // Rejecting at the patch layer keeps a typo from being stored and then
+        // silently ignored in favour of password auth.
+        let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+            "downloader": { "auth": "apikey-auth" }
+        }))
+        .unwrap();
+        let err = AppConfig::validate_patch(&patch).unwrap_err().to_string();
+        assert!(err.contains("apikey-auth"), "{err}");
+    }
+
+    #[test]
+    fn switching_back_to_password_ignores_a_saved_key() {
+        // A stale key must not keep being used after the user picks password auth,
+        // which is the whole reason `auth` is stored instead of inferred.
+        let mut cfg = cfg_with("token", Some("free"));
+        cfg.downloader.api_key = "qbt_abc".into();
+        cfg.downloader.auth = "password".into();
+        assert_eq!(cfg.downloader.effective_api_key(), None);
+        assert!(
+            cfg.validate().is_ok(),
+            "a saved key is not an error in password mode"
+        );
+
+        cfg.downloader.auth = "api_key".into();
+        assert_eq!(cfg.downloader.effective_api_key(), Some("qbt_abc"));
+    }
+
+    #[test]
+    fn blank_api_key_on_a_patch_keeps_the_saved_one() {
+        let mut cfg = cfg_with("token", Some("free"));
+        cfg.downloader.auth = "api_key".into();
+        cfg.downloader.api_key = "qbt_saved".into();
+
+        let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+            "downloader": { "auth": "api_key", "api_key": "  " }
+        }))
+        .unwrap();
+        cfg.apply_patch(patch);
+        assert_eq!(cfg.downloader.api_key, "qbt_saved");
+    }
+
+    #[test]
+    fn public_view_reports_auth_mode_without_the_key() {
+        let mut cfg = cfg_with("token", Some("free"));
+        cfg.downloader.auth = "api_key".into();
+        cfg.downloader.api_key = "qbt_secret_value".into();
+
+        let view = serde_json::to_value(cfg.public_view()).unwrap();
+        let dl = view.get("downloader").expect("downloader section");
+        assert_eq!(dl.get("auth").and_then(|v| v.as_str()), Some("api_key"));
+        assert_eq!(
+            dl.get("has_api_key").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            !dl.to_string().contains("qbt_secret_value"),
+            "API key leaked into the public config: {dl}"
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_auth_defaults_to_password() {
+        // An existing install has no `auth` field; it must load as password mode
+        // rather than failing to deserialize or silently switching to API keys.
+        let cfg: AppConfig = serde_json::from_value(serde_json::json!({
+            "iyuu": { "token": "t", "tier": "free" },
+            "downloader": { "kind": "qbittorrent", "username": "u", "password": "p" }
+        }))
+        .unwrap();
+        assert_eq!(cfg.downloader.auth_mode(), DownloaderAuthMode::Password);
+        assert_eq!(cfg.downloader.effective_api_key(), None);
     }
 
     #[test]
