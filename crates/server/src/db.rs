@@ -15,7 +15,9 @@
 use crate::error::ServerError;
 use chrono::{DateTime, Utc};
 use iyuu_core::engine::AttemptStore;
-use iyuu_core::models::{ReseedAttempt, ReseedState, Run, RunStats, RunStatus, RunTrigger};
+use iyuu_core::models::{
+    IyuuSite, ReseedAttempt, ReseedState, Run, RunStats, RunStatus, RunTrigger,
+};
 use iyuu_core::ratelimit::QuotaUsage;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -75,6 +77,32 @@ const MIGRATIONS: &[&str] = &[
     r"
     CREATE INDEX IF NOT EXISTS idx_attempts_state
         ON attempts(state);
+    ",
+    // IYUU's cross-seed site catalogue, persisted.
+    //
+    // Why a table and not a per-process cache: `/reseed/sites/index` costs one
+    // unit of the daily quota, and the catalogue changes on the order of weeks.
+    // Caching it in the `IyuuClient` (as an earlier version did, 24h TTL) meant
+    // every process start re-spent a request, and every settings page that read
+    // the list hit the network. Persisting it makes "fetch" a once-per-install
+    // event plus explicit user refreshes, which is what the quota accounting
+    // assumes.
+    //
+    // `download_page`/`details_page` are stored verbatim: they are the URL
+    // templates the fetcher renders, so a partial row is useless.
+    r"
+    CREATE TABLE IF NOT EXISTS iyuu_sites (
+        id              INTEGER PRIMARY KEY,
+        site            TEXT NOT NULL,
+        nickname        TEXT NOT NULL DEFAULT '',
+        base_url        TEXT NOT NULL DEFAULT '',
+        download_page   TEXT NOT NULL DEFAULT '',
+        details_page    TEXT NOT NULL DEFAULT '',
+        reseed_check    TEXT NOT NULL DEFAULT '',
+        is_https        INTEGER NOT NULL DEFAULT 1,
+        cookie_required INTEGER NOT NULL DEFAULT 0,
+        fetched_at      TEXT NOT NULL
+    );
     ",
     r"
     CREATE TABLE IF NOT EXISTS runs (
@@ -179,6 +207,92 @@ impl Db {
             "iyuu_api_usage",
             &serde_json::to_string(usage).unwrap_or_else(|_| "{}".into()),
         )
+    }
+
+    // ------------------------------------------------------- iyuu site catalogue
+
+    /// Settings key recording the last **successful** catalogue sync.
+    ///
+    /// Distinct from the rows themselves: a successful fetch that returns zero
+    /// sites (possible while a token is mid-activation) would leave the table
+    /// empty and be indistinguishable from "never fetched". Without this marker
+    /// the app would re-spend a request on every start.
+    const SITES_SYNCED_KEY: &str = "iyuu_sites_synced_at";
+
+    /// Whether the catalogue has ever been fetched successfully.
+    pub fn catalogue_initialised(&self) -> Result<bool, ServerError> {
+        Ok(self.get_setting(Self::SITES_SYNCED_KEY)?.is_some())
+    }
+
+    /// Last successful sync time, for the UI's "updated 3 days ago" line.
+    pub fn catalogue_synced_at(&self) -> Result<Option<String>, ServerError> {
+        self.get_setting(Self::SITES_SYNCED_KEY)
+    }
+
+    /// Read the persisted catalogue, ordered by display name.
+    pub fn load_sites(&self) -> Result<Vec<IyuuSite>, ServerError> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, site, nickname, base_url, download_page, details_page,
+                    reseed_check, is_https, cookie_required
+             FROM iyuu_sites",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(IyuuSite {
+                id: r.get(0)?,
+                site: r.get(1)?,
+                nickname: r.get(2)?,
+                base_url: r.get(3)?,
+                download_page: r.get(4)?,
+                details_page: r.get(5)?,
+                reseed_check: r.get(6)?,
+                is_https: r.get(7)?,
+                cookie_required: r.get(8)?,
+            })
+        })?;
+        let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+        out.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+        Ok(out)
+    }
+
+    /// Replace the catalogue with a freshly fetched one, in one transaction.
+    ///
+    /// Replace, not merge: a site IYUU has dropped must disappear locally too,
+    /// otherwise a run keeps trying to build download URLs for a site the server
+    /// no longer indexes. Both statements share a transaction so a crash cannot
+    /// leave a half-written catalogue that looks complete.
+    pub fn replace_sites(&self, sites: &[IyuuSite]) -> Result<(), ServerError> {
+        let mut conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM iyuu_sites", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO iyuu_sites(
+                    id, site, nickname, base_url, download_page, details_page,
+                    reseed_check, is_https, cookie_required, fetched_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            )?;
+            for s in sites {
+                stmt.execute(params![
+                    s.id,
+                    s.site,
+                    s.nickname,
+                    s.base_url,
+                    s.download_page,
+                    s.details_page,
+                    s.reseed_check,
+                    s.is_https,
+                    s.cookie_required,
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        // Written after the rows land: the marker must never claim a catalogue
+        // exists when the transaction rolled back.
+        self.set_setting(Self::SITES_SYNCED_KEY, &now)?;
+        Ok(())
     }
 
     // ----------------------------------------------------------------- runs

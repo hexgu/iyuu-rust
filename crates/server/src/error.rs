@@ -12,6 +12,10 @@ use serde_json::json;
 pub enum ServerError {
     /// Bad or missing IYUU token / no sites bound → action required by the user.
     IyuuAuth(String),
+    /// The token is valid but not **activated**: no cooperative-site account has
+    /// been bound to it yet. Split from [`Self::IyuuAuth`] because the fix is a
+    /// different screen (bind a partner site), not "check your token".
+    IyuuInactive(String),
     /// IYUU's rate/quota limit was hit. Distinct from other failures because the
     /// UI's advice differs: wait for the reset (or upgrade the account), and do
     /// not retry now.
@@ -32,6 +36,7 @@ impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IyuuAuth(m) => write!(f, "IYUU 认证失败：{m}"),
+            Self::IyuuInactive(m) => write!(f, "IYUU Token 未激活：{m}"),
             Self::RateLimited(m) => write!(f, "IYUU 接口限流：{m}"),
             Self::Config(m) => write!(f, "配置错误：{m}"),
             Self::DownloaderAuth(m) => write!(f, "下载器认证失败：{m}"),
@@ -50,6 +55,7 @@ impl ServerError {
     fn kind(&self) -> &'static str {
         match self {
             Self::IyuuAuth(_) => "iyuu_auth",
+            Self::IyuuInactive(_) => "iyuu_inactive",
             Self::RateLimited(_) => "rate_limited",
             Self::Config(_) => "config",
             Self::DownloaderAuth(_) => "downloader_auth",
@@ -63,6 +69,9 @@ impl ServerError {
     fn status(&self) -> StatusCode {
         match self {
             Self::IyuuAuth(_) | Self::DownloaderAuth(_) => StatusCode::BAD_GATEWAY,
+            // 403, not 502: the upstream answered correctly and the caller lacks a
+            // setup step. A gateway error would suggest IYUU is broken.
+            Self::IyuuInactive(_) => StatusCode::FORBIDDEN,
             // 429 is the honest status for "stop calling": a proxy or a human
             // reading logs sees the same signal the engine acts on.
             Self::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -125,6 +134,7 @@ impl From<iyuu_core::CoreError> for ServerError {
             }
             // Both mean "your IYUU auth material needs attention"; the UI shows
             // the same hint for either.
+            C::IyuuInactive(m) => ServerError::IyuuInactive(m),
             C::SidSha1Expired(m) | C::IyuuToken(m) => ServerError::IyuuAuth(m),
             C::TorrentFetch { site, msg } => {
                 ServerError::Downloader(format!("获取种子失败（{site}）：{msg}"))

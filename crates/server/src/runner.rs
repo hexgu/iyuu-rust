@@ -169,12 +169,23 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
         set
     };
 
+    // Site metadata from the persisted catalogue. No network call: a run must not
+    // spend quota re-reading a list that changes monthly, and reading it from the
+    // database keeps a run working while IYUU's catalogue endpoint is down.
+    let sites = state
+        .db
+        .load_sites()?
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
+
     Ok(EngineContext {
         iyuu,
         downloader,
         http: iyuu_core::fetch::site_http_client()?,
         config: (&cfg.reseed).into(),
         credentials: cfg.credential_map(),
+        sites,
         blocked_hashes: blocked,
     })
 }
@@ -403,6 +414,89 @@ async fn run_inner(
         warnings: outcome.warnings,
         cancelled: outcome.cancelled,
     })
+}
+
+/// Fetch the IYUU site catalogue **once**, on the first run after install.
+///
+/// The catalogue (`/reseed/sites/index`) costs one unit of the daily quota and
+/// changes on the order of weeks, so the policy is: persist it, serve every page
+/// and every run from SQLite, and only refetch when the user presses 刷新
+/// (`POST /api/sites/refresh`).
+///
+/// This function therefore does nothing once the catalogue has been initialised
+/// successfully — including after a normal restart — and it never retries on a
+/// schedule, because a token that is not yet activated answers that endpoint with
+/// `403 用户未绑定推荐站点`, and retrying would burn quota on a request that cannot
+/// succeed until the user acts.
+pub async fn bootstrap_site_catalogue(state: AppState) {
+    if matches!(state.db.catalogue_initialised(), Ok(true)) {
+        tracing::debug!("站点目录已在数据库中，跳过拉取");
+        return;
+    }
+
+    let cfg = state.config_snapshot();
+    if cfg.iyuu.token.trim().is_empty() || !cfg.iyuu.tier_chosen() {
+        // Nothing to authenticate with yet. Waiting for the user to save a token
+        // is correct; the refresh button and the next start both cover this.
+        tracing::info!("尚未配置 IYUU Token，跳过首次站点目录拉取");
+        return;
+    }
+
+    // A short delay so the log shows the service is up before an outbound call
+    // that may fail on a fresh install.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let client = match IyuuClient::build(
+        cfg.iyuu.token.clone(),
+        cfg.iyuu.effective_base_url(),
+        cfg.iyuu.tier(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "构建 IYUU 客户端失败，跳过站点目录拉取");
+            return;
+        }
+    };
+    // Seed the day's counter from the database so this request is charged against
+    // the real remaining budget rather than a fresh one, then publish the client so
+    // the quota widget counts what we are about to spend.
+    let usage = match state.db.load_api_usage() {
+        Ok(u) => u,
+        Err(e) => {
+            // Losing the stored counter costs at most one extra request; it must
+            // not stop the catalogue from being fetched.
+            tracing::warn!(error = %e, "读取 API 用量失败，按今日未用计");
+            iyuu_core::ratelimit::QuotaUsage::default()
+        }
+    };
+    let client = std::sync::Arc::new(client.with_usage(&usage));
+    *state.iyuu.write() = Some(client.clone());
+
+    match client.sites().await {
+        Ok(sites) => {
+            let n = sites.len();
+            match state.db.replace_sites(&sites) {
+                Ok(()) => {
+                    tracing::info!(count = n, "首次启动：站点目录已写入数据库");
+                    state.push_log(format!("首次启动：已拉取 {n} 个辅种站点"));
+                }
+                Err(e) => tracing::warn!(error = %e, "写入站点目录失败"),
+            }
+        }
+        Err(iyuu_core::CoreError::IyuuInactive(msg)) => {
+            tracing::warn!(%msg, "IYUU Token 尚未激活，无法拉取站点目录");
+            state.push_log("IYUU Token 尚未激活：请在设置里绑定一个合作站点");
+        }
+        Err(e) => {
+            // Not fatal: the user can press 刷新 in the UI. Logged loudly because
+            // a failed first fetch is the difference between "no sites to choose"
+            // and a working install.
+            tracing::warn!(error = %e, "首次拉取站点目录失败，可在「添加辅种站点」里手动刷新");
+            state.push_log(format!("首次拉取站点目录失败：{e}"));
+        }
+    }
+
+    persist_api_usage(&state);
 }
 
 /// The verification loop. Runs forever; reads pending attempts from the

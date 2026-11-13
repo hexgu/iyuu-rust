@@ -80,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
     // added yesterday and interrupted by a restart still needs to be resolved.
     tokio::spawn(runner::verification_loop(state.clone()));
 
+    // One-time catalogue bootstrap. After this, the site list is only refetched
+    // when the user clicks 刷新 — it is read from SQLite by every page and every
+    // run in between, so the daily quota is not spent re-downloading a list that
+    // changes monthly.
+    tokio::spawn(runner::bootstrap_site_catalogue(state.clone()));
+
     // Scheduler: restarts cleanly whenever the cron setting changes.
     let sched = scheduler::spawn(state.clone());
 

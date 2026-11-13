@@ -525,7 +525,6 @@ mod tests {
             reseed_check: "passkey".into(),
             is_https: 1,
             cookie_required: 0,
-            bind_check: String::new(),
         }
     }
 

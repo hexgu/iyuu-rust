@@ -31,6 +31,16 @@ pub enum CoreError {
     #[error("IYUU Token 无效或未绑定站点：{0}")]
     IyuuToken(String),
 
+    /// The token is syntactically valid but **not activated**: IYUU only grants
+    /// access after one cooperative-site account is bound to it
+    /// (`POST /reseed/users/bind`). The service answers `403 用户未绑定推荐站点`.
+    ///
+    /// A separate variant because the fix is a specific menu item, not "check your
+    /// token" — telling the user their token is wrong when it simply needs
+    /// activating sends them to the wrong page.
+    #[error("IYUU Token 尚未激活：{0}")]
+    IyuuInactive(String),
+
     /// `sid_sha1` expired mid-run — recoverable by re-reporting.
     #[error("sid_sha1 失效：{0}")]
     SidSha1Expired(String),

@@ -36,7 +36,8 @@ pub struct IyuuSite {
     /// Download path template, e.g. `download.php?id={}&passkey={passkey}`.
     #[serde(default)]
     pub download_page: String,
-    /// e.g. `details.php?id={}` — used for the details-page fallback.
+    /// e.g. `details.php?id={}` — used for the details-page fallback. Present in
+    /// the API's example response but not in its parameter table; optional.
     #[serde(default)]
     pub details_page: String,
     /// Which credential the site needs: `passkey`, `authkey`, `uid`, ...
@@ -45,11 +46,9 @@ pub struct IyuuSite {
     /// 0 = http only, 1 = https only, 2 = both.
     #[serde(default)]
     pub is_https: i64,
+    /// `1` = the site gates downloads behind a login cookie.
     #[serde(default)]
     pub cookie_required: i64,
-    /// Sites that need a login cookie rather than / in addition to a passkey.
-    #[serde(default)]
-    pub bind_check: String,
 }
 
 impl IyuuSite {
@@ -72,14 +71,141 @@ impl IyuuSite {
     }
 }
 
+/// One entry of `GET /reseed/sites/recommend` — a **cooperative** site.
+///
+/// This is a different list from [`IyuuSite`], and confusing the two is the
+/// mistake this type exists to prevent:
+///
+/// * [`IyuuSite`] (`/reseed/sites/index`) is the catalogue of sites IYUU can
+///   cross-seed into, with the download-URL template needed to fetch a .torrent.
+/// * `PartnerSite` is the shorter list of sites IYUU has a **commercial
+///   partnership** with. Binding one of *your* accounts on such a site
+///   (`POST /reseed/users/bind`) is what **activates the token** — without it
+///   IYUU answers `403 用户未绑定推荐站点` and every other endpoint refuses.
+///
+/// So this list is an *activation menu*, not a reseed target list. It carries no
+/// `base_url` and no `download_page`: the response simply does not include them,
+/// so parsing it as [`IyuuSite`] yields dozens of entries with empty URLs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartnerSite {
+    /// Same `sid` space as [`IyuuSite::id`].
+    pub id: i64,
+    #[serde(default)]
+    pub site: String,
+    #[serde(default)]
+    pub nickname: String,
+    /// Which fields the bind call needs, e.g. `passkey,uid`. Documented as
+    /// deprecated upstream; kept because it is what tells the UI whether to ask
+    /// for a uid at all.
+    #[serde(default)]
+    pub bind_check: String,
+    /// Reseed credential hint. Documented as deprecated upstream.
+    #[serde(default)]
+    pub reseed_check: String,
+}
+
+impl PartnerSite {
+    /// Display name, falling back to the slug.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        if self.nickname.is_empty() {
+            &self.site
+        } else {
+            &self.nickname
+        }
+    }
+
+    /// Whether the bind call needs the site's numeric user id.
+    ///
+    /// `bind_check` is a comma-separated list (`passkey,uid`). Absent or
+    /// unparsable → assume it is needed, because the bind endpoint documents
+    /// `id` as required and a missing uid is a rejected call, not a worse one.
+    #[must_use]
+    pub fn needs_uid(&self) -> bool {
+        if self.bind_check.trim().is_empty() {
+            return true;
+        }
+        self.bind_check
+            .split(',')
+            .any(|f| f.trim().eq_ignore_ascii_case("uid"))
+    }
+}
+
 /// A cross-seed candidate from `POST /reseed/index/index`.
+///
+/// `sid` and `torrent_id` are documented as integers, and the example response
+/// shows integers — but in practice the server passes through whatever the
+/// per-site spider stored, and some sites yield **numeric strings**
+/// (`"torrent_id": "631188"`). Deserializing those as plain `i64` fails the whole
+/// batch with `invalid type: string "631188", expected i64`, throwing away up to
+/// 200 hashes of good answers because one site's row was stringly typed.
+///
+/// So both fields accept either form. The lenience lives in the type, not at the
+/// call site, because every consumer only ever wants the number.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedCandidate {
     /// Site id, join key into the site list.
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub sid: i64,
+    #[serde(deserialize_with = "de_i64_lenient")]
     pub torrent_id: i64,
     #[serde(default)]
     pub info_hash: String,
+}
+
+/// Deserialize an integer that may arrive as a JSON number or a numeric string.
+///
+/// Also accepts a float that is exactly integral (`74215.0`), which some PHP
+/// `json_encode` paths produce for values that overflowed an int column. Rejects
+/// anything else loudly rather than silently defaulting to 0 — a zero id would
+/// build a nonsense download URL and fail at the site instead of here.
+fn de_i64_lenient<'de, D>(de: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Int(i64),
+        /// `u64` covers ids above `i64::MAX`, which would otherwise be reported as
+        /// a type error rather than a range one.
+        UInt(u64),
+        Float(f64),
+        Str(String),
+    }
+
+    match Raw::deserialize(de)? {
+        Raw::Int(v) => Ok(v),
+        Raw::UInt(v) => {
+            i64::try_from(v).map_err(|_| D::Error::custom(format!("站点 ID 超出范围：{v}")))
+        }
+        Raw::Float(v) => {
+            // `f64 -> i64` is only meaningful when the value is integral and in
+            // range; Rust's `as` cast saturates silently, which would turn a
+            // malformed id into a plausible-looking wrong one.
+            // Compare against the f64 representation of the *exact* bounds rather
+            // than casting `i64::MIN`/`MAX` to f64: `i64::MAX as f64` rounds up to
+            // 2^63, so the naive comparison would accept an out-of-range value.
+            // `-2^63` is exactly representable, `2^63` is the first float above it.
+            if v.fract() != 0.0
+                || v < -9_223_372_036_854_775_808.0
+                || v >= 9_223_372_036_854_775_808.0
+            {
+                return Err(D::Error::custom(format!("站点 ID 不是整数：{v}")));
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "range and integrality were checked immediately above"
+            )]
+            Ok(v as i64)
+        }
+        Raw::Str(s) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| D::Error::custom(format!("站点 ID 无法解析为整数：「{s}」"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,4 +614,97 @@ pub struct Run {
     pub finished_at: Option<DateTime<Utc>>,
     pub stats: RunStats,
     pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------- candidate field leniency
+
+    #[test]
+    fn torrent_id_as_a_numeric_string_is_accepted() {
+        // The exact shape that broke a real run:
+        //   响应数据结构不符：invalid type: string "631188", expected i64
+        // Some sites' spider rows carry the id as a string, and the server passes
+        // it through verbatim. Deserializing strictly cost the whole 200-hash
+        // batch, so this must parse.
+        let json = r#"{"sid":7,"torrent_id":"631188","info_hash":"abc"}"#;
+        let c: SeedCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!(c.sid, 7);
+        assert_eq!(c.torrent_id, 631_188);
+        assert_eq!(c.info_hash, "abc");
+    }
+
+    #[test]
+    fn sid_as_a_numeric_string_is_accepted() {
+        // Same class of problem on the other field, and the one that would
+        // otherwise fail *after* a fix to `torrent_id` alone.
+        let json = r#"{"sid":"7","torrent_id":74215,"info_hash":"abc"}"#;
+        let c: SeedCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!(c.sid, 7);
+        assert_eq!(c.torrent_id, 74_215);
+    }
+
+    #[test]
+    fn both_fields_as_strings_and_surrounding_space_are_accepted() {
+        let json = r#"{"sid":" 7 ","torrent_id":" 74215 ","info_hash":""}"#;
+        let c: SeedCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!((c.sid, c.torrent_id), (7, 74_215));
+    }
+
+    #[test]
+    fn plain_integers_still_parse() {
+        // The documented shape must keep working — leniency is additive.
+        let json = r#"{"sid":32,"torrent_id":19537,"info_hash":"x"}"#;
+        let c: SeedCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!((c.sid, c.torrent_id), (32, 19_537));
+    }
+
+    #[test]
+    fn an_integral_float_is_accepted() {
+        // A PHP json_encode of an oversized int column can surface as 74215.0.
+        let json = r#"{"sid":7.0,"torrent_id":74215.0,"info_hash":"x"}"#;
+        let c: SeedCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!((c.sid, c.torrent_id), (7, 74_215));
+    }
+
+    #[test]
+    fn a_non_integral_float_is_rejected() {
+        // Silently truncating 7.5 to 7 would build a download URL for the wrong
+        // torrent — worse than failing, because it would look like it worked.
+        let json = r#"{"sid":7.5,"torrent_id":74215,"info_hash":"x"}"#;
+        let err = serde_json::from_str::<SeedCandidate>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不是整数"), "{err}");
+    }
+
+    #[test]
+    fn a_garbage_id_is_rejected_rather_than_defaulted_to_zero() {
+        // A 0 id would render a nonsense template and fail at the site; failing
+        // here names the actual problem.
+        let json = r#"{"sid":7,"torrent_id":"not-a-number","info_hash":"x"}"#;
+        let err = serde_json::from_str::<SeedCandidate>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("无法解析"), "{err}");
+    }
+
+    #[test]
+    fn an_out_of_range_id_is_rejected() {
+        let json = r#"{"sid":7,"torrent_id":99999999999999999999999999,"info_hash":"x"}"#;
+        assert!(serde_json::from_str::<SeedCandidate>(json).is_err());
+    }
+
+    #[test]
+    fn one_bad_row_reports_which_field_is_at_fault() {
+        // The original message named neither the field nor the site. Callers log
+        // this string, so it has to be diagnosable on its own.
+        let json = r#"{"sid":7,"torrent_id":{},"info_hash":"x"}"#;
+        let err = serde_json::from_str::<SeedCandidate>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty(), "an error with no message is undebuggable");
+    }
 }
