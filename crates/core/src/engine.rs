@@ -93,6 +93,14 @@ pub struct EngineContext {
     pub http: reqwest::Client,
     pub config: DiscoveryConfig,
     pub credentials: CredentialMap,
+    /// IYUU site metadata, keyed by sid, loaded from the persisted catalogue.
+    ///
+    /// Comes from the database rather than a network call: the catalogue is
+    /// fetched once at install and only refetched when the user asks, so a run
+    /// must not spend quota on it. An empty map means the catalogue has not been
+    /// initialised yet, which [`collect_target_sites`] treats as "no filtering"
+    /// rather than "every site is unknown".
+    pub sites: HashMap<i64, IyuuSite>,
     /// Hashes that previously failed to fetch — skip them so a dead release
     /// doesn't get retried on every scheduled run.
     pub blocked_hashes: HashSet<String>,
@@ -184,7 +192,14 @@ pub async fn discover(
     }
 
     // ------------------------------------------------------- IYUU query
-    let site_map = ctx.iyuu.sites_by_id().await?;
+    //
+    // Site metadata comes from the persisted catalogue in `ctx`, not from a
+    // `/reseed/sites/index` call: that request costs quota and the catalogue only
+    // changes when the user refreshes it.
+    //
+    // Cloned once: a few hundred small rows, and it keeps `site_map` usable after
+    // `ctx` is moved into the shared `Arc` below.
+    let site_map = ctx.sites.clone();
     let sid_list = target_sites(ctx, &site_map)?;
 
     let source_hashes: Vec<String> = sources.iter().map(|t| t.hash.clone()).collect();
@@ -394,6 +409,7 @@ fn clone_ctx(ctx: &EngineContext) -> EngineContext {
         http: ctx.http.clone(),
         config: ctx.config.clone(),
         credentials: ctx.credentials.clone(),
+        sites: ctx.sites.clone(),
         blocked_hashes: ctx.blocked_hashes.clone(),
     }
 }
@@ -492,20 +508,60 @@ fn collect_target_sites(
     credentials: &CredentialMap,
     site_map: &HashMap<i64, IyuuSite>,
 ) -> Result<Vec<i64>> {
-    let mut sites: Vec<i64> = credentials
+    // An empty catalogue is a setup problem, not "every site is valid": without
+    // download templates nothing can be fetched, so every candidate would fail
+    // one at a time instead of the run saying what is actually wrong.
+    if site_map.is_empty() {
+        return Err(CoreError::Config(
+            "还没有 IYUU 站点目录：请先在「添加辅种站点」里点刷新拉取站点列表".into(),
+        ));
+    }
+
+    let configured: Vec<i64> = credentials
         .iter()
         .filter(|(_, c)| c.has_any_credential())
-        // A sid IYUU's catalogue does not list cannot be fetched from: we have no
-        // download URL template for it, so it would fail per candidate.
-        .filter(|(sid, _)| site_map.is_empty() || site_map.contains_key(sid))
         .map(|(sid, _)| *sid)
+        .collect();
+
+    if configured.is_empty() {
+        return Err(CoreError::Config(
+            "还没有添加任何站点：请先在「站点凭据」里添加要辅种的站点".into(),
+        ));
+    }
+
+    // A sid IYUU's catalogue does not list cannot be fetched from: we have no
+    // download URL template for it, so it would fail per candidate. Logged rather
+    // than silently dropped — a configured site that never produces candidates
+    // otherwise looks like the site has nothing, when the real cause is a stale
+    // catalogue.
+    let mut missing: Vec<i64> = configured
+        .iter()
+        .copied()
+        .filter(|sid| !site_map.contains_key(sid))
+        .collect();
+    missing.sort_unstable();
+    if !missing.is_empty() {
+        tracing::warn!(
+            missing = ?missing,
+            "已配置的站点不在 IYUU 站点目录中，已跳过；建议刷新站点目录"
+        );
+    }
+
+    let mut sites: Vec<i64> = configured
+        .into_iter()
+        .filter(|sid| site_map.contains_key(sid))
         .collect();
 
     sites.sort_unstable();
     if sites.is_empty() {
-        return Err(CoreError::Config(
-            "还没有添加任何站点：请先在「站点凭据」里添加要辅种的站点".into(),
-        ));
+        return Err(CoreError::Config(format!(
+            "已配置的站点都不在 IYUU 站点目录中（sid {}）：请刷新站点目录后重试",
+            missing
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )));
     }
     Ok(sites)
 }
@@ -653,6 +709,30 @@ fn new_attempt(job: &Job, site: &IyuuSite, target_hash: &str, run_id: &str) -> R
     }
 }
 
+/// Record a per-job failure in the run's warning list, deduplicated and capped.
+///
+/// A systemic failure (every site down, expired cookie) otherwise produces one
+/// identical warning per candidate — hundreds of lines that bury the message.
+/// Repeats are collapsed to a count so the reason stays readable.
+fn push_failure_warning(out: &mut DiscoveryOutcome, message: &str) {
+    const MAX_FAILURE_WARNINGS: usize = 10;
+
+    if let Some(existing) = out.warnings.iter_mut().find(|w| w.starts_with(message)) {
+        if let Some(count) = existing
+            .rsplit_once(" ×")
+            .and_then(|(_, n)| n.parse::<u32>().ok())
+        {
+            *existing = format!("{message} ×{}", count + 1);
+        } else {
+            existing.push_str(" ×2");
+        }
+        return;
+    }
+    if out.warnings.len() < MAX_FAILURE_WARNINGS {
+        out.warnings.push(message.to_string());
+    }
+}
+
 async fn apply_job_result(
     stats: &mut RunStats,
     out: &mut DiscoveryOutcome,
@@ -669,10 +749,18 @@ async fn apply_job_result(
             stats.fetch_failed += 1;
             if let Some(msg) = &result.message {
                 tracing::warn!(source = %job.source_name, %msg, "获取种子失败");
+                // The run log is the only place an operator can see *why* nothing
+                // was added: a fetch failure produces no attempt row, so without
+                // this "0 added" reads exactly like "the sites had nothing".
+                push_failure_warning(out, &format!("获取种子失败：{msg}"));
             }
         }
         JobOutcome::AddFailed => {
             stats.add_failed += 1;
+            if let Some(msg) = &result.message {
+                tracing::warn!(source = %job.source_name, %msg, "添加种子失败");
+                push_failure_warning(out, &format!("添加种子失败：{msg}"));
+            }
         }
         JobOutcome::Skipped => {
             stats.existed += 1;
@@ -1116,7 +1204,6 @@ mod tests {
             reseed_check: "passkey".into(),
             is_https: 1,
             cookie_required: 0,
-            bind_check: String::new(),
         }
     }
 
@@ -1172,9 +1259,63 @@ mod tests {
     fn no_added_sites_is_a_config_error_not_an_empty_run() {
         // Silently running with zero targets looks identical to "no candidates
         // found", which sends the user hunting for a bug that isn't there.
-        let err = collect_target_sites(&CredentialMap::new(), &HashMap::new())
+        // Catalogue is present here, so the message must be about credentials.
+        let site_map: HashMap<i64, IyuuSite> = [(1, site(1))].into_iter().collect();
+        let err = collect_target_sites(&CredentialMap::new(), &site_map)
             .unwrap_err()
             .to_string();
         assert!(err.contains("站点凭据"), "{err}");
+    }
+
+    #[test]
+    fn empty_catalogue_is_reported_as_a_refresh_problem() {
+        // The catalogue is fetched once at install and only refetched on demand,
+        // so an empty one means the fetch never succeeded (usually an unactivated
+        // token). Treating it as "no filter" would skip every configured site.
+        let mut creds = CredentialMap::new();
+        creds.insert(
+            1,
+            SiteCredentials {
+                passkey: Some("p".into()),
+                ..Default::default()
+            },
+        );
+        let err = collect_target_sites(&creds, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("站点目录"), "{err}");
+    }
+
+    #[test]
+    fn configured_sites_missing_from_the_catalogue_are_reported_by_sid() {
+        // A configured site the catalogue does not know cannot be fetched from;
+        // naming its sid is what lets the user tell "stale catalogue" apart from
+        // "the site genuinely has nothing".
+        let site_map: HashMap<i64, IyuuSite> = [(1, site(1))].into_iter().collect();
+        let mut creds = CredentialMap::new();
+        for sid in [1, 7] {
+            creds.insert(
+                sid,
+                SiteCredentials {
+                    passkey: Some("p".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(collect_target_sites(&creds, &site_map).unwrap(), vec![1]);
+
+        // Only the unknown one configured: nothing is left to query.
+        let mut only_unknown = CredentialMap::new();
+        only_unknown.insert(
+            7,
+            SiteCredentials {
+                passkey: Some("p".into()),
+                ..Default::default()
+            },
+        );
+        let err = collect_target_sites(&only_unknown, &site_map)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('7'), "{err}");
     }
 }
