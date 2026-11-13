@@ -5,8 +5,10 @@
 # every unresolved cross-seed and they will sit paused in the downloader again.
 services:
   iyuu-reseed:
-    build: .
-    image: iyuu-reseed:latest
+    # 默认用 GitHub Actions 构建好的镜像，不占本地编译资源。
+    # 想自己构建就改成 `build: .`（两个都留着的话 compose 会先构建再用 build 的 tag）。
+    image: ghcr.io/hexgu/iyuu-rust:latest
+    # build: .
     container_name: iyuu-reseed
     restart: unless-stopped
     ports:
