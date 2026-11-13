@@ -7,7 +7,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["iyuu-reseed contributors"]
-repository = "https://github.com/iyuu-reseed/iyuu-reseed"
+repository = "https://github.com/hexgu/iyuu-rust"
+homepage = "https://github.com/hexgu/iyuu-rust"
 
 # Lint policy (see rust-best-practices, chapter 2). Crates opt in with
 # `[lints] workspace = true`, so the plain gate
