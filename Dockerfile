@@ -97,7 +97,7 @@ LABEL org.opencontainers.image.title="iyuu-reseed" \
 
 # 镜像里没有 curl/wget；bash 的 /dev/tcp 足够做存活探测。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8098 && printf "GET /api/health HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' || exit 1
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8098 && printf 'GET /api/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
 
 # 入口先修 /data 属主再降权，应用进程最终以 uid 10001 运行（见 docker-entrypoint.sh）。
 ENTRYPOINT ["docker-entrypoint.sh"]
