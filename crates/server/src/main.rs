@@ -11,6 +11,7 @@ mod error;
 mod importer;
 mod runner;
 mod scheduler;
+mod seeds;
 
 use crate::config::AppConfig;
 use crate::db::Db;

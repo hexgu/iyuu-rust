@@ -410,6 +410,18 @@ impl Db {
         Ok(out)
     }
 
+    /// 全量读取辅种记录，供「种子管理」聚合使用。
+    ///
+    /// 分组必须在内存里做：一组的主种子可能在任何一条记录里当源、也可能已经不在
+    /// 下载器里，SQL 没法表达这种「记录 + 下载器快照」的连接。记录量级在一万以内
+    /// （每个候选一条），一次读完比按组分页查询更简单也更快。
+    pub fn all_attempts(&self) -> Result<Vec<ReseedAttempt>, ServerError> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM attempts ORDER BY id DESC")?;
+        let rows = stmt.query_map([], attempt_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn count_attempts(&self, state: Option<&str>) -> Result<i64, ServerError> {
         let conn = self.pool.get()?;
         let n = match state {

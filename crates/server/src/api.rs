@@ -9,6 +9,7 @@
 use crate::config::ConfigPatch;
 use crate::error::{Result, ServerError};
 use crate::runner::{self, AppState};
+use crate::seeds;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
@@ -66,6 +67,8 @@ pub fn router(state: AppState) -> Router {
         .route("/attempts/stats", get(attempt_stats))
         .route("/attempts/{id}/requeue", post(requeue_attempt))
         .route("/attempts/{id}", delete(delete_attempt))
+        // 「种子管理」视图：主种子 + 它的辅种子。分组是推导出来的，不落库。
+        .route("/seeds", get(list_seeds))
         // downloader introspection
         .route("/downloader/torrents", get(list_torrents))
         .route("/downloader/summary", get(downloader_summary))
@@ -1096,6 +1099,59 @@ async fn cancel_run(State(state): State<AppState>) -> Json<Value> {
 }
 
 // ----------------------------------------------------------------- attempts
+
+// ----------------------------------------------------------------- seeds
+
+#[derive(Deserialize)]
+struct SeedsQuery {
+    filter: Option<String>,
+    q: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// 主种子 + 辅种子分组视图。
+///
+/// 每次请求都重新聚合：下载器快照是实时读的，辅种记录是库里的，两者之间没有缓存
+/// 可以不一致。分页在聚合之后做——组数远小于记录数，省下的那点内存不值得让分页
+/// 把一组拆到两页里。
+async fn list_seeds(
+    State(state): State<AppState>,
+    Query(q): Query<SeedsQuery>,
+) -> Result<Json<Value>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let torrents = with_downloader(&state, |dl| async move {
+        dl.list_torrents().await.map_err(ServerError::from)
+    })
+    .await?;
+    let attempts = state.db.all_attempts()?;
+
+    let groups = seeds::build_groups(&torrents, &attempts);
+    // counts 取自过滤之前：顶部数字要回答「一共还有多少问题」，而不是「这页筛出来多少」。
+    let counts = seeds::summarize(&groups);
+
+    let filter = q.filter.unwrap_or_default();
+    let needle = q.q.unwrap_or_default();
+    let filtered: Vec<_> = groups
+        .into_iter()
+        .filter(|g| seeds::matches(g, &filter, &needle))
+        .collect();
+    let total = filtered.len();
+
+    let skip = usize::try_from(offset).unwrap_or(0);
+    let take = usize::try_from(limit).unwrap_or(0);
+    let items: Vec<_> = filtered.into_iter().skip(skip).take(take).collect();
+
+    Ok(Json(json!({
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "counts": counts,
+        "items": items,
+    })))
+}
 
 #[derive(Deserialize)]
 struct AttemptsQuery {
