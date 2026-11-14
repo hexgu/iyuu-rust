@@ -104,6 +104,27 @@ jobs:
       - name: 类型检查 + 构建
         run: bun run build
 
+  # ------------------------------------------------------- Dockerfile 静态检查
+  # hadolint 检查「镜像怎么造」：基础镜像选择、apt 清理、多阶段、指令顺序。
+  # 忽略项集中在 .hadolint.yaml，每条都带理由。
+  hadolint:
+    name: Dockerfile · hadolint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+      # compose 文件写坏了同样要等部署时才发现，这里顺手校验一次。
+      - name: 校验 compose.yml
+        run: docker compose -f compose.yml config -q
+
   # 说明：这里没有依赖变更审查（actions/dependency-review-action）。它要求仓库开启
   # Dependency graph，而本仓库该功能不可用（action 直接报 "not supported on this
   # repository"）。硬塞进来只会让每个 PR 常红，所以等仓库设置里能开启时再加。
@@ -137,7 +158,7 @@ jobs:
   # skipped 视为通过——dockerfile / dependency-review 在非 PR 事件上本来就不跑。
   ci-ok:
     name: CI 通过
-    needs: [rust-lint, rust-test, web, dockerfile]
+    needs: [rust-lint, rust-test, web, hadolint, dockerfile]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
