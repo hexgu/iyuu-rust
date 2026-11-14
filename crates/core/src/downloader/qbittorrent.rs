@@ -386,11 +386,12 @@ impl QBittorrentClient {
             downloaded: t.downloaded,
             ratio: t.ratio,
             error: None,
-            trackers: t
-                .magnet_uri
-                .as_deref()
-                .map(tracker_hosts)
-                .unwrap_or_default(),
+            // 不用 `.map(..).unwrap_or_default()`：新版 clippy 会要求换成
+            // `map_or_default`，而那个方法在当前的 stable 上还没有。
+            trackers: match t.magnet_uri.as_deref() {
+                Some(magnet) => tracker_hosts(magnet),
+                None => Vec::new(),
+            },
         }
     }
 
