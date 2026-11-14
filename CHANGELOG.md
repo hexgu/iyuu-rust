@@ -3,6 +3,17 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.2] - 2026-11-14
+
+### 变更
+
+- **自动清理不再有观察期**。删掉 `cleanup.grace_hours`：确认主种子缺失、且有证据的组，
+  下一次任务就直接清。等待窗口会让人以为已经清过，实际还在耗时间；安全边界仍在
+  （默认关闭、证据检查、删文件前检查共用目录、dry-run 审计）。
+
+- 移除只为宽限期存在的 `cleanup_pending` 表与相关接口字段
+  （`first_seen_at` / `waited_hours` / `eta_hours`）。
+
 ## [0.4.1] - 2026-11-14
 
 ### 新增
@@ -247,6 +258,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.4.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.2
 [0.4.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.1
 [0.3.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.2
