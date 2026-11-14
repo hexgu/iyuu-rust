@@ -1,39 +1,50 @@
 name: CI
 
+# 只做「这段代码能不能进主干」的验证：PR 和 main 上的 push。
+# 镜像构建与发布在 release.yml（tag 触发），不再跟着每次 push 跑一遍多架构构建——
+# 那是每次 40 分钟起，而且大部分 commit 根本不会发版。
 on:
   push:
     branches: [main]
-    # 打 tag 也要跑：镜像的 semver 标签（v0.2.1 / 0.2 / latest）只在 tag 上生成，
-    # 不监听 tags 的话发版就只更新了代码、没有对应的镜像。
-    tags: ["v*.*.*"]
   pull_request:
   workflow_dispatch:
 
-# 同一个分支只保留最新一次运行：新 push 会取消还在跑的旧任务，省 runner。
+# 最小权限：默认只读。需要写权限的 job 自己声明（见 release.yml）。
+permissions:
+  contents: read
+
+# 同一个 ref 只保留最新一次运行：新 push 会取消还在跑的旧任务，省 runner。
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # runner 是一次性的，增量编译只会让 target 目录膨胀、拖慢缓存存取。
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # ---------------------------------------------------------------- Rust 门禁
-  lint:
-    name: fmt + clippy
+  rust-lint:
+    name: Rust · fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: 恢复 cargo 缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: lint
+          # lint 和 test 编译的是同一批依赖，共用一个 key 才能互相命中。
+          shared-key: rust
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -41,39 +52,47 @@ jobs:
       - name: clippy（pedantic，警告即错误）
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-  test:
-    name: test
+  rust-test:
+    name: Rust · test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: 恢复 cargo 缓存
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: test
+          shared-key: rust
 
       - name: cargo test
         run: cargo test --all-features --locked
 
   # ------------------------------------------------------------- 前端门禁
   web:
-    name: 前端类型检查 + 构建
+    name: 前端 · 类型检查 + 构建
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
       - name: 恢复 bun 缓存
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -85,53 +104,62 @@ jobs:
       - name: 类型检查 + 构建
         run: bun run build
 
-  # ------------------------------------------------------------------ 镜像
-  # 构建并推送多架构镜像到 ghcr.io。只在 main 分支和 tag 上推送，PR 只验证
-  # 能否构建（不推），这样 fork 来的 PR 拿不到写权限也不会失败。
-  image:
-    name: 镜像 → ghcr.io
+  # --------------------------------------------------- Dockerfile 构建校验
+  # 只在 PR 上跑，单架构、不推送：目的是「这个 Dockerfile 还能不能构建」，
+  # 真正的多架构发布在 release.yml。cargo-chef + gha 缓存让重复构建只要 1～2 分钟。
+  dockerfile:
+    name: Dockerfile · 构建校验
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: 设置 QEMU（arm64 交叉构建）
-        uses: docker/setup-qemu-action@v3
-
-      - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: 生成镜像元数据
-        id: meta
-        uses: docker/metadata-action@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+          persist-credentials: false
 
-      - name: 登录 ghcr.io
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: 构建并推送
-        uses: docker/build-push-action@v6
+      - name: 构建（amd64，不推送）
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          # PR 只构建 amd64 验证可编译，快得多。
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=docker-amd64
+          cache-to: type=gha,mode=max,scope=docker-amd64
+
+  # ------------------------------------------------------------ 依赖变更审查
+  # 只在 PR 上跑：新增/升级依赖时把已知漏洞与许可证问题挡在合并之前。
+  dependency-review:
+    name: 依赖变更审查
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+  # -------------------------------------------------------------- 汇总门禁
+  # 分支保护只需要勾这一个检查：以后往 CI 里加 job 不必再改仓库设置。
+  # skipped 视为通过——dockerfile / dependency-review 在非 PR 事件上本来就不跑。
+  ci-ok:
+    name: CI 通过
+    needs: [rust-lint, rust-test, web, dockerfile, dependency-review]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 汇总各 job 结果
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$NEEDS"

@@ -1,0 +1,206 @@
+name: Release
+
+# 发版只在 tag 上发生：`git tag -a v0.3.2 && git push origin v0.3.2`。
+# 一次运行产出三样东西——多架构镜像（ghcr.io）、GitHub Release、以及可追溯的
+# 构建缓存，全部来自同一个 commit。
+on:
+  push:
+    tags: ["v*.*.*"]
+  # 镜像构建失败或需要重建时，对已有 tag 重跑，不必重新打 tag。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的 tag（例如 v0.3.2）
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# 发布不取消：一半的 tag 已经推上去了，取消只会留下不完整的镜像。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------- 版本信息
+  meta:
+    name: 解析版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      minor: ${{ steps.v.outputs.minor }}
+    steps:
+      - name: 从 tag 推导镜像标签
+        id: v
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "tag 必须以 v 开头，收到：$TAG" >&2; exit 1 ;;
+          esac
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # 0.3.2 -> 0.3：给只想跟次版本的用户一个可锁的标签。
+          echo "minor=${VERSION%.*}" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ 镜像
+  # 每个架构在**原生 runner** 上构建，不再用 QEMU 模拟：arm64 上跑 Rust 编译
+  # 曾经一步就要 47 分钟（amd64 原生 6 分钟），换原生 arm64 runner 后两边并行。
+  build:
+    name: 镜像 · ${{ matrix.platform }}
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 每个架构各自推一份「只有 digest 的镜像」，随后由 merge 合成 manifest list。
+      # 这样两个架构真正并行，也不必让任何一个 runner 模拟另一种 CPU。
+      - name: 构建并推送（${{ matrix.platform }}）
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # 缓存按平台分开：两个架构的层永远不可能互相命中，混在一个 scope 里
+          # 只会互相挤掉（gha 缓存有仓库总量上限）。
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=iyuu-reseed
+            org.opencontainers.image.description=基于 IYUU 开放 API 的自动辅种工具（非官方）
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # 合并 manifest 时 attestation 会被丢掉，开了等于给自己一个假的安全感；
+          # 等确认 imagetools 能保留 referrer 再开。
+          provenance: false
+          sbom: false
+
+      - name: 导出 digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/$(echo '${{ matrix.platform }}' | tr '/' '-')"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # -------------------------------------------------------------- 合并架构
+  merge:
+    name: 合并多架构 manifest
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成 0.3.2 / 0.3 / latest
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          MINOR: ${{ needs.meta.outputs.minor }}
+        run: |
+          set -euo pipefail
+          SOURCES=""
+          for f in digests/*; do
+            SOURCES="$SOURCES $IMAGE@$(cat "$f")"
+          done
+          for tag in "$VERSION" "$MINOR" latest; do
+            docker buildx imagetools create -t "$IMAGE:$tag" $SOURCES
+          done
+
+      - name: 校验合并结果
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+  # ------------------------------------------------------------ GitHub Release
+  release:
+    name: 发布 Release
+    needs: [meta, merge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: 从 CHANGELOG 取本版说明
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          # CHANGELOG 里没有这一版就别发一个空正文的 release。
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md 里没有 $VERSION 段落" >&2
+            exit 1
+          fi
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+          fi

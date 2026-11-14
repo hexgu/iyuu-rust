@@ -1,0 +1,15 @@
+version: 2
+# action 都是按 commit SHA 钉死的（供应链安全），代价是升级不会自动发生。
+# dependabot 负责把「SHA 之后的新版本」提成 PR，并同时改写 SHA 与注释里的版本号。
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions:
+        patterns: ["*"]
+    # 一次全提，避免每个 action 一个 PR。
+    open-pull-requests-limit: 3
