@@ -11,6 +11,8 @@
 #   * 容器内 127.0.0.1 指的是容器自己。下载器跑在宿主机或别的机器上时，
 #     请填它的局域网 IP，或使用 host.docker.internal（macOS / Windows）。
 #   * 只对外暴露 8098。容器里没有内网穿透、反代或 TLS，需要的话在前面加一层。
+#   * 进程不以 root 运行：镜像入口会先把 ./data 的属主改成 10001:10001，再降权启动。
+#     第一次启动后 ./data 就归 10001 了，之后每次启动这一步是空操作。
 
 name: iyuu-reseed
 
@@ -53,6 +55,8 @@ services:
       resources:
         limits:
           memory: 512M
+          # 这个服务只有几个线程，限制进程数挡一挡 fork 炸弹类的意外。
+          pids: 256
 
     healthcheck:
       # 镜像里没有 curl/wget，/dev/tcp 是 bash 内置特性，必须用 bash 执行
@@ -79,3 +83,14 @@ services:
 
     security_opt:
       - no-new-privileges:true
+
+    # 能力收敛：默认全丢，只留下入口脚本「把 /data 交给应用用户再降权」必需的四个。
+    # 应用进程（uid 10001）跑起来时已经没有任何 capability。
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+
