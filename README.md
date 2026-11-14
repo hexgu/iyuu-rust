@@ -84,6 +84,7 @@
 | 📥 **AutoSeed 备份导入** | 直接读 IYUU AutoSeed 的 `cn_sites_*.json`，先预览再落地，禁用的站点不会被偷偷打开 |
 | 🗂️ **站点按需添加** | 只显示你添加过的站点，其余上百个不铺出来；每站只填它真正需要的字段 |
 | ⏰ **cron 定时辅种** | 5 字段表达式，按容器本地时区触发，改配置无需重启 |
+| 🌱 **主种子 + 辅种子** | 一份数据一组：主种子在上、各站辅种折叠在下面；跨站靠「大小 + 名称」识别同一份数据 |
 | 🎨 **现代控制台** | Vue 3 + TypeScript + Tailwind v4 + shadcn-vue，深色模式，浅色可切 |
 | 🔒 **默认收敛** | 密钥只写不回显、API 主机名不进浏览器、compose 默认只发布到 `127.0.0.1` |
 
@@ -92,7 +93,7 @@
 <table>
 <tr>
 <td width="50%"><img src="docs/screenshots/dashboard.jpg" alt="概览"><br><sub><b>概览</b> — 运行日志、额度、下载器概况、状态分布</sub></td>
-<td width="50%"><img src="docs/screenshots/attempts.jpg" alt="辅种记录"><br><sub><b>辅种记录</b> — 按状态筛选，可重新校验或删除记录</sub></td>
+<td width="50%"><img src="docs/screenshots/seeds.jpg" alt="种子管理"><br><sub><b>种子管理</b> — 主种子 + 各站辅种子，失败与主种子缺失一眼可见</sub></td>
 </tr>
 <tr>
 <td><img src="docs/screenshots/sites.jpg" alt="站点凭据"><br><sub><b>站点凭据</b> — 只辅种你添加过的站点，支持备份导入</sub></td>
@@ -356,7 +357,8 @@ environment:
 | GET/POST | `/runs` | 任务列表 / 触发任务 |
 | GET | `/runs/progress` | 当前任务实时进度与日志 |
 | POST | `/runs/current/cancel` | 取消正在运行的任务 |
-| GET | `/attempts` `/attempts/stats` | 辅种记录与状态统计 |
+| GET | `/seeds` | **种子管理**视图：主种子 + 辅种子分组（`filter` / `q` / 分页） |
+| GET | `/attempts` `/attempts/stats` | 辅种记录流水与状态统计 |
 | POST | `/attempts/{id}/requeue` | 手动重新校验 |
 | DELETE | `/attempts/{id}` | 删除记录（不动下载器） |
 | GET | `/downloader/torrents` `/downloader/summary` | 下载器种子浏览与汇总 |
@@ -379,7 +381,7 @@ environment:
 <details>
 <summary><b>种子加进去了，但一直停在暂停状态？</b></summary>
 
-看「辅种记录」页的状态。`added` / `verifying` 表示还在等下载器校验结果；
+看「种子管理」页展开那一组里的辅种子状态。`added` / `verifying` 表示还在等下载器校验结果；
 `verify_failed` 说明校验完了但数据不完整，绝大多数是 **save_path 与原种不一致**。
 本程序会强制复用原种子的保存路径，所以更常见的原因是原种子本身已被移动过。修正路径后点「重新校验」。
 </details>
