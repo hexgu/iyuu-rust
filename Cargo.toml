@@ -6,9 +6,6 @@ resolver = "3"
 version = "0.3.1"
 edition = "2024"
 license = "MIT"
-authors = ["iyuu-reseed contributors"]
-repository = "https://github.com/hexgu/iyuu-rust"
-homepage = "https://github.com/hexgu/iyuu-rust"
 
 # Lint policy (see rust-best-practices, chapter 2). Crates opt in with
 # `[lints] workspace = true`, so the plain gate
@@ -59,10 +56,8 @@ urlencoding = "2"
 
 # torrent parsing / hashing
 sha1 = "0.10"
-sha2 = "0.10"
 hex = "0.4"
 percent-encoding = "2"
-rand = "0.9"
 scraper = "0.23"
 
 # html parsing for flux stylesheet
@@ -74,7 +69,6 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.31"
 
 # config / logging
-toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "json"] }
 thiserror = "2"
@@ -88,8 +82,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 parking_lot = "0.12"
-dashmap = "6"
-bitflags = "2"
 
 # Debug builds carry the default `debug = 2` (full DWARF), which on this
 # workspace produces a 154 MB binary and dominates both build time and disk

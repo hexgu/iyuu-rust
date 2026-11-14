@@ -313,7 +313,7 @@ fn build_group(
 
     let main_seed = main.map_or_else(
         || MainSeed {
-            hash: snapshot.map(|a| a.source_hash.clone()).unwrap_or_default(),
+            hash: snapshot.map_or_else(String::new, |a| a.source_hash.clone()),
             name: name.clone(),
             size,
             save_path: save_path.clone(),
