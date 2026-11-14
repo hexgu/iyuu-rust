@@ -69,6 +69,10 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      # build-push-action 默认会把 build record 当产物传上去；这里的 digest 才是
+      # 我们要的，多两个 .dockerbuild 产物只会在合并阶段添乱。
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     permissions:
       contents: read
       packages: write
@@ -131,8 +135,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # 只挑 digest-*：一次运行里还可能有 buildx 的 build record 产物，
+      # 不带 pattern 会连它们一起下载，而它们下载失败就会拖垮合并。
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: digest-*
           path: digests
           merge-multiple: true
 
