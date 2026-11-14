@@ -3,6 +3,37 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.2] - 2026-11-14
+
+### 工程
+
+- **镜像不再用 QEMU 模拟 arm64**。原来多架构镜像在 amd64 runner 上模拟 arm64 跑
+  `cargo build`，实测这一步 47 分钟（amd64 原生 6 分钟），整个镜像作业 50 分钟。现在两个
+  架构各在原生 runner（`ubuntu-latest` / `ubuntu-24.04-arm`）上并行构建，再用
+  `docker buildx imagetools` 合并成 manifest list。
+
+- **Dockerfile 用 cargo-chef 拆出依赖层**。原来 `COPY crates/` 与 `cargo build` 在同一层，
+  改一行源码就让 ~200 个 crate 全部重编译。现在依赖只在 `Cargo.toml` / `Cargo.lock` 变化时
+  重建：本地实测冷构建依赖 652s、业务代码 13s；真实改动一次源码后的完整镜像重建 **14s**。
+
+- **工作流按职责拆分**：`ci.yml`（PR / main：fmt + clippy、test、前端构建；PR 额外验证
+  Dockerfile 能否构建、跑依赖变更审查）与 `release.yml`（tag：多架构镜像 + GitHub Release）。
+  镜像只在发版时构建，日常 push 不再跑一次 50 分钟的多架构构建。
+
+- **发布自动化**：推 `v*.*.*` tag 即产出 `0.3.2` / `0.3` / `latest` 三个标签的镜像，并从
+  CHANGELOG 提取本版说明创建 GitHub Release；构建失败可用 `workflow_dispatch` 指定已有 tag
+  重跑，不必重新打 tag。
+
+- 缓存三处各自生效：cargo 缓存由 lint/test 共用 key；bun 缓存按 `bun.lock` 哈希；
+  BuildKit 缓存按平台分 scope——两个架构的层不可能互相命中，混在一个 scope 里只会互相挤掉。
+
+- 安全与稳定性：所有 action 固定到 commit SHA（配套 dependabot 每周跟进）、工作流默认
+  `contents: read` 最小权限、每个 job 设 `timeout-minutes`、新增汇总门禁 `ci-ok`
+  （分支保护只需勾这一个检查，以后加 job 不用改仓库设置）。
+
+- **镜像标签策略变化**：不再发布 `main` / `sha-xxxxxxx` 标签，只保留 semver 系列
+  （`0.3.2` / `0.3`）与 `latest`。
+
 ## [0.3.1] - 2026-11-14
 
 ### 新增
@@ -151,6 +182,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.3.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.1
 [0.2.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.2.3
 [0.2.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.2.1

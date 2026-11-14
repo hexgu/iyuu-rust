@@ -208,3 +208,26 @@ docker build --network=host -t iyuu-reseed .
 ## 提交改动
 
 欢迎 Issue 与 PR。提交前请确保 `make check` 通过；CI 会检查 fmt、clippy、测试，以及前端类型检查与镜像构建。
+
+## 发布
+
+发版由 tag 触发，不需要手工构建或上传镜像：
+
+```bash
+# 1. 改版本号（Cargo.toml / web/package.json / README 徽章）并写好 CHANGELOG 段落
+# 2. 打 tag 推上去
+git tag -a v0.3.2 -m "v0.3.2"
+git push origin main --follow-tags
+```
+
+`Release` 工作流随后做三件事：
+
+1. 在**原生** amd64 / arm64 runner 上分别构建镜像（不再用 QEMU 模拟，两边并行）；
+2. 用 `docker buildx imagetools` 把两个架构合并成一份 manifest list，打 `0.3.2` / `0.3` / `latest`；
+3. 从 `CHANGELOG.md` 取本版段落，创建（或更新）GitHub Release。
+
+`CHANGELOG.md` 里没有对应版本段落时发布会失败——这是故意的，避免发出一个空正文的 release。
+构建失败需要重跑时，用 `workflow_dispatch` 传入已有 tag 即可，不必重新打 tag。
+
+镜像只在发版时构建。日常 push 到 `main` 只跑 fmt + clippy、测试和前端构建；PR 还会额外验证
+Dockerfile 能否构建（单架构、不推送）并对依赖变更做漏洞审查。
