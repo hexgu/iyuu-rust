@@ -12,7 +12,22 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'dashboard', component: () => import('./views/DashboardView.vue') },
-    { path: '/attempts', name: 'attempts', component: () => import('./views/AttemptsView.vue') },
+    { path: '/seeds', name: 'seeds', component: () => import('./views/SeedsView.vue') },
+    // 旧地址保留：`/attempts?state=verify_failed` 这类书签和外部链接还在用，
+    // 直接把旧的状态参数映射成新的组过滤条件，而不是让人 404 或者退回首页。
+    {
+      path: '/attempts',
+      redirect: (to) => {
+        const state = String(to.query.state ?? '')
+        const filter =
+          state === 'verify_failed' || state === 'missing_files'
+            ? 'has_failure'
+            : state === 'added' || state === 'verifying'
+              ? 'verifying'
+              : 'all'
+        return { path: '/seeds', query: filter === 'all' ? {} : { filter } }
+      },
+    },
     { path: '/torrents', name: 'torrents', component: () => import('./views/TorrentsView.vue') },
     { path: '/sites', name: 'sites', component: () => import('./views/SitesView.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },

@@ -208,7 +208,7 @@ const headline = computed(() => {
       icon: CheckCircle2,
       tone: 'text-status-success',
       hint: '校验通过、数据完整、正在做种的辅种数量',
-      to: '/attempts?state=seeding',
+      to: '/seeds',
     },
     {
       key: 'pending',
@@ -217,7 +217,7 @@ const headline = computed(() => {
       icon: Timer,
       tone: 'text-status-warn',
       hint: '已添加到下载器、尚未得出校验结果的辅种',
-      to: '/attempts?state=added',
+      to: '/seeds?filter=verifying',
     },
     {
       key: 'failed',
@@ -226,7 +226,7 @@ const headline = computed(() => {
       icon: XCircle,
       tone: 'text-status-error',
       hint: '校验完成但数据不完整 —— 通常是保存路径与原种不一致',
-      to: '/attempts?state=verify_failed',
+      to: '/seeds?filter=has_failure',
     },
     {
       key: 'added',
@@ -235,7 +235,7 @@ const headline = computed(() => {
       icon: Download,
       tone: 'text-status-active',
       hint: '本次任务成功交给下载器的种子数（不等于成功）',
-      to: '/attempts',
+      to: '/seeds',
     },
   ]
 })
@@ -629,10 +629,10 @@ const activityText = computed(() => {
       <CardHeader class="flex-row items-center justify-between">
         <CardTitle class="text-sm">{{ running ? '本次进度' : '上次任务结果' }}</CardTitle>
         <RouterLink
-          to="/attempts"
+          to="/seeds"
           class="text-muted-foreground hover:text-foreground flex items-center gap-1 text-xs"
         >
-          全部记录 <ArrowRight class="size-3" />
+          全部种子 <ArrowRight class="size-3" />
         </RouterLink>
       </CardHeader>
       <CardContent>
@@ -690,7 +690,7 @@ const activityText = computed(() => {
       <CardHeader class="flex-row items-center justify-between">
         <CardTitle class="text-sm">最近辅种</CardTitle>
         <RouterLink
-          to="/attempts"
+          to="/seeds"
           class="text-muted-foreground hover:text-foreground flex items-center gap-1 text-xs"
         >
           查看全部 <ArrowRight class="size-3" />

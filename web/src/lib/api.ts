@@ -322,6 +322,109 @@ export interface ImportResult {
   config: PublicConfig
 }
 
+
+// ------------------------------------------------------------- seeds (种子管理)
+
+/**
+ * 一组「同一份数据」的种子：主种子 + 各站点上的辅种子。
+ *
+ * 分组是后端推导出来的（下载器快照 + 辅种记录），不是持久化的实体，所以这里只有
+ * 读模型，没有创建/更新的概念。
+ */
+export type SeedGroupState = 'healthy' | 'verifying' | 'degraded' | 'main_missing' | 'no_aux'
+
+export interface SeedMain {
+  hash: string
+  name: string
+  size: number
+  save_path: string
+  state: string
+  phase: string
+  progress: number
+  seeding_time: number | null
+  uploaded: number
+  ratio: number
+  added_on: string | null
+  tags: string[]
+  trackers: string[]
+  /** false = 下载器里已经没有它了，其余字段是最后的记录快照。 */
+  present: boolean
+}
+
+export interface SeedAuxLive {
+  state: string
+  phase: string
+  progress: number
+  seeding_time: number | null
+  uploaded: number
+  ratio: number
+  added_on: string | null
+}
+
+export interface SeedAux {
+  attempt_id: number
+  site: string
+  site_name: string
+  sid: number
+  torrent_id: number
+  info_hash: string
+  state: ReseedState
+  check_count: number
+  added_at: string | null
+  last_checked_at: string | null
+  finished_at: string | null
+  message: string | null
+  in_downloader: boolean
+  live: SeedAuxLive | null
+}
+
+export interface SeedDuplicate {
+  hash: string
+  name: string
+  uploaded: number
+  added_on: string | null
+}
+
+export interface SeedGroupCounts {
+  aux: number
+  seeding: number
+  verifying: number
+  failed: number
+}
+
+export interface SeedGroup {
+  key: string
+  name: string
+  size: number
+  save_path: string
+  category: string | null
+  state: SeedGroupState
+  main: SeedMain
+  aux: SeedAux[]
+  duplicates: SeedDuplicate[]
+  counts: SeedGroupCounts
+  updated_at: string | null
+}
+
+export interface SeedCounts {
+  groups: number
+  aux_total: number
+  aux_seeding: number
+  aux_verifying: number
+  aux_failed: number
+  with_failure: number
+  no_aux: number
+  main_missing: number
+}
+
+export interface SeedPage {
+  total: number
+  limit: number
+  offset: number
+  counts: SeedCounts
+  items: SeedGroup[]
+}
+
 export interface TorrentItem {
   hash: string
   name: string
@@ -565,6 +668,22 @@ export const api = {
     request<{ ok: boolean }>(`/attempts/${id}/requeue`, { method: 'POST' }),
   deleteAttempt: (id: number) =>
     request<{ ok: boolean }>(`/attempts/${id}`, { method: 'DELETE' }),
+
+  /**
+   * 主种子 + 辅种子分组视图。
+   *
+   * `counts` 是过滤之前的全量统计——页面顶部的数字要回答「一共还有多少问题」，
+   * 不是「这一页筛出来多少」。
+   */
+  seeds: (params: { filter?: string; q?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (params.filter && params.filter !== 'all') q.set('filter', params.filter)
+    if (params.q) q.set('q', params.q)
+    if (params.limit != null) q.set('limit', String(params.limit))
+    if (params.offset != null) q.set('offset', String(params.offset))
+    const qs = q.toString()
+    return request<SeedPage>(`/seeds${qs ? `?${qs}` : ''}`)
+  },
 
   torrents: (params: { filter?: string; limit?: number } = {}) => {
     const q = new URLSearchParams()
