@@ -84,6 +84,8 @@ class State:
         # hash -> torrent record
         self.torrents: dict[str, dict] = {}
         self.add_log: list[dict] = []
+        # 每一次删除都记下来：哪个 hash、有没有连文件一起删。
+        self.deleted: list[dict] = []
         # hash -> behaviour: ok | incomplete | missing | error | reject
         self.verify_behaviour: dict[str, str] = {}
         # Torrents that must never appear in a listing (a scheduler outage).
@@ -540,6 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             "added_on": int(time.time()),
             "seeding_time": 0,
             "uploaded": 0,
+            # 辅种是复用已有文件加进来的，没有下载量。
+            "downloaded": 0,
             "ratio": 0.0,
             "ticks": 0,
             "check_ticks": 1,
@@ -581,6 +585,9 @@ class Handler(BaseHTTPRequestHandler):
                 st.torrents[k]["category"] = form.get("category", "")
         elif action == "delete":
             for k in known:
+                st.deleted.append(
+                    {"hash": k, "delete_files": form.get("deleteFiles") == "true"}
+                )
                 del st.torrents[k]
         elif action in ("setAutoManagement", "setShareLimits", "toggleSequentialDownload", "setForceStart"):
             pass

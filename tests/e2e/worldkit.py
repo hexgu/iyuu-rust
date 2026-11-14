@@ -43,6 +43,8 @@ def add_torrent(
         "added_on": int(time.time()),
         "seeding_time": 3600,
         "uploaded": 1024,
+        # 用户真的下载过这份数据，这是主种子的直接痕迹。
+        "downloaded": size,
         "ratio": 1.0,
         "ticks": 0,
         "check_ticks": check_ticks,
