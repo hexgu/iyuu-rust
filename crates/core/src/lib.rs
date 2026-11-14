@@ -3,6 +3,7 @@
 //! Layering:
 //!   `bencode`    — byte-exact torrent parsing and info-hash computation
 //!   `models`     — domain types and the cross-seed state machine
+//!   `identity`   — 「这份数据是不是同一个资源」的跨站识别规则
 //!   `iyuu`       — IYUU `OpenAPI` client
 //!   `fetch`      — turn (site, `torrent_id`) into a validated .torrent
 //!   `downloader` — qBittorrent / Transmission adapters behind one trait
@@ -16,6 +17,7 @@ pub mod downloader;
 pub mod engine;
 pub mod error;
 pub mod fetch;
+pub mod identity;
 pub mod iyuu;
 pub mod models;
 pub mod ratelimit;
