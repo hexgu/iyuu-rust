@@ -83,3 +83,47 @@ def info_hash(torrent: bytes) -> str:
             continue
         pos += 1
     return hashlib.sha1(torrent[start:pos]).hexdigest()
+
+
+def _decode(buf: bytes, pos: int):
+    """Decode one bencode value starting at `pos`; returns (value, next_pos)."""
+    head = buf[pos : pos + 1]
+    if head == b"i":
+        end = buf.index(b"e", pos)
+        return int(buf[pos + 1 : end]), end + 1
+    if head == b"d":
+        pos += 1
+        out: dict = {}
+        while buf[pos : pos + 1] != b"e":
+            key, pos = _decode(buf, pos)
+            value, pos = _decode(buf, pos)
+            out[key] = value
+        return out, pos + 1
+    if head == b"l":
+        pos += 1
+        out: list = []
+        while buf[pos : pos + 1] != b"e":
+            value, pos = _decode(buf, pos)
+            out.append(value)
+        return out, pos + 1
+    colon = buf.index(b":", pos)
+    length = int(buf[pos:colon])
+    return buf[colon + 1 : colon + 1 + length], colon + 1 + length
+
+
+def info_fields(torrent: bytes) -> dict:
+    """Name and total size from the `info` dict.
+
+    The fake downloader needs these to behave like a real client: qBittorrent
+    reports the torrent's own name and size, not the save path. Getting this
+    wrong makes every added cross-seed look like the same 1 MiB "media" blob,
+    which quietly turns the grouping tests into nonsense.
+    """
+    start = torrent.index(b"4:info") + len(b"4:info")
+    info, _ = _decode(torrent, start)
+    name = info.get(b"name", b"").decode("utf-8", "replace")
+    if b"length" in info:
+        size = info[b"length"]
+    else:
+        size = sum(f.get(b"length", 0) for f in info.get(b"files", []))
+    return {"name": name, "size": size}

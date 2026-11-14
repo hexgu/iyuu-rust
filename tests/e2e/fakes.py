@@ -520,12 +520,19 @@ class Handler(BaseHTTPRequestHandler):
             st.add_log.append({"hash": h, "rejected": True, "fields": fields})
             return self._send(200, b"Fails.", "text/plain")
 
+        # 真实客户端上报的是种子自己的名称和大小；用 savepath 末段当名字会让
+        # 每一条新增的种子都长成同一个 1 MiB 的 "media"，把分组测试变成瞎测。
+        try:
+            meta = torrentlib.info_fields(blob)
+        except Exception:
+            meta = {"name": "e2e", "size": 1 << 20}
+        save_path = fields.get("savepath", "")
         st.torrents[h] = {
             "hash": h,
-            "name": fields.get("savepath", "").rstrip("/").rsplit("/", 1)[-1] or "e2e",
-            "save_path": fields.get("savepath", ""),
-            "content_path": None,
-            "total_size": 1 << 20,
+            "name": meta["name"] or "e2e",
+            "save_path": save_path,
+            "content_path": f"{save_path.rstrip('/')}/{meta['name']}" if save_path else None,
+            "total_size": meta["size"] or (1 << 20),
             "progress": 0.0,
             "state": "checkingDL",
             "category": fields.get("category", ""),
