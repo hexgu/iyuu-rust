@@ -25,7 +25,7 @@ const SIMILARITY_PERCENT: usize = 85;
 /// 归一化后的种子名：小写、去掉站点自加的前缀、标点压成单空格。
 ///
 /// 去掉开头连续的 `[...]` / `【...】` 是刻意的：国内站点普遍在标题前面补一段中文名
-/// （`[律界战争].WAR.S01...`），而同一资源在别的站点可能没有这段。它不携带片名信息
+/// （`[示例中文名].Demo.Show.S01...`），而同一资源在别的站点可能没有这段。它不携带片名信息
 /// 之外的识别价值，去掉之后两侧才能对齐。
 #[must_use]
 pub fn name_key(name: &str) -> String {
@@ -123,15 +123,15 @@ mod tests {
 
     #[test]
     fn chinese_prefix_is_ignored() {
-        let a = "[律界战争].WAR.S01.2026.2160p.MAX.WEB-DL.H265.DDP.5.1.Atmos-CMCTV";
-        let b = "WAR.S01.2026.2160p.MAX.WEB-DL.H265.DDP.5.1.Atmos-CMCTV";
+        let a = "[示例中文名].Demo.Show.S01.2026.2160p.WEB-DL.H265.DDP.5.1-GROUP";
+        let b = "Demo.Show.S01.2026.2160p.WEB-DL.H265.DDP.5.1-GROUP";
         assert!(same_release(6_661_586_546, a, 6_661_586_546, b));
     }
 
     #[test]
     fn multiple_leading_groups_are_ignored() {
-        let a = "【玫瑰战争】[HDR].War.of.Thorns.S01.2026.2160p.WEB-DL.H265.AAC.2Audios-CMCTV";
-        let b = "War.of.Thorns.S01.2026.2160p.WEB-DL.H265.AAC.2Audios-CMCTV";
+        let a = "【另一个中文名】[HDR].Demo.Show.S01.2026.2160p.WEB-DL.H265.AAC.2Audios-GROUP";
+        let b = "Demo.Show.S01.2026.2160p.WEB-DL.H265.AAC.2Audios-GROUP";
         assert!(same_release(1_184_478_662, a, 1_184_478_662, b));
     }
 
