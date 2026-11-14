@@ -250,7 +250,8 @@ export interface ReseedConfig {
   reuse_category: boolean
   default_category: string | null
   tags: string[]
-  tag_with_site: boolean
+  /** 其它辅种工具留下的标签，用于识别「已经是副本」。 */
+  aux_tags: string[]
   auto_start_after_verify: boolean
   fetch_concurrency: number
   verify_interval_secs: number
@@ -259,6 +260,15 @@ export interface ReseedConfig {
 export interface ScheduleConfig {
   enabled: boolean
   cron: string
+}
+
+export interface CleanupConfig {
+  /** 默认关闭：这是一条不可逆的删除路径。 */
+  enabled: boolean
+  /** 删种子时连文件一起删。 */
+  delete_files: boolean
+  /** 主种子消失后观察多久才动手。 */
+  grace_hours: number
 }
 
 export interface PublicConfig {
@@ -286,6 +296,7 @@ export interface PublicConfig {
   reseed: ReseedConfig
   credentials: Record<string, PublicCredentials>
   schedule: ScheduleConfig
+  cleanup: CleanupConfig
   ui: { language: string | null }
 }
 
@@ -326,63 +337,69 @@ export interface ImportResult {
 // ------------------------------------------------------------- seeds (种子管理)
 
 /**
- * 一组「同一份数据」的种子：主种子 + 各站点上的辅种子。
+ * 一组「同一份数据」的种子。
  *
- * 分组是后端推导出来的（下载器快照 + 辅种记录），不是持久化的实体，所以这里只有
- * 读模型，没有创建/更新的概念。
+ * 页面管理的是下载器：每条种子都会出现在某个组里，主种子一行、辅种折叠。分组是后端
+ * 推导出来的（下载器快照 + 辅种记录），不是持久化实体，所以这里只有读模型。
  */
 export type SeedGroupState = 'healthy' | 'verifying' | 'degraded' | 'main_missing' | 'no_aux'
+
+/** 主种子是怎么认出来的。`inferred` 是推断，UI 要标出来。 */
+export type SeedMainSource = 'record' | 'single' | 'tag' | 'traffic' | 'inferred' | 'snapshot'
+
+/** 辅种的有效状态（下载器事实优先于记录）。 */
+export type SeedAuxState = 'seeding' | 'verifying' | 'failed' | 'pending' | 'missing'
 
 export interface SeedMain {
   hash: string
   name: string
   size: number
   save_path: string
+  content_path: string | null
   state: string
   phase: string
   progress: number
   seeding_time: number | null
   uploaded: number
+  /** 累计下载量：主种子是用户真的拉过数据的那一份，副本是 0。 */
+  downloaded: number
   ratio: number
   added_on: string | null
   tags: string[]
   trackers: string[]
+  downloader: string
   /** false = 下载器里已经没有它了，其余字段是最后的记录快照。 */
   present: boolean
 }
 
-export interface SeedAuxLive {
-  state: string
-  phase: string
-  progress: number
-  seeding_time: number | null
-  uploaded: number
-  ratio: number
-  added_on: string | null
-}
-
 export interface SeedAux {
-  attempt_id: number
+  /** 库里没有这条记录时是 null：别的工具加的副本也照样显示。 */
+  attempt_id: number | null
+  info_hash: string
   site: string
   site_name: string
-  sid: number
-  torrent_id: number
-  info_hash: string
-  state: ReseedState
+  site_source: 'record' | 'tracker' | 'unknown'
+  origin: 'record' | 'tag' | 'content'
+  /** 同一站点上的重复副本。 */
+  duplicate: boolean
+  state: SeedAuxState
+  phase: string | null
+  progress: number
   check_count: number
+  message: string | null
   added_at: string | null
   last_checked_at: string | null
   finished_at: string | null
-  message: string | null
   in_downloader: boolean
-  live: SeedAuxLive | null
-}
-
-export interface SeedDuplicate {
-  hash: string
-  name: string
+  tags: string[]
   uploaded: number
+  ratio: number
+  seeding_time: number | null
   added_on: string | null
+  save_path: string | null
+  /** 副本实际落盘的路径（清理前用来判断有没有别的资源共用文件）。 */
+  content_path: string | null
+  downloader: string
 }
 
 export interface SeedGroupCounts {
@@ -390,6 +407,8 @@ export interface SeedGroupCounts {
   seeding: number
   verifying: number
   failed: number
+  /** 记录说成功，但下载器里已经没有这个种子。 */
+  missing: number
 }
 
 export interface SeedGroup {
@@ -397,24 +416,35 @@ export interface SeedGroup {
   name: string
   size: number
   save_path: string
+  content_path: string | null
   category: string | null
   state: SeedGroupState
+  main_source: SeedMainSource
   main: SeedMain
   aux: SeedAux[]
-  duplicates: SeedDuplicate[]
   counts: SeedGroupCounts
   updated_at: string | null
+  downloaders: string[]
+  /** 组内的辅种记录条数。 */
+  record_count: number
+  /** 组内所有活种子都带辅种标签。 */
+  all_tagged: boolean
 }
 
 export interface SeedCounts {
   groups: number
+  torrents: number
+  with_aux: number
+  no_aux: number
   aux_total: number
   aux_seeding: number
   aux_verifying: number
   aux_failed: number
+  aux_missing: number
   with_failure: number
-  no_aux: number
   main_missing: number
+  /** 主种子靠推断认出来的组数。 */
+  inferred: number
 }
 
 export interface SeedPage {
@@ -423,6 +453,57 @@ export interface SeedPage {
   offset: number
   counts: SeedCounts
   items: SeedGroup[]
+}
+
+export interface TagRewriteResult {
+  client: string
+  scanned: number
+  matched: number
+  rewritten: number
+  skipped: number
+  errors: string[]
+}
+
+export interface CleanupAction {
+  key: string
+  name: string
+  main_hash: string
+  sites: string[]
+  hashes: string[]
+  first_seen_at: string
+  waited_hours: number
+  eta_hours: number
+  deleted: boolean
+  delete_files: boolean
+}
+
+export interface CleanupReport {
+  dry_run: boolean
+  delete_files: boolean
+  grace_hours: number
+  groups: number
+  missing_groups: number
+  candidates: number
+  deleted_groups: number
+  deleted_torrents: number
+  deleted_records: number
+  skipped_grace: number
+  skipped_no_evidence: number
+  errors: string[]
+  actions: CleanupAction[]
+}
+
+export interface CleanupLog {
+  id: number
+  at: string
+  group_key: string
+  name: string
+  main_hash: string
+  hashes: string[]
+  sites: string[]
+  torrents: number
+  files_deleted: boolean
+  dry_run: boolean
 }
 
 export interface TorrentItem {
@@ -684,6 +765,15 @@ export const api = {
     const qs = q.toString()
     return request<SeedPage>(`/seeds${qs ? `?${qs}` : ''}`)
   },
+
+  /** 把旧的 iyuu-reseed* 标签重写成 iyuu-rust。 */
+  rewriteSeedTags: () => request<TagRewriteResult>('/seeds/tags/rewrite', { method: 'POST' }),
+
+  /** 主种子已消失的辅种清理。默认只预览。 */
+  runCleanup: (dryRun = true) =>
+    request<CleanupReport>(`/seeds/cleanup?dry_run=${dryRun}`, { method: 'POST' }),
+
+  cleanupLogs: () => request<{ logs: CleanupLog[] }>('/seeds/cleanup'),
 
   torrents: (params: { filter?: string; limit?: number } = {}) => {
     const q = new URLSearchParams()

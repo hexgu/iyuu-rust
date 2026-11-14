@@ -9,6 +9,7 @@ import {
   Server,
   ShieldCheck,
   Timer,
+  Trash2,
   Zap,
 } from 'lucide-vue-next'
 import {
@@ -70,14 +71,17 @@ const form = reactive({
   excludeTags: '',
   excludePaths: '',
   tags: '',
+  auxTags: '辅种',
   reuseCategory: true,
   defaultCategory: '',
-  tagWithSite: true,
   autoStart: true,
   concurrency: '2',
   verifyInterval: '15',
   scheduleEnabled: false,
   cron: '0 4 * * *',
+  cleanupEnabled: false,
+  cleanupDeleteFiles: true,
+  cleanupGrace: '24',
 })
 
 
@@ -99,14 +103,17 @@ function seedForm(c: PublicConfig) {
   form.excludeTags = c.reseed.exclude_tags.join(', ')
   form.excludePaths = c.reseed.exclude_paths.join('\n')
   form.tags = c.reseed.tags.join(', ')
+  form.auxTags = c.reseed.aux_tags.join(', ')
   form.reuseCategory = c.reseed.reuse_category
   form.defaultCategory = c.reseed.default_category ?? ''
-  form.tagWithSite = c.reseed.tag_with_site
   form.autoStart = c.reseed.auto_start_after_verify
   form.concurrency = String(c.reseed.fetch_concurrency)
   form.verifyInterval = String(c.reseed.verify_interval_secs)
   form.scheduleEnabled = c.schedule.enabled
   form.cron = c.schedule.cron
+  form.cleanupEnabled = c.cleanup.enabled
+  form.cleanupDeleteFiles = c.cleanup.delete_files
+  form.cleanupGrace = String(c.cleanup.grace_hours)
   form.token = '' // write-only
   rememberSaved()
 }
@@ -235,7 +242,7 @@ function reseedSection() {
     reuse_category: form.reuseCategory,
     default_category: form.defaultCategory || null,
     tags: splitList(form.tags),
-    tag_with_site: form.tagWithSite,
+    aux_tags: splitList(form.auxTags),
     auto_start_after_verify: form.autoStart,
     fetch_concurrency: Number(form.concurrency) || 2,
     verify_interval_secs: Number(form.verifyInterval) || 15,
@@ -246,12 +253,21 @@ function scheduleSection() {
   return { enabled: form.scheduleEnabled, cron: form.cron }
 }
 
-type SectionName = 'downloader' | 'reseed' | 'schedule'
+function cleanupSection() {
+  return {
+    enabled: form.cleanupEnabled,
+    delete_files: form.cleanupDeleteFiles,
+    grace_hours: Math.max(0, Number(form.cleanupGrace) || 0),
+  }
+}
+
+type SectionName = 'downloader' | 'reseed' | 'schedule' | 'cleanup'
 
 const SECTIONS: Record<SectionName, () => unknown> = {
   downloader: downloaderSection,
   reseed: reseedSection,
   schedule: scheduleSection,
+  cleanup: cleanupSection,
 }
 
 const SECTION_NAMES = Object.keys(SECTIONS) as SectionName[]
@@ -848,14 +864,13 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
               </div>
               <Switch v-model="form.reuseCategory" />
             </div>
-            <div class="flex items-center justify-between gap-4">
-              <div>
-                <Label class="cursor-pointer">标签中加入站点名</Label>
-                <p class="text-muted-foreground text-[11px]">
-                  例如 iyuu-reseed:springsunday，方便按站点筛选
-                </p>
-              </div>
-              <Switch v-model="form.tagWithSite" />
+            <div class="space-y-1.5">
+              <Label>识别为辅种的标签</Label>
+              <Input v-model="form.auxTags" placeholder="辅种" />
+              <p class="text-muted-foreground text-[11px]">
+                其它辅种工具（Hermes、AutoSeed、手工操作）留下的标记，用来判断一个种子是不是副本。
+                我们自己的 iyuu-rust 永远认得，不用写在这里。
+              </p>
             </div>
             <div class="flex items-center justify-between gap-4">
               <div>
@@ -893,6 +908,54 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
             <p class="text-muted-foreground text-[11px]">
               5 个字段：分 时 日 月 周。例如 <code>0 4 * * *</code> 表示每天 04:00
             </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <!-- 自动清理 -->
+      <Card>
+        <CardHeader>
+          <CardTitle class="flex items-center gap-2 text-sm">
+            <Trash2 class="size-4" /> 自动清理无效辅种
+          </CardTitle>
+          <CardDescription>
+            主种子被删掉之后，把它的辅种副本一起删掉；文件还在的，连文件一起收
+          </CardDescription>
+        </CardHeader>
+        <CardContent class="space-y-4">
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <Label class="cursor-pointer">启用自动清理</Label>
+              <p class="text-muted-foreground text-[11px]">
+                每次任务结束后检查一遍。默认关闭：删除不可逆，也会带走那些站点的做种记录
+              </p>
+            </div>
+            <Switch v-model="form.cleanupEnabled" />
+          </div>
+          <div v-if="form.cleanupEnabled" class="space-y-4">
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <Label class="cursor-pointer">连文件一起删</Label>
+                <p class="text-muted-foreground text-[11px]">
+                  主种子删了但文件留着时，这是唯一会收掉那份数据的地方
+                </p>
+              </div>
+              <Switch v-model="form.cleanupDeleteFiles" />
+            </div>
+            <div class="space-y-1.5">
+              <Label>观察期（小时）</Label>
+              <Input v-model="form.cleanupGrace" type="number" min="0" max="720" />
+              <p class="text-muted-foreground text-[11px]">
+                第一次发现主种子缺失后，观察这么久才动手。换盘、重新添加这类操作不该被当成删除
+              </p>
+            </div>
+            <Alert>
+              <AlertCircle />
+              <AlertDescription class="text-[11px]">
+                只处理有证据的组：库里有辅种记录，或者组内所有种子都带辅种标签。靠推断识别的组一律不动。
+                删除记录会写进 <code>cleanup_log</code>，可在种子管理页回看。
+              </AlertDescription>
+            </Alert>
           </div>
         </CardContent>
       </Card>

@@ -3,7 +3,10 @@ import { computed } from 'vue'
 import type { ReseedState } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
-const props = defineProps<{ state: ReseedState; size?: 'sm' | 'md' }>()
+/** 记录状态 + 种子管理视图里的有效状态（下载器事实优先）。 */
+export type BadgeState = ReseedState | 'failed' | 'missing'
+
+const props = defineProps<{ state: BadgeState; size?: 'sm' | 'md' }>()
 
 /**
  * One place that decides how a state looks and reads.
@@ -13,7 +16,7 @@ const props = defineProps<{ state: ReseedState; size?: 'sm' | 'md' }>()
  * verification is still unknown, and showing it as green is exactly the
  * reporting bug that hides hundreds of broken torrents.
  */
-const META: Record<ReseedState, { label: string; cls: string; hint: string }> = {
+const META: Record<BadgeState, { label: string; cls: string; hint: string }> = {
   pending: {
     label: '待处理',
     cls: 'border-status-pending/40 text-status-pending bg-status-pending/10',
@@ -69,6 +72,17 @@ const META: Record<ReseedState, { label: string; cls: string; hint: string }> = 
     cls: 'border-status-warn/40 text-status-warn bg-status-warn/10',
     hint: '超过校验时限仍未完成',
   },
+  // 下面两个是「种子管理」视图的有效状态：记录与下载器对齐之后的结果。
+  failed: {
+    label: '失败',
+    cls: 'border-status-error/50 text-status-error bg-status-error/10',
+    hint: '下载器报错、文件缺失，或校验没有通过',
+  },
+  missing: {
+    label: '已丢失',
+    cls: 'border-status-error/40 text-status-error bg-status-error/10',
+    hint: '记录说已经辅种成功，但下载器里已经没有这个种子了',
+  },
 }
 
 const meta = computed(() => META[props.state] ?? META.pending)
@@ -89,7 +103,7 @@ const meta = computed(() => META[props.state] ?? META.pending)
         state === 'seeding' && 'bg-status-success',
         state === 'verifying' && 'bg-status-active animate-pulse',
         state === 'added' && 'bg-status-warn animate-pulse',
-        (state === 'verify_failed' || state === 'missing_files' || state === 'fetch_failed' || state === 'add_failed') && 'bg-status-error',
+        (state === 'verify_failed' || state === 'missing_files' || state === 'fetch_failed' || state === 'add_failed' || state === 'failed' || state === 'missing') && 'bg-status-error',
         state === 'timed_out' && 'bg-status-warn',
         state === 'pending' && 'bg-status-pending',
         state === 'skipped' && 'bg-muted-foreground',
