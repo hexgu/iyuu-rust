@@ -366,6 +366,9 @@ async fn run_inner(
     cancel: &CancellationToken,
 ) -> Result<DiscoveryOutcome> {
     let ctx = build_engine(state).await?;
+    // 清理在发现流程之后跑，用的是同一份下载器句柄；先克隆，因为下面的校验任务会
+    // 把 ctx 移进 Arc。
+    let cleanup_downloader = Arc::clone(&ctx.downloader);
 
     {
         let mut p = state.progress.write();
@@ -407,6 +410,27 @@ async fn run_inner(
                 Err(e) => state2.push_log(format!("首次校验失败：{e}")),
             }
         });
+    }
+
+    if !outcome.cancelled && state.config_snapshot().cleanup.enabled {
+        match crate::cleanup::run(state, &cleanup_downloader, false).await {
+            Ok(report) if report.deleted_groups > 0 => state.push_log(format!(
+                "自动清理：{} 组主种子已消失，删除 {} 个辅种{}",
+                report.deleted_groups,
+                report.deleted_torrents,
+                if report.delete_files {
+                    "（含文件）"
+                } else {
+                    ""
+                }
+            )),
+            Ok(report) => {
+                for e in report.errors.iter().take(3) {
+                    state.push_log(format!("自动清理失败：{e}"));
+                }
+            }
+            Err(e) => state.push_log(format!("自动清理失败：{e}")),
+        }
     }
 
     Ok(DiscoveryOutcome {

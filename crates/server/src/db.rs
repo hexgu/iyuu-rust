@@ -119,6 +119,37 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_runs_started
         ON runs(started_at DESC);
     ",
+    // 自动清理的观察台账：主种子第一次被观察到「不在了」的时间。
+    //
+    // 光看下载器快照无法知道主种子是什么时候没的，而没有时间就无法实现宽限期。
+    // 这张表只记「组 → 第一次缺失时间」，组一旦恢复（主种子又出现）就删掉。
+    r"
+    CREATE TABLE IF NOT EXISTS cleanup_pending (
+        group_key     TEXT PRIMARY KEY,
+        main_hash     TEXT NOT NULL DEFAULT '',
+        name          TEXT NOT NULL DEFAULT '',
+        first_seen_at TEXT NOT NULL,
+        last_seen_at  TEXT NOT NULL
+    );
+    ",
+    // 删除是不可逆的，留一份审计：删了哪些 hash、哪些站点、有没有连文件一起删。
+    r"
+    CREATE TABLE IF NOT EXISTS cleanup_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        at            TEXT NOT NULL,
+        group_key     TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        main_hash     TEXT NOT NULL,
+        hashes        TEXT NOT NULL,
+        sites         TEXT NOT NULL,
+        torrents      INTEGER NOT NULL,
+        files_deleted INTEGER NOT NULL,
+        dry_run       INTEGER NOT NULL
+    );
+    ",
+    r"
+    CREATE INDEX IF NOT EXISTS idx_cleanup_log_at ON cleanup_log(at DESC);
+    ",
 ];
 
 impl Db {
@@ -473,6 +504,157 @@ impl Db {
     }
 }
 
+// --------------------------------------------------------------- cleanup
+
+/// Input for one audit row.
+#[derive(Clone, Copy)]
+pub struct CleanupLogEntry<'a> {
+    pub group_key: &'a str,
+    pub name: &'a str,
+    pub main_hash: &'a str,
+    pub hashes: &'a [String],
+    pub sites: &'a [String],
+    pub files_deleted: bool,
+    pub dry_run: bool,
+}
+
+/// One audit row: what the cleanup deleted, and whether it was a dry run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CleanupLogRow {
+    pub id: i64,
+    pub at: DateTime<Utc>,
+    pub group_key: String,
+    pub name: String,
+    pub main_hash: String,
+    pub hashes: Vec<String>,
+    pub sites: Vec<String>,
+    pub torrents: i64,
+    pub files_deleted: bool,
+    pub dry_run: bool,
+}
+
+impl Db {
+    /// Record that a group's main seed is missing, returning when it was first
+    /// seen missing.
+    ///
+    /// The grace period needs an anchor, and the downloader has none: a snapshot
+    /// says "not here", never "gone since Tuesday". First observation is the only
+    /// honest anchor available.
+    pub fn cleanup_touch(
+        &self,
+        group_key: &str,
+        main_hash: &str,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, ServerError> {
+        let conn = self.pool.get()?;
+        let stamp = now.to_rfc3339();
+        conn.execute(
+            "INSERT INTO cleanup_pending(group_key, main_hash, name, first_seen_at, last_seen_at)
+             VALUES(?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(group_key) DO UPDATE SET
+                main_hash = excluded.main_hash,
+                name = excluded.name,
+                last_seen_at = excluded.last_seen_at",
+            params![group_key, main_hash, name, stamp],
+        )?;
+        let first: String = conn.query_row(
+            "SELECT first_seen_at FROM cleanup_pending WHERE group_key = ?1",
+            [group_key],
+            |r| r.get(0),
+        )?;
+        Ok(parse_dt(&first))
+    }
+
+    /// Forget groups that are no longer missing (main came back, or the group
+    /// disappeared). Returns how many rows were dropped.
+    pub fn cleanup_prune(&self, keep: &HashSet<String>) -> Result<usize, ServerError> {
+        let conn = self.pool.get()?;
+        let keys: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT group_key FROM cleanup_pending")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed = 0;
+        for key in keys {
+            if !keep.contains(&key) {
+                removed +=
+                    conn.execute("DELETE FROM cleanup_pending WHERE group_key = ?1", [key])?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Append one cleanup action to the audit log.
+    pub fn cleanup_log_add(&self, entry: CleanupLogEntry<'_>) -> Result<(), ServerError> {
+        let CleanupLogEntry {
+            group_key,
+            name,
+            main_hash,
+            hashes,
+            sites,
+            files_deleted,
+            dry_run,
+        } = entry;
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO cleanup_log(at, group_key, name, main_hash, hashes, sites, torrents, files_deleted, dry_run)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Utc::now().to_rfc3339(),
+                group_key,
+                name,
+                main_hash,
+                serde_json::to_string(hashes)?,
+                serde_json::to_string(sites)?,
+                i64::try_from(hashes.len()).unwrap_or(i64::MAX),
+                i64::from(files_deleted),
+                i64::from(dry_run),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_logs(&self, limit: i64) -> Result<Vec<CleanupLogRow>, ServerError> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, at, group_key, name, main_hash, hashes, sites, torrents, files_deleted, dry_run
+             FROM cleanup_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            let hashes: String = r.get("hashes")?;
+            let sites: String = r.get("sites")?;
+            Ok(CleanupLogRow {
+                id: r.get("id")?,
+                at: parse_dt(&r.get::<_, String>("at")?),
+                group_key: r.get("group_key")?,
+                name: r.get("name")?,
+                main_hash: r.get("main_hash")?,
+                hashes: serde_json::from_str(&hashes).unwrap_or_default(),
+                sites: serde_json::from_str(&sites).unwrap_or_default(),
+                torrents: r.get("torrents")?,
+                files_deleted: r.get::<_, i64>("files_deleted")? != 0,
+                dry_run: r.get::<_, i64>("dry_run")? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Drop attempt records whose target hash is gone from the downloader.
+    /// Returns how many rows were removed.
+    pub fn delete_attempts_for_targets(&self, hashes: &[String]) -> Result<usize, ServerError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.pool.get()?;
+        let placeholders = std::iter::repeat_n("?", hashes.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM attempts WHERE target_info_hash IN ({placeholders})");
+        Ok(conn.execute(&sql, rusqlite::params_from_iter(hashes))?)
+    }
+}
+
 fn parse_dt(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
@@ -669,6 +851,20 @@ impl AttemptStore for Db {
         })
         .await
         .map_err(|e| iyuu_core::CoreError::Other(format!("读取失败记录失败：{e}")))?
+        .map_err(|e| iyuu_core::CoreError::Other(e.to_string()))
+    }
+    async fn source_hashes(&self) -> iyuu_core::Result<HashSet<String>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || -> Result<HashSet<String>, ServerError> {
+            let conn = this.pool.get()?;
+            // 历史事实：这些 hash 当过「数据来源」。有了它，重新添加过的种子也不会
+            // 被更早加入的副本抢走「主种子」的位置。
+            let mut stmt = conn.prepare("SELECT DISTINCT source_hash FROM attempts")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<HashSet<_>, _>>()?)
+        })
+        .await
+        .map_err(|e| iyuu_core::CoreError::Other(format!("读取源种子失败：{e}")))?
         .map_err(|e| iyuu_core::CoreError::Other(e.to_string()))
     }
 }

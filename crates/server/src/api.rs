@@ -67,8 +67,12 @@ pub fn router(state: AppState) -> Router {
         .route("/attempts/stats", get(attempt_stats))
         .route("/attempts/{id}/requeue", post(requeue_attempt))
         .route("/attempts/{id}", delete(delete_attempt))
-        // 「种子管理」视图：主种子 + 它的辅种子。分组是推导出来的，不落库。
+        // 「种子管理」视图：下载器里的种子按「同一份资源」聚组，主种子行上、辅种折叠。
+        // 分组是推导出来的，不落库。
         .route("/seeds", get(list_seeds))
+        .route("/seeds/tags/rewrite", post(rewrite_seed_tags))
+        // 自动清理：默认只预览（`dry_run=true`），要真删必须显式传 false。
+        .route("/seeds/cleanup", post(run_cleanup).get(list_cleanup_logs))
         // downloader introspection
         .route("/downloader/torrents", get(list_torrents))
         .route("/downloader/summary", get(downloader_summary))
@@ -1110,7 +1114,7 @@ struct SeedsQuery {
     offset: Option<i64>,
 }
 
-/// 主种子 + 辅种子分组视图。
+/// 下载器库存 → 资源组 → 主种子 / 辅种。
 ///
 /// 每次请求都重新聚合：下载器快照是实时读的，辅种记录是库里的，两者之间没有缓存
 /// 可以不一致。分页在聚合之后做——组数远小于记录数，省下的那点内存不值得让分页
@@ -1121,14 +1125,22 @@ async fn list_seeds(
 ) -> Result<Json<Value>> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
+    let cfg = state.config_snapshot();
 
     let torrents = with_downloader(&state, |dl| async move {
         dl.list_torrents().await.map_err(ServerError::from)
     })
     .await?;
     let attempts = state.db.all_attempts()?;
+    let sites = state.db.load_sites()?;
 
-    let groups = seeds::build_groups(&torrents, &attempts);
+    let groups = seeds::build_groups(seeds::SeedsInput {
+        torrents: &torrents,
+        attempts: &attempts,
+        aux_tags: &cfg.reseed.aux_tags,
+        sites: &sites,
+        downloader: downloader_label(&cfg),
+    });
     // counts 取自过滤之前：顶部数字要回答「一共还有多少问题」，而不是「这页筛出来多少」。
     let counts = seeds::summarize(&groups);
 
@@ -1150,6 +1162,102 @@ async fn list_seeds(
         "offset": offset,
         "counts": counts,
         "items": items,
+    })))
+}
+
+#[derive(Deserialize)]
+struct CleanupQuery {
+    dry_run: Option<bool>,
+}
+
+/// 清理主种子已消失的辅种。
+///
+/// 默认 `dry_run=true`：一个 POST 却会删数据的接口，默认值必须是「什么都不做」。
+/// 真正删除需要显式传 `dry_run=false`（页面上的第二步确认），或者打开
+/// `cleanup.enabled` 让每次任务结束后自动执行。
+async fn run_cleanup(
+    State(state): State<AppState>,
+    Query(q): Query<CleanupQuery>,
+) -> Result<Json<Value>> {
+    let dry_run = q.dry_run.unwrap_or(true);
+    let ctx = runner::build_engine(&state).await?;
+    let report = crate::cleanup::run(&state, &ctx.downloader, dry_run).await?;
+    if !dry_run && report.deleted_groups > 0 {
+        state.push_log(format!(
+            "清理无效辅种：{} 组，删除 {} 个种子{}",
+            report.deleted_groups,
+            report.deleted_torrents,
+            if report.delete_files {
+                "（含文件）"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(Json(json!(report)))
+}
+
+/// 最近的清理审计记录。删除是不可逆的，至少要能回看删了什么。
+async fn list_cleanup_logs(State(state): State<AppState>) -> Result<Json<Value>> {
+    let logs = state.db.cleanup_logs(50)?;
+    Ok(Json(json!({ "logs": logs })))
+}
+
+/// 把旧的 `iyuu-reseed*` 标签重写成 `iyuu-rust`。
+///
+/// qBittorrent 没有「改标签名」的接口，所以是「移除旧标签 + 添加新标签」两步。客户端
+/// 不支持移除标签时直接跳过并计数，不谎报成功——半套操作（加了新标签、旧的还在）
+/// 比不迁移更糟。
+async fn rewrite_seed_tags(State(state): State<AppState>) -> Result<Json<Value>> {
+    let report = with_downloader(&state, |dl| async move {
+        let torrents = dl.list_torrents().await?;
+        let scanned = torrents.len();
+        let matched = seeds::legacy_tags(&torrents);
+        let mut rewritten = 0usize;
+        let mut skipped = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (hash, legacy) in &matched {
+            let hashes = std::slice::from_ref(hash);
+            match dl.remove_tags(hashes, legacy).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("{hash}: {e}"));
+                    continue;
+                }
+            }
+            match dl
+                .add_tags(hashes, &[iyuu_core::downloader::AUX_TAG.to_string()])
+                .await
+            {
+                Ok(()) => rewritten += 1,
+                Err(e) => errors.push(format!("{hash}: {e}")),
+            }
+        }
+
+        Ok((
+            scanned,
+            matched.len(),
+            rewritten,
+            skipped,
+            errors,
+            dl.name().to_string(),
+        ))
+    })
+    .await?;
+
+    let (scanned, matched, rewritten, skipped, errors, client) = report;
+    Ok(Json(json!({
+        "client": client,
+        "scanned": scanned,
+        "matched": matched,
+        "rewritten": rewritten,
+        "skipped": skipped,
+        "errors": errors,
     })))
 }
 
@@ -1212,6 +1320,15 @@ where
 {
     let ctx = runner::build_engine(state).await?;
     f(ctx.downloader).await
+}
+
+/// 下载器的展示名：优先用配置里的名字，没填就用客户端类型。
+fn downloader_label(cfg: &crate::config::AppConfig) -> &str {
+    if cfg.downloader.name.trim().is_empty() {
+        cfg.downloader.kind.as_str()
+    } else {
+        cfg.downloader.name.as_str()
+    }
 }
 
 #[derive(Deserialize)]

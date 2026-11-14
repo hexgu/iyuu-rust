@@ -4,6 +4,7 @@
 //! fires scheduled discovery runs.
 
 mod api;
+mod cleanup;
 mod config;
 mod db;
 mod env_config;

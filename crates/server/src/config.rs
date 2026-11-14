@@ -30,6 +30,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub schedule: ScheduleConfig,
     #[serde(default)]
+    pub cleanup: CleanupConfig,
+    #[serde(default)]
     pub ui: UiConfig,
 }
 
@@ -217,8 +219,10 @@ pub struct ReseedConfig {
     pub default_category: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default = "default_true")]
-    pub tag_with_site: bool,
+    /// 其它辅种工具留下的标签，用来识别「这已经是别人的副本」。
+    /// 默认 `辅种`（`Hermes` / `AutoSeed` / 手工操作的常见写法）。
+    #[serde(default = "default_aux_tags")]
+    pub aux_tags: Vec<String>,
     #[serde(default = "default_true")]
     pub auto_start_after_verify: bool,
     #[serde(default = "default_fetch_concurrency")]
@@ -230,6 +234,9 @@ pub struct ReseedConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_aux_tags() -> Vec<String> {
+    vec!["辅种".to_string()]
 }
 fn default_fetch_concurrency() -> usize {
     2
@@ -247,7 +254,7 @@ impl Default for ReseedConfig {
             reuse_category: true,
             default_category: None,
             tags: Vec::new(),
-            tag_with_site: true,
+            aux_tags: default_aux_tags(),
             auto_start_after_verify: true,
             fetch_concurrency: 2,
             verify_interval_secs: 15,
@@ -264,7 +271,7 @@ impl From<&ReseedConfig> for DiscoveryConfig {
             reuse_category: c.reuse_category,
             default_category: c.default_category.clone(),
             tags: c.tags.clone(),
-            tag_with_site: c.tag_with_site,
+            aux_tags: c.aux_tags.clone(),
             auto_start_after_verify: c.auto_start_after_verify,
             fetch_concurrency: c.fetch_concurrency.clamp(1, 16),
             dry_run: false,
@@ -290,6 +297,38 @@ impl Default for ScheduleConfig {
         Self {
             enabled: false,
             cron: default_cron(),
+        }
+    }
+}
+
+/// 自动清理：主种子被删掉之后，把它的辅种副本（和文件）一起收掉。
+///
+/// 默认关闭。这是一条不可逆的删除路径：删掉的是别的站点上的做种记录，有些站点的
+/// H&R 还没跑完。所以它必须显式打开，并且给一段宽限时间——主种子刚消失可能只是用户
+/// 正在换盘、重新添加。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 删种子时是否连文件一起删。用户手动删主种子时如果留下了文件，这里是唯一会
+    /// 把那份数据收掉的地方。
+    #[serde(default = "default_true")]
+    pub delete_files: bool,
+    /// 主种子消失后观察多久才动手。0 表示下一次任务就删。
+    #[serde(default = "default_cleanup_grace")]
+    pub grace_hours: u32,
+}
+
+fn default_cleanup_grace() -> u32 {
+    24
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            delete_files: true,
+            grace_hours: default_cleanup_grace(),
         }
     }
 }
@@ -393,6 +432,7 @@ pub struct PublicConfig {
     pub reseed: ReseedConfig,
     pub credentials: HashMap<String, PublicCredentials>,
     pub schedule: ScheduleConfig,
+    pub cleanup: CleanupConfig,
     pub ui: UiConfig,
 }
 
@@ -504,6 +544,7 @@ impl AppConfig {
                 })
                 .collect(),
             schedule: self.schedule.clone(),
+            cleanup: self.cleanup.clone(),
             ui: self.ui.clone(),
         }
     }
@@ -517,6 +558,7 @@ pub struct ConfigPatch {
     pub downloader: Option<DownloaderPatch>,
     pub reseed: Option<ReseedConfig>,
     pub schedule: Option<ScheduleConfig>,
+    pub cleanup: Option<CleanupConfig>,
     pub ui: Option<UiConfig>,
     /// Per-site credentials. `null` value deletes the entry.
     pub credentials: Option<HashMap<String, Option<SiteCredentials>>>,
@@ -641,6 +683,9 @@ impl AppConfig {
         }
         if let Some(v) = patch.schedule {
             self.schedule = v;
+        }
+        if let Some(v) = patch.cleanup {
+            self.cleanup = v;
         }
         if let Some(v) = patch.ui {
             self.ui = v;
