@@ -3,7 +3,7 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [0.4.1] - 2026-11-14
 
 ### 新增
 
@@ -247,6 +247,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.4.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.1
 [0.3.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.1
