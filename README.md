@@ -93,7 +93,7 @@
 <table>
 <tr>
 <td width="50%"><img src="docs/screenshots/dashboard.jpg" alt="概览"><br><sub><b>概览</b> — 运行日志、额度、下载器概况、状态分布</sub></td>
-<td width="50%"><img src="docs/screenshots/seeds.jpg" alt="种子管理"><br><sub><b>种子管理</b> — 主种子 + 各站辅种子，失败与主种子缺失一眼可见</sub></td>
+<td width="50%"><img src="docs/screenshots/seeds.jpg" alt="种子管理"><br><sub><b>种子管理</b> — 下载器里的资源按主种子聚合，跨站副本折叠，失败与主种子缺失一眼可见</sub></td>
 </tr>
 <tr>
 <td><img src="docs/screenshots/sites.jpg" alt="站点凭据"><br><sub><b>站点凭据</b> — 只辅种你添加过的站点，支持备份导入</sub></td>
@@ -362,7 +362,10 @@ environment:
 | GET/POST | `/runs` | 任务列表 / 触发任务 |
 | GET | `/runs/progress` | 当前任务实时进度与日志 |
 | POST | `/runs/current/cancel` | 取消正在运行的任务 |
-| GET | `/seeds` | **种子管理**视图：主种子 + 辅种子分组（`filter` / `q` / 分页） |
+| GET | `/seeds` | **种子管理**视图：下载器资源组（主种子 + 折叠的辅种，`filter` / `q` / 分页） |
+| POST | `/seeds/tags/rewrite` | 把旧的 `iyuu-reseed*` 标签重写为 `iyuu-rust` |
+| POST | `/seeds/cleanup` | 清理主种子已消失的辅种（默认 `dry_run=true`） |
+| GET | `/seeds/cleanup` | 最近的清理审计记录 |
 | GET | `/attempts` `/attempts/stats` | 辅种记录流水与状态统计 |
 | POST | `/attempts/{id}/requeue` | 手动重新校验 |
 | DELETE | `/attempts/{id}` | 删除记录（不动下载器） |
