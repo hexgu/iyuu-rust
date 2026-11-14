@@ -6,7 +6,7 @@
 #   1. web      前端产物（bun + vite）
 #   2. planner  把依赖清单抽成 recipe.json（cargo-chef）
 #   3. builder  先只编依赖，再编我们的代码
-#   4. runtime  只带二进制 + 静态文件
+#   4. runtime  只带二进制 + 静态文件，进程以非 root 运行
 #
 # cargo-chef 把「编依赖」和「编我们自己的代码」拆成两层：原来 `COPY crates/` 和
 # `cargo build` 在同一层，改任何一行源码都会让整层失效，~200 个 crate 全部重编译。
@@ -59,12 +59,16 @@ RUN cargo build --release --locked && \
 # Stage 4: 运行时
 # ---------------------------------------------------------------------------
 # 刻意不用 rust:1-slim 当运行时：它 1.2 GB，而这里只需要 glibc + CA 证书 +
-# 时区数据。
+# 时区数据 + setpriv（util-linux，用来降权）。
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates tzdata && \
+    apt-get install -y --no-install-recommends ca-certificates tzdata util-linux && \
     rm -rf /var/lib/apt/lists/*
+
+# 应用用户：固定的 uid/gid 10001，便于宿主机上给 ./data 设属主。
+RUN groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
 # 容器时区影响 cron 触发与日志时间，用户可以在 compose 里覆盖。
 ENV TZ=Asia/Shanghai \
@@ -75,8 +79,12 @@ ENV TZ=Asia/Shanghai \
 # 只应在真正需要时从 compose 传入。
 
 WORKDIR /app
-COPY --from=builder /build/target/release/iyuu-reseed /usr/local/bin/iyuu-reseed
-COPY --from=web /build/web/dist /app/web
+COPY --link --from=builder /build/target/release/iyuu-reseed /usr/local/bin/iyuu-reseed
+COPY --link --from=web /build/web/dist /app/web
+COPY --link docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh && \
+    mkdir -p /data && \
+    chown 10001:10001 /data /app /app/web
 
 # 数据库放这里，挂成卷：校准队列存在库里，容器重建就会丢掉所有在途辅种。
 VOLUME ["/data"]
@@ -91,4 +99,6 @@ LABEL org.opencontainers.image.title="iyuu-reseed" \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/8098 && printf "GET /api/health HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' || exit 1
 
-ENTRYPOINT ["iyuu-reseed"]
+# 入口先修 /data 属主再降权，应用进程最终以 uid 10001 运行（见 docker-entrypoint.sh）。
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["iyuu-reseed"]

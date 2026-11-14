@@ -1,11 +1,31 @@
-# Build context hygiene: keep the image build fast and free of host state.
+# 构建上下文只留「造镜像真正需要的东西」：crates/ 的源码、两个清单、web/ 的源码。
+#
+# 注意：docker-entrypoint.sh 不能排除——运行时阶段要 COPY 它。
+
+# 构建产物（容器里自己会生成）
 target
 web/node_modules
 web/dist
+
+# 宿主机状态与凭据
 data
+.env
+.env.*
+
+# 版本控制与 CI
 .git
 .gitignore
-.agents
 .github
+.dockerignore
+
+# 文档与开发辅助，镜像里用不到
+docs
+tests
+*.md
+Makefile
+dev.sh
+compose.yml
+*.lpk
 *.log
 *.tsbuildinfo
+.hadolint.yaml
