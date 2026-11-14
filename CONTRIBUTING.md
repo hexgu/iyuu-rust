@@ -230,4 +230,4 @@ git push origin main --follow-tags
 构建失败需要重跑时，用 `workflow_dispatch` 传入已有 tag 即可，不必重新打 tag。
 
 镜像只在发版时构建。日常 push 到 `main` 只跑 fmt + clippy、测试和前端构建；PR 还会额外验证
-Dockerfile 能否构建（单架构、不推送）并对依赖变更做漏洞审查。
+Dockerfile 能否构建（单架构、不推送）。

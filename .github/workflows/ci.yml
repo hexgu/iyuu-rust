@@ -104,6 +104,10 @@ jobs:
       - name: 类型检查 + 构建
         run: bun run build
 
+  # 说明：这里没有依赖变更审查（actions/dependency-review-action）。它要求仓库开启
+  # Dependency graph，而本仓库该功能不可用（action 直接报 "not supported on this
+  # repository"）。硬塞进来只会让每个 PR 常红，所以等仓库设置里能开启时再加。
+
   # --------------------------------------------------- Dockerfile 构建校验
   # 只在 PR 上跑，单架构、不推送：目的是「这个 Dockerfile 还能不能构建」，
   # 真正的多架构发布在 release.yml。cargo-chef + gha 缓存让重复构建只要 1～2 分钟。
@@ -128,31 +132,12 @@ jobs:
           cache-from: type=gha,scope=docker-amd64
           cache-to: type=gha,mode=max,scope=docker-amd64
 
-  # ------------------------------------------------------------ 依赖变更审查
-  # 只在 PR 上跑：新增/升级依赖时把已知漏洞与许可证问题挡在合并之前。
-  dependency-review:
-    name: 依赖变更审查
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          fail-on-severity: high
-
   # -------------------------------------------------------------- 汇总门禁
   # 分支保护只需要勾这一个检查：以后往 CI 里加 job 不必再改仓库设置。
   # skipped 视为通过——dockerfile / dependency-review 在非 PR 事件上本来就不跑。
   ci-ok:
     name: CI 通过
-    needs: [rust-lint, rust-test, web, dockerfile, dependency-review]
+    needs: [rust-lint, rust-test, web, dockerfile]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

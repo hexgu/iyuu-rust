@@ -17,7 +17,7 @@
   重建：本地实测冷构建依赖 652s、业务代码 13s；真实改动一次源码后的完整镜像重建 **14s**。
 
 - **工作流按职责拆分**：`ci.yml`（PR / main：fmt + clippy、test、前端构建；PR 额外验证
-  Dockerfile 能否构建、跑依赖变更审查）与 `release.yml`（tag：多架构镜像 + GitHub Release）。
+  Dockerfile 能否构建）与 `release.yml`（tag：多架构镜像 + GitHub Release）。
   镜像只在发版时构建，日常 push 不再跑一次 50 分钟的多架构构建。
 
 - **发布自动化**：推 `v*.*.*` tag 即产出 `0.3.2` / `0.3` / `latest` 三个标签的镜像，并从
