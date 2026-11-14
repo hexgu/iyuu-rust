@@ -3,6 +3,32 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.3] - 2026-11-14
+
+### 安全
+
+- **应用进程不再以 root 运行**。镜像内新增 uid/gid 10001 的应用用户，入口脚本先把
+  `./data` 的属主交还给它、再用 `setpriv` 降权，应用进程始终以 10001 执行。
+  没有直接写 `USER 10001` 是因为 `./data` 是宿主机 bind mount，它的属主由宿主机决定，
+  镜像里的 USER 管不到挂载点——那样做会让升级后第一次启动直接打不开 SQLite。
+  入口做了幂等判断：属主已经对了就不遍历目录。
+
+- **compose 能力收敛**：`cap_drop: ALL`，只保留入口脚本降权与移交属主必需的
+  `CHOWN` / `DAC_OVERRIDE` / `SETGID` / `SETUID`；应用进程跑起来时没有任何 capability。
+  另加 `deploy.resources.limits.pids` 限制进程数。
+
+### 工程
+
+- **Dockerfile 静态检查进 CI**（hadolint + `.hadolint.yaml`，忽略项逐条带理由），
+  同一作业里顺带用 `docker compose config` 校验 compose 文件语法——写错的 compose
+  不该等到部署时才发现。
+
+- **发布前扫镜像漏洞**（Trivy，HIGH/CRITICAL，忽略尚未修复的条目）。当前不阻断发布：
+  基础镜像的 CVE 会随上游更新，卡死发布对使用者没有好处，先把结果摆在发布日志里。
+
+- **基础镜像按用途收敛**：运行时只装 `ca-certificates` / `tzdata` / `util-linux`；
+  构建上下文用 `.dockerignore` 收到只留源码与清单（文档、测试、compose、lpk 都不进 daemon）。
+
 ## [0.3.2] - 2026-11-14
 
 ### 工程
@@ -182,6 +208,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.3.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.3
 [0.3.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.2
 [0.3.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.1
 [0.2.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.2.3

@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.3-blue.svg)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![Vue](https://img.shields.io/badge/vue-3-42b883.svg)](web/package.json)
 [![GHCR](https://img.shields.io/badge/ghcr.io-hexgu%2Fiyuu--rust-2496ed?logo=docker&logoColor=white)](https://github.com/hexgu/iyuu-rust/pkgs/container/iyuu-rust)
@@ -115,7 +115,8 @@
 
 镜像由 GitHub Actions 构建并发布到 GitHub Container Registry，`linux/amd64` 与 `linux/arm64` 都有。
 仓库里的 [`compose.yml`](compose.yml) 是一份可直接上生产的配置：只监听回环、只读根文件系统、
-日志轮转、健康检查、资源上限、优雅退出都已设好。
+能力全部丢弃后按需授予、进程以 uid 10001 而非 root 运行、日志轮转、健康检查、资源与进程数上限、
+优雅退出都已设好。`./data` 的属主由容器入口自动纠正，升级时不用手工 chown。
 
 ```bash
 git clone https://github.com/hexgu/iyuu-rust.git
@@ -149,9 +150,9 @@ docker run -d \
   ghcr.io/hexgu/iyuu-rust:latest
 ```
 
-> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `0.3.2` / `0.3`（版本标签不带 `v` 前缀）。
+> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `0.3.3` / `0.3`（版本标签不带 `v` 前缀）。
 > 镜像只在发版时构建：推 `v*.*.*` tag 会同时产出多架构镜像与 GitHub Release。
-> 生产环境建议锁到具体版本（例如 `0.3.2`）而不是 `latest`，升级时再改标签。
+> 生产环境建议锁到具体版本（例如 `0.3.3`）而不是 `latest`，升级时再改标签。
 > GHCR 在部分网络下需要登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin`。
 
 ### 首次配置
@@ -435,7 +436,7 @@ environment:
 
 ## 更新日志
 
-各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.3.2**。
+各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.3.3**。
 
 ## License
 
