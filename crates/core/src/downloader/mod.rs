@@ -23,6 +23,56 @@ pub mod transmission;
 pub use qbittorrent::{QBittorrentClient, QbAuth};
 pub use transmission::TransmissionClient;
 
+/// 我们给辅种打的标签。刻意不带站点后缀：站点是「种子在哪个 tracker 上」这件事，
+/// 应该从 tracker / 记录里读，而不是塞进一个用户随时能改的字符串。
+pub const AUX_TAG: &str = "iyuu-rust";
+
+/// 旧版本的标签（`iyuu-reseed` / `iyuu-reseed:<site>` / `iyuu-reseed:verified`）。
+/// 只用于识别与迁移，不再写入。
+pub const LEGACY_AUX_TAG: &str = "iyuu-reseed";
+
+/// 这个标签是否表示「这是一份辅种/跨站副本」。
+///
+/// `extra` 是用户配置的其它辅种工具的标签（默认 `辅种`），用来兼容 Hermes、
+/// AutoSeed、手工操作留下的标记。识别结果只影响**角色**，不影响资源分组：
+/// 标签可以被改，路径和大小才是事实。
+#[must_use]
+pub fn is_aux_tag(tag: &str, extra: &[String]) -> bool {
+    let tag = tag.trim();
+    tag == AUX_TAG
+        || is_legacy_aux_tag(tag)
+        || extra.iter().any(|x| x.trim().eq_ignore_ascii_case(tag))
+}
+
+/// 种子身上是否带任一「辅种」标记。
+#[must_use]
+pub fn has_aux_tag(tags: &[String], extra: &[String]) -> bool {
+    tags.iter().any(|t| is_aux_tag(t, extra))
+}
+
+/// 是不是需要迁移的旧标签。
+#[must_use]
+pub fn is_legacy_aux_tag(tag: &str) -> bool {
+    let tag = tag.trim();
+    tag == LEGACY_AUX_TAG || tag.starts_with("iyuu-reseed:")
+}
+
+/// Host part of an announce URL, e.g. `tracker.example.org`.
+///
+/// Shared by both adapters: Transmission returns trackers as full announce URLs,
+/// qBittorrent hides them inside the magnet URI.
+#[must_use]
+pub(crate) fn host_of(announce: &str) -> Option<String> {
+    let after_scheme = announce.split("://").nth(1)?;
+    let host = after_scheme.split('/').next()?;
+    let host = host.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Options for adding a cross-seed torrent.
 #[derive(Debug, Clone, Default)]
 pub struct AddTorrentOptions {
@@ -94,6 +144,17 @@ pub trait Downloader: Send + Sync {
     /// Add tags. No-op on clients without tags.
     async fn add_tags(&self, hashes: &[String], tags: &[String]) -> Result<()>;
 
+    /// Remove tags from torrents, returning `true` when the client actually did
+    /// it.
+    ///
+    /// Clients that model tags as something else (Transmission labels are a
+    /// replacement list, and older daemons have none at all) leave this at the
+    /// default `false`. The caller must treat `false` as "not migrated" instead
+    /// of reporting a rewrite it did not perform.
+    async fn remove_tags(&self, _hashes: &[String], _tags: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Disable automatic torrent management for the given hashes so the save
     /// path we chose is not overridden by a category rule.
     async fn disable_auto_management(&self, hashes: &[String]) -> Result<()>;
@@ -148,4 +209,22 @@ pub struct DownloaderExtra {
     /// Transmission RPC endpoint path, default `/transmission/rpc`.
     #[serde(default)]
     pub transmission_rpc_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_our_legacy_and_foreign_aux_tags() {
+        let extra = vec!["辅种".to_string()];
+        assert!(is_aux_tag("iyuu-rust", &extra));
+        assert!(is_aux_tag("iyuu-reseed", &extra));
+        assert!(is_aux_tag("iyuu-reseed:springsunday", &extra));
+        assert!(is_aux_tag("iyuu-reseed:verified", &extra));
+        assert!(is_aux_tag("辅种", &extra));
+        assert!(!is_aux_tag("刷流", &extra));
+        // 前缀相近但不是我们的标签不能被误认。
+        assert!(!is_aux_tag("iyuu-rust-other", &extra));
+    }
 }

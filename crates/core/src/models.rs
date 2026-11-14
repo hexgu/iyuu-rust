@@ -260,6 +260,13 @@ pub struct TorrentInfo {
     /// Seconds seeding, when known.
     pub seeding_time: Option<i64>,
     pub uploaded: i64,
+    /// Total bytes downloaded for this torrent, all-time.
+    ///
+    /// The main seed is the one the user actually pulled here; a cross-seed is
+    /// added on top of files that already exist and downloads nothing. So
+    /// `downloaded > 0` is direct evidence of "this is the original", and it is
+    /// the client's own accounting rather than a tag someone typed.
+    pub downloaded: i64,
     pub ratio: f64,
     /// Error message when the client reports one.
     pub error: Option<String>,

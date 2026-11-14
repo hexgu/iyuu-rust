@@ -29,9 +29,8 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Marker tag applied to every torrent we add, so we can identify our own work
-/// and are never tricked into a duplicate add by a race.
-pub const IYUU_TAG: &str = "iyuu-reseed";
+// Tag constants live in `crate::downloader` (`AUX_TAG` / `LEGACY_AUX_TAG`):
+// tagging is a cross-client policy, not a qBittorrent detail.
 
 /// How to authenticate against the `WebUI`.
 #[derive(Debug, Clone)]
@@ -117,7 +116,13 @@ struct QbTorrent {
     #[serde(default)]
     uploaded: i64,
     #[serde(default)]
+    downloaded: i64,
+    #[serde(default)]
     ratio: f64,
+    /// Carries every announce URL; qB does not expose a tracker list in
+    /// `torrents/info`.
+    #[serde(default)]
+    magnet_uri: Option<String>,
 }
 
 impl QBittorrentClient {
@@ -378,9 +383,14 @@ impl QBittorrentClient {
             },
             seeding_time: Some(t.seeding_time),
             uploaded: t.uploaded,
+            downloaded: t.downloaded,
             ratio: t.ratio,
             error: None,
-            trackers: Vec::new(),
+            trackers: t
+                .magnet_uri
+                .as_deref()
+                .map(tracker_hosts)
+                .unwrap_or_default(),
         }
     }
 
@@ -678,6 +688,21 @@ impl Downloader for QBittorrentClient {
         Ok(())
     }
 
+    async fn remove_tags(&self, hashes: &[String], tags: &[String]) -> Result<bool> {
+        if hashes.is_empty() || tags.is_empty() {
+            return Ok(true);
+        }
+        self.post(
+            "torrents/removeTags",
+            vec![
+                ("hashes".into(), Self::hashes_form(hashes)),
+                ("tags".into(), tags.join(",")),
+            ],
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn disable_auto_management(&self, hashes: &[String]) -> Result<()> {
         if hashes.is_empty() {
             return Ok(());
@@ -742,16 +767,42 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((maj, min, patch))
 }
 
-/// Convenience: the qB marker tag for a specific site, e.g. `iyuu-springsunday`.
-/// Used to find our own add when qB computes a different hash.
+/// Tracker hosts out of a magnet URI (`magnet:?xt=…&tr=https%3A%2F%2Ftracker…`).
+///
+/// `torrents/info` does not carry a tracker list, but it does carry `magnet_uri`,
+/// which is where qB keeps every announce URL. Parsing it here avoids one
+/// `torrents/trackers` request per torrent just to label a cross-seed with its
+/// site.
 #[must_use]
-pub fn site_tag(site: &str) -> String {
-    format!("{IYUU_TAG}:{site}")
+pub fn tracker_hosts(magnet: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for pair in magnet.split('&') {
+        let Some(value) = pair.strip_prefix("tr=") else {
+            continue;
+        };
+        let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+        if let Some(host) = super::host_of(&decoded)
+            && !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host))
+        {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_trackers_from_the_magnet_uri() {
+        let magnet = "magnet:?xt=urn:btih:abc&dn=Some.Show&tr=https%3A%2F%2Ftracker.example.org%2Fannounce&tr=udp%3A%2F%2Ftracker.other.net%3A6969%2Fannounce";
+        assert_eq!(
+            tracker_hosts(magnet),
+            vec!["tracker.example.org", "tracker.other.net"]
+        );
+        assert_eq!(tracker_hosts(""), Vec::<String>::new());
+    }
 
     #[test]
     fn normalizes_base_urls() {
@@ -903,6 +954,7 @@ mod tests {
             added_on: None,
             seeding_time: Some(0),
             uploaded: 0,
+            downloaded: 0,
             ratio: 0.0,
             error: None,
             trackers: vec![],

@@ -79,6 +79,52 @@ pub fn tokens(name: &str) -> HashSet<String> {
         .collect()
 }
 
+/// 位置身份：同一份数据落在磁盘上的位置。
+///
+/// 这是最强的一条识别证据——跨站辅种复用的就是同一批文件，两个 `.torrent` 的
+/// info hash 不同，`content_path` 却完全一样。用路径而不是标签来认资源，意味着
+/// `Hermes` / `MoviePilot` / 手工加的副本哪怕没有任何记录、没打任何标签，也能自动归到
+/// 主种子下面。
+///
+/// `content_path` 缺失时（部分客户端不返回）退化成 `save_path/name`：名称在两个站点
+/// 之间可能不同，但同一客户端里不会，所以这条只用于「同一个下载器内部」的比较。
+///
+/// 返回 `None` 表示两边都没有可用的路径信息，调用方不能拿它做判断。
+#[must_use]
+pub fn content_key(save_path: &str, content_path: Option<&str>, name: &str) -> Option<String> {
+    if let Some(path) = content_path.map(str::trim).filter(|p| !p.is_empty()) {
+        return Some(normalize_path(path));
+    }
+    let save = save_path.trim().trim_end_matches('/');
+    let name = name.trim();
+    if save.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(normalize_path(&format!("{save}/{name}")))
+}
+
+/// 折叠重复斜杠、去掉尾部斜杠。`..` 与大小写都不动：客户端给的是绝对路径，展开它
+/// 只会引入猜测，而猜测在这里的代价是合并错资源。
+fn normalize_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        out.push(ch);
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
 /// 两个种子是否承载同一份数据。
 ///
 /// `size` 为 0 表示「大小未知」，此时只承认名称完全一致之外的否定结论——也就是说
@@ -190,5 +236,32 @@ mod tests {
     #[test]
     fn name_key_collapses_punctuation() {
         assert_eq!(name_key("A...B -- C__D"), "a b c d");
+    }
+
+    #[test]
+    fn content_key_prefers_content_path() {
+        assert_eq!(
+            content_key("/data", Some("/data/Show S01"), "Show.S01").as_deref(),
+            Some("/data/Show S01")
+        );
+    }
+
+    #[test]
+    fn content_key_falls_back_to_save_path_and_name() {
+        assert_eq!(
+            content_key("/data/", None, "Show.S01").as_deref(),
+            Some("/data/Show.S01")
+        );
+    }
+
+    #[test]
+    fn content_key_normalizes_slashes_only() {
+        assert_eq!(
+            content_key("/data//x/", Some("//data///x/"), "ignored").as_deref(),
+            Some("/data/x")
+        );
+        // 没有可用信息时返回 None，调用方不能把它当成「同一路径」。
+        assert_eq!(content_key("", None, "Show.S01"), None);
+        assert_eq!(content_key("/data", Some("   "), ""), None);
     }
 }

@@ -17,10 +17,11 @@
 //! disabled or IYUU is down, and that a restart resumes rather than loses.
 
 use crate::bencode;
-use crate::downloader::qbittorrent::{IYUU_TAG, site_tag};
+use crate::downloader::{AUX_TAG, has_aux_tag};
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::{CoreError, Result};
 use crate::fetch::fetch_torrent;
+use crate::group::primary_sources;
 use crate::iyuu::{HASH_CHUNK_SIZE, IyuuClient, SiteCredentials};
 use crate::models::{
     IyuuSite, ReseedAttempt, ReseedState, RunStats, SeedCandidate, TorrentInfo, TorrentPhase,
@@ -35,10 +36,6 @@ use std::time::Duration;
 /// The flags are independent user-facing toggles persisted one-for-one in the
 /// settings file; grouping them into sub-structs would only add a layer between
 /// the JSON the UI writes and the code that reads it.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "these mirror independent settings toggles, not instance state"
-)]
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     /// Minimum torrent size in GiB. 0 disables the filter.
@@ -54,8 +51,10 @@ pub struct DiscoveryConfig {
     pub default_category: Option<String>,
     /// Extra tags for every added cross-seed.
     pub tags: Vec<String>,
-    /// Add a tag naming the target site, handy for per-site filtering in the UI.
-    pub tag_with_site: bool,
+    /// Tags that mark a torrent as someone else's cross-seed (`辅种`, …).
+    /// Together with our own tag they decide what counts as "already a copy",
+    /// so we never try to cross-seed a cross-seed.
+    pub aux_tags: Vec<String>,
     /// Also start the torrent after verification completes. When false the
     /// torrent is left complete-but-stopped for the operator to inspect.
     pub auto_start_after_verify: bool,
@@ -75,7 +74,7 @@ impl Default for DiscoveryConfig {
             reuse_category: true,
             default_category: None,
             tags: Vec::new(),
-            tag_with_site: true,
+            aux_tags: vec!["辅种".to_string()],
             auto_start_after_verify: true,
             fetch_concurrency: 2,
             dry_run: false,
@@ -125,6 +124,15 @@ pub trait AttemptStore: Send + Sync {
     async fn seeded_targets(&self) -> Result<HashSet<String>>;
     /// Hashes that terminally failed, so we don't retry them next run.
     async fn known_bad_targets(&self) -> Result<HashSet<String>>;
+
+    /// Hashes the attempt table has ever used as a `source_hash`.
+    ///
+    /// This is history, not state: it answers "which copy is the original" even
+    /// when the original was re-added later than its cross-seeds. Default empty
+    /// so a minimal store can skip it.
+    async fn source_hashes(&self) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
 }
 
 /// Outcome of a discovery run.
@@ -163,6 +171,7 @@ pub async fn discover(
 
     let known_bad = store.known_bad_targets().await?;
     let already_seeded = store.seeded_targets().await?;
+    let known_sources = store.source_hashes().await?;
 
     // ------------------------------------------------------- local filters
     let mut sources: Vec<&TorrentInfo> = Vec::new();
@@ -178,6 +187,20 @@ pub async fn discover(
                 stats.skipped += 1;
             }
         }
+    }
+
+    // IYUU 按 info hash 查询，同一份数据在不同站点上是不同 hash，一次查询就覆盖
+    // 全部站点。把辅种副本也拿去查，等于用同一份数据重复消耗额度、答案还一样。
+    // 所以每个资源只留一个代表；代表优先选没被标成辅种、校验通过、加入更早的那个。
+    let before_dedupe = sources.len();
+    let sources = primary_sources(&sources, &ctx.config.aux_tags, &known_sources);
+    if sources.len() != before_dedupe {
+        stats.skipped += len_as_i64(before_dedupe - sources.len());
+        tracing::info!(
+            torrents = before_dedupe,
+            resources = sources.len(),
+            "按资源去重，只查询主种子"
+        );
     }
 
     tracing::info!(
@@ -461,10 +484,7 @@ fn filter_source(t: &TorrentInfo, cfg: &DiscoveryConfig) -> std::result::Result<
 
     // Skip our own cross-seeds: seeding them again from themselves would be a
     // no-op at best and a duplicate-add loop at worst.
-    if t.tags
-        .iter()
-        .any(|tag| tag == IYUU_TAG || tag.starts_with(&format!("{IYUU_TAG}:")))
-    {
+    if has_aux_tag(&t.tags, &cfg.aux_tags) {
         return Err("本身即为辅种");
     }
     for excluded in &cfg.exclude_tags {
@@ -645,11 +665,9 @@ async fn process_job(
         };
     }
 
+    // 只打一个标签，不区分站点：站点属于 tracker，不属于标签。
     let mut tags = ctx.config.tags.clone();
-    tags.push(IYUU_TAG.to_string());
-    if ctx.config.tag_with_site {
-        tags.push(site_tag(&site.site));
-    }
+    tags.push(AUX_TAG.to_string());
 
     let opts = AddTorrentOptions {
         save_path: Some(job.save_path.clone()).filter(|s| !s.is_empty()),
@@ -959,8 +977,9 @@ async fn mark(
         .await
 }
 
-/// Verification passed: start the torrent (when configured), tag it, and record
-/// the attempt as seeding.
+/// Verification passed: start the torrent (when configured) and record the
+/// attempt as seeding. No extra tag: the attempt row is the ledger, and a
+/// `:verified` suffix used to be a second, dumber copy of it.
 async fn promote(
     ctx: &EngineContext,
     store: &dyn AttemptStore,
@@ -971,13 +990,6 @@ async fn promote(
         && let Err(e) = ctx.downloader.start(hash).await
     {
         tracing::warn!(hash = %attempt.target_info_hash, error = %e, "启动辅种失败");
-    }
-    if let Err(e) = ctx
-        .downloader
-        .add_tags(hash, &[format!("{IYUU_TAG}:verified")])
-        .await
-    {
-        tracing::debug!(error = %e, "打标签失败");
     }
     mark(store, attempt, ReseedState::Seeding, "校验通过，开始辅种").await
 }
@@ -1053,6 +1065,7 @@ mod tests {
             added_on: None,
             seeding_time: Some(0),
             uploaded: 0,
+            downloaded: 0,
             ratio: 0.0,
             error: None,
             trackers: vec![],
@@ -1080,19 +1093,27 @@ mod tests {
     #[test]
     fn rejects_our_own_cross_seeds() {
         let mut t = torrent("a", 1.0, "uploading");
-        t.tags = vec![IYUU_TAG.to_string()];
+        t.tags = vec![AUX_TAG.to_string()];
         assert_eq!(
             filter_source(&t, &DiscoveryConfig::default()),
             Err("本身即为辅种")
         );
 
-        // Site-suffixed variant must also be recognized.
+        // 旧标签、以及其它工具留下的 `辅种`，都算「已经是副本」。
         let mut t2 = torrent("b", 1.0, "uploading");
-        t2.tags = vec![site_tag("springsunday")];
+        t2.tags = vec!["iyuu-reseed:springsunday".to_string()];
         assert_eq!(
             filter_source(&t2, &DiscoveryConfig::default()),
             Err("本身即为辅种")
         );
+
+        let mut t3 = torrent("c", 1.0, "uploading");
+        t3.tags = vec!["辅种".to_string()];
+        let cfg = DiscoveryConfig {
+            aux_tags: vec!["辅种".to_string()],
+            ..DiscoveryConfig::default()
+        };
+        assert_eq!(filter_source(&t3, &cfg), Err("本身即为辅种"));
     }
 
     #[test]

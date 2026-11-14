@@ -12,6 +12,7 @@
 //!  * `status` is a bitfield enum, not a boolean; `isFinished` is not the same as
 //!    "verified complete".
 
+use super::host_of;
 use crate::bencode;
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::{CoreError, Result};
@@ -38,6 +39,7 @@ const TORRENT_FIELDS: &[&str] = &[
     "addedDate",
     "secondsSeeding",
     "uploadedEver",
+    "downloadedEver",
     "uploadRatio",
     "error",
     "errorString",
@@ -84,6 +86,8 @@ struct TrTorrent {
     seconds_seeding: i64,
     #[serde(rename = "uploadedEver", default)]
     uploaded_ever: i64,
+    #[serde(rename = "downloadedEver", default)]
+    downloaded_ever: i64,
     #[serde(rename = "uploadRatio", default)]
     upload_ratio: f64,
     #[serde(default)]
@@ -296,6 +300,7 @@ impl TransmissionClient {
             },
             seeding_time: Some(t.seconds_seeding),
             uploaded: t.uploaded_ever,
+            downloaded: t.downloaded_ever,
             ratio: t.upload_ratio,
             error,
             trackers: t
@@ -474,19 +479,9 @@ impl Downloader for TransmissionClient {
     }
 }
 
-fn host_of(announce: &str) -> Option<String> {
-    let after_scheme = announce.split("://").nth(1)?;
-    let host = after_scheme.split('/').next()?;
-    let host = host.split(':').next()?;
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::host_of;
     use super::*;
 
     #[test]
@@ -515,6 +510,7 @@ mod tests {
             added_date: 0,
             seconds_seeding: 0,
             uploaded_ever: 0,
+            downloaded_ever: 0,
             upload_ratio: 0.0,
             error: 0,
             error_string: String::new(),
@@ -549,6 +545,7 @@ mod tests {
             added_date: 0,
             seconds_seeding: 0,
             uploaded_ever: 0,
+            downloaded_ever: 0,
             upload_ratio: 0.0,
             error: 0,
             error_string: String::new(),
