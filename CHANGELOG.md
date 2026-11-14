@@ -3,6 +3,16 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.3] - 2026-11-14
+
+### 修复
+
+- **「种子管理」翻页不生效**。上一页 / 下一页 只挪了游标却没有重新请求，分页条上的
+  `1–50 / 320` 变了，表格还停在第一页。现在翻页会带着 `offset` 重新拉数据，并把视口
+  带回列表顶部。
+
+- 游标越界时退回到最后一页：清理删掉了组、或搜索让结果变少之后，不再留一张空表格。
+
 ## [0.4.2] - 2026-11-14
 
 ### 变更
@@ -258,6 +268,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.4.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.3
 [0.4.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.2
 [0.4.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.1
 [0.3.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.3.3
