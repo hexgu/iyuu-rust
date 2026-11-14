@@ -87,6 +87,8 @@ const rewriting = ref(false)
 const cleaning = ref(false)
 /** 展开的组。折叠状态是视图状态，不进 URL —— 刷新一次不该丢掉用户翻到哪儿。 */
 const open = ref<Set<string>>(new Set())
+/** 表格顶部的锚点：翻页后把视口带回去，不然用户停在分页条那儿看不见新内容。 */
+const listTop = ref<HTMLElement | null>(null)
 
 let poll: ReturnType<typeof setInterval> | undefined
 let debounce: ReturnType<typeof setTimeout> | undefined
@@ -100,6 +102,14 @@ async function load(quiet = false) {
       limit: PAGE_SIZE,
       offset: offset.value,
     })
+    // 游标可能已经越过末尾（清理删掉了组、搜索结果变少了）：退回到最后一页。
+    // 不退的话用户看到一张空表，却还有「上一页」可点，只能自己猜。
+    const last = r.total === 0 ? 0 : Math.floor((r.total - 1) / PAGE_SIZE) * PAGE_SIZE
+    if (offset.value > last) {
+      offset.value = last
+      await load(quiet)
+      return
+    }
     items.value = r.items
     counts.value = r.counts
     total.value = r.total
@@ -240,6 +250,22 @@ const pageInfo = computed(() => {
 })
 const canPrev = computed(() => offset.value > 0)
 const canNext = computed(() => offset.value + PAGE_SIZE < total.value)
+
+/**
+ * 翻页。
+ *
+ * 游标只是状态，改了必须重新请求 —— 只挪 offset 不拉数据的话，分页条上的
+ * 「1–50 / 320」会变，表格却一直是第一页，看起来就是「下一页坏了」。
+ */
+async function goPage(delta: number) {
+  const next = offset.value + delta
+  if (next < 0) return
+  if (delta > 0 && next >= total.value) return
+  if (loading.value) return
+  offset.value = next
+  await load()
+  listTop.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 /** 筛选按钮上的数字。校验中不单独统计组数，就不显示数字，避免口径不一致。 */
 function chipCount(value: string): number | null {
@@ -397,6 +423,8 @@ onUnmounted(() => {
         </span>
       </button>
     </div>
+
+    <div ref="listTop" class="scroll-mt-4"></div>
 
     <Card class="py-0">
       <CardContent class="p-0">
@@ -641,10 +669,10 @@ onUnmounted(() => {
     <div class="flex items-center justify-between text-xs">
       <span class="text-muted-foreground tabular">{{ pageInfo }}</span>
       <div class="flex gap-1.5">
-        <Button variant="outline" size="sm" :disabled="!canPrev" @click="offset -= PAGE_SIZE">
+        <Button variant="outline" size="sm" :disabled="!canPrev || loading" @click="goPage(-PAGE_SIZE)">
           上一页
         </Button>
-        <Button variant="outline" size="sm" :disabled="!canNext" @click="offset += PAGE_SIZE">
+        <Button variant="outline" size="sm" :disabled="!canNext || loading" @click="goPage(PAGE_SIZE)">
           下一页
         </Button>
       </div>
