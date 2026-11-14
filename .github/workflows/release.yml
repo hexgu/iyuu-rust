@@ -77,8 +77,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # 构建必须锁在 tag 上：`workflow_dispatch` 重跑时 github.ref 是分支，
+      # 不指定 ref 就会把「重建某个版本的镜像」做成「构建 main 的镜像」。
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.meta.outputs.tag }}
           persist-credentials: false
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -182,6 +185,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.meta.outputs.tag }}
           persist-credentials: false
 
       - name: 从 CHANGELOG 取本版说明
