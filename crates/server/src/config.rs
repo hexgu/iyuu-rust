@@ -304,8 +304,8 @@ impl Default for ScheduleConfig {
 /// 自动清理：主种子被删掉之后，把它的辅种副本（和文件）一起收掉。
 ///
 /// 默认关闭。这是一条不可逆的删除路径：删掉的是别的站点上的做种记录，有些站点的
-/// H&R 还没跑完。所以它必须显式打开，并且给一段宽限时间——主种子刚消失可能只是用户
-/// 正在换盘、重新添加。
+/// H&R 还没跑完。所以它必须显式打开；打开之后不做延迟观察——确认主种子缺失且有
+/// 证据的组，下一次任务就清。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupConfig {
     #[serde(default)]
@@ -314,13 +314,6 @@ pub struct CleanupConfig {
     /// 把那份数据收掉的地方。
     #[serde(default = "default_true")]
     pub delete_files: bool,
-    /// 主种子消失后观察多久才动手。0 表示下一次任务就删。
-    #[serde(default = "default_cleanup_grace")]
-    pub grace_hours: u32,
-}
-
-fn default_cleanup_grace() -> u32 {
-    24
 }
 
 impl Default for CleanupConfig {
@@ -328,7 +321,6 @@ impl Default for CleanupConfig {
         Self {
             enabled: false,
             delete_files: true,
-            grace_hours: default_cleanup_grace(),
         }
     }
 }

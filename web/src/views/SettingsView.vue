@@ -81,7 +81,6 @@ const form = reactive({
   cron: '0 4 * * *',
   cleanupEnabled: false,
   cleanupDeleteFiles: true,
-  cleanupGrace: '24',
 })
 
 
@@ -113,7 +112,6 @@ function seedForm(c: PublicConfig) {
   form.cron = c.schedule.cron
   form.cleanupEnabled = c.cleanup.enabled
   form.cleanupDeleteFiles = c.cleanup.delete_files
-  form.cleanupGrace = String(c.cleanup.grace_hours)
   form.token = '' // write-only
   rememberSaved()
 }
@@ -257,7 +255,6 @@ function cleanupSection() {
   return {
     enabled: form.cleanupEnabled,
     delete_files: form.cleanupDeleteFiles,
-    grace_hours: Math.max(0, Number(form.cleanupGrace) || 0),
   }
 }
 
@@ -927,7 +924,8 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
             <div>
               <Label class="cursor-pointer">启用自动清理</Label>
               <p class="text-muted-foreground text-[11px]">
-                每次任务结束后检查一遍。默认关闭：删除不可逆，也会带走那些站点的做种记录
+                每次任务结束后检查一遍，确认主种子缺失就立即处理。默认关闭：删除不可逆，
+                也会带走那些站点的做种记录
               </p>
             </div>
             <Switch v-model="form.cleanupEnabled" />
@@ -941,13 +939,6 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                 </p>
               </div>
               <Switch v-model="form.cleanupDeleteFiles" />
-            </div>
-            <div class="space-y-1.5">
-              <Label>观察期（小时）</Label>
-              <Input v-model="form.cleanupGrace" type="number" min="0" max="720" />
-              <p class="text-muted-foreground text-[11px]">
-                第一次发现主种子缺失后，观察这么久才动手。换盘、重新添加这类操作不该被当成删除
-              </p>
             </div>
             <Alert>
               <AlertCircle />

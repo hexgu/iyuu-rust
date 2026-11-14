@@ -119,19 +119,6 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_runs_started
         ON runs(started_at DESC);
     ",
-    // 自动清理的观察台账：主种子第一次被观察到「不在了」的时间。
-    //
-    // 光看下载器快照无法知道主种子是什么时候没的，而没有时间就无法实现宽限期。
-    // 这张表只记「组 → 第一次缺失时间」，组一旦恢复（主种子又出现）就删掉。
-    r"
-    CREATE TABLE IF NOT EXISTS cleanup_pending (
-        group_key     TEXT PRIMARY KEY,
-        main_hash     TEXT NOT NULL DEFAULT '',
-        name          TEXT NOT NULL DEFAULT '',
-        first_seen_at TEXT NOT NULL,
-        last_seen_at  TEXT NOT NULL
-    );
-    ",
     // 删除是不可逆的，留一份审计：删了哪些 hash、哪些站点、有没有连文件一起删。
     r"
     CREATE TABLE IF NOT EXISTS cleanup_log (
@@ -534,57 +521,6 @@ pub struct CleanupLogRow {
 }
 
 impl Db {
-    /// Record that a group's main seed is missing, returning when it was first
-    /// seen missing.
-    ///
-    /// The grace period needs an anchor, and the downloader has none: a snapshot
-    /// says "not here", never "gone since Tuesday". First observation is the only
-    /// honest anchor available.
-    pub fn cleanup_touch(
-        &self,
-        group_key: &str,
-        main_hash: &str,
-        name: &str,
-        now: DateTime<Utc>,
-    ) -> Result<DateTime<Utc>, ServerError> {
-        let conn = self.pool.get()?;
-        let stamp = now.to_rfc3339();
-        conn.execute(
-            "INSERT INTO cleanup_pending(group_key, main_hash, name, first_seen_at, last_seen_at)
-             VALUES(?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(group_key) DO UPDATE SET
-                main_hash = excluded.main_hash,
-                name = excluded.name,
-                last_seen_at = excluded.last_seen_at",
-            params![group_key, main_hash, name, stamp],
-        )?;
-        let first: String = conn.query_row(
-            "SELECT first_seen_at FROM cleanup_pending WHERE group_key = ?1",
-            [group_key],
-            |r| r.get(0),
-        )?;
-        Ok(parse_dt(&first))
-    }
-
-    /// Forget groups that are no longer missing (main came back, or the group
-    /// disappeared). Returns how many rows were dropped.
-    pub fn cleanup_prune(&self, keep: &HashSet<String>) -> Result<usize, ServerError> {
-        let conn = self.pool.get()?;
-        let keys: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT group_key FROM cleanup_pending")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut removed = 0;
-        for key in keys {
-            if !keep.contains(&key) {
-                removed +=
-                    conn.execute("DELETE FROM cleanup_pending WHERE group_key = ?1", [key])?;
-            }
-        }
-        Ok(removed)
-    }
-
     /// Append one cleanup action to the audit log.
     pub fn cleanup_log_add(&self, entry: CleanupLogEntry<'_>) -> Result<(), ServerError> {
         let CleanupLogEntry {

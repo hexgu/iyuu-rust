@@ -268,19 +268,19 @@ def preview_cleanup(app):
     app.cleanup = payload
 
 
-@when(parsers.parse("开启自动清理，宽限期 {hours:d} 小时"))
-def enable_cleanup(app, hours):
+@when("开启自动清理")
+def enable_cleanup(app):
     status, payload = app.request(
         "PUT",
         "/api/config",
-        {"cleanup": {"enabled": True, "delete_files": True, "grace_hours": hours}},
+        {"cleanup": {"enabled": True, "delete_files": True}},
     )
     assert status == 200, payload
 
 
 @then(parsers.parse("预览应列出 {count:d} 组要清理的资源"))
 def preview_groups(app, count):
-    # 预览里候选 = 通过证据检查的组，包含还在宽限期内的。
+    # 预览里候选 = 通过证据检查、会被清理的组。
     assert app.cleanup["candidates"] == count, app.cleanup
     assert app.cleanup["actions"], app.cleanup
 

@@ -188,11 +188,6 @@ async function cleanInvalid() {
       notice.value = '没有发现主种子缺失的辅种。'
       return
     }
-    if (preview.deleted_groups === 0) {
-      const wait = Math.max(...preview.actions.map((a) => a.eta_hours))
-      notice.value = `${preview.candidates} 组主种子缺失，但还在观察期内（最长还需 ${wait} 小时才能动手）。`
-      return
-    }
     const ready = preview.actions.filter((a) => a.deleted)
     const names = ready.slice(0, 3).map((a) => a.name)
     const more = ready.length > names.length ? `\n…以及另外 ${ready.length - names.length} 组` : ''

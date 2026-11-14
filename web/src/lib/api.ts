@@ -267,8 +267,6 @@ export interface CleanupConfig {
   enabled: boolean
   /** 删种子时连文件一起删。 */
   delete_files: boolean
-  /** 主种子消失后观察多久才动手。 */
-  grace_hours: number
 }
 
 export interface PublicConfig {
@@ -470,9 +468,6 @@ export interface CleanupAction {
   main_hash: string
   sites: string[]
   hashes: string[]
-  first_seen_at: string
-  waited_hours: number
-  eta_hours: number
   deleted: boolean
   delete_files: boolean
 }
@@ -480,14 +475,12 @@ export interface CleanupAction {
 export interface CleanupReport {
   dry_run: boolean
   delete_files: boolean
-  grace_hours: number
   groups: number
   missing_groups: number
   candidates: number
   deleted_groups: number
   deleted_torrents: number
   deleted_records: number
-  skipped_grace: number
   skipped_no_evidence: number
   errors: string[]
   actions: CleanupAction[]
