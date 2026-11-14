@@ -4,12 +4,16 @@
 # iyuu-reseed — 多阶段构建
 #
 #   1. web      前端产物（bun + vite）
-#   2. builder  Rust release 二进制
-#   3. runtime  只带二进制 + 静态文件
+#   2. planner  把依赖清单抽成 recipe.json（cargo-chef）
+#   3. builder  先只编依赖，再编我们的代码
+#   4. runtime  只带二进制 + 静态文件
 #
-# 构建走官方源（crates.io / registry.npmjs.org），不预设任何镜像或代理：
-# 镜像站点和代理属于个人网络环境，应该留在本机的 gitignore 文件里，而不是
-# 随仓库分发。网络受限时请自行为构建机配置代理，或在本机临时覆盖。
+# cargo-chef 把「编依赖」和「编我们自己的代码」拆成两层：原来 `COPY crates/` 和
+# `cargo build` 在同一层，改任何一行源码都会让整层失效，~200 个 crate 全部重编译。
+# 前端只要 20 秒，Rust 要几分钟（arm64 上还是 QEMU 模拟，实测 47 分钟）。
+#
+# 构建走官方源（crates.io / registry.npmjs.org），不预设任何镜像或代理：镜像站点和
+# 代理属于个人网络环境，应该留在本机的 gitignore 文件里，而不是随仓库分发。
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -26,21 +30,33 @@ COPY web/ ./
 RUN bun run build
 
 # ---------------------------------------------------------------------------
-# Stage 2: Rust release 构建
+# Stage 2: 依赖清单
 # ---------------------------------------------------------------------------
-FROM rust:1-slim AS builder
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim AS chef
 WORKDIR /build
 
-# rusqlite 用 `bundled`（SQLite 编进二进制）、reqwest 用 rustls，所以不需要
-# libsqlite3-dev / pkg-config / OpenSSL 头文件，这一层完全不碰 apt。
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+RUN cargo chef prepare --recipe-path recipe.json
 
+# ---------------------------------------------------------------------------
+# Stage 3: Rust release 构建
+# ---------------------------------------------------------------------------
+FROM chef AS builder
+WORKDIR /build
+
+# 只依赖清单编依赖：这一层能跨构建命中缓存，源码改动不会让它失效。
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 RUN cargo build --release --locked && \
     strip target/release/iyuu-reseed
 
 # ---------------------------------------------------------------------------
-# Stage 3: 运行时
+# Stage 4: 运行时
 # ---------------------------------------------------------------------------
 # 刻意不用 rust:1-slim 当运行时：它 1.2 GB，而这里只需要 glibc + CA 证书 +
 # 时区数据。
