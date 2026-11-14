@@ -13,3 +13,13 @@ updates:
         patterns: ["*"]
     # 一次全提，避免每个 action 一个 PR。
     open-pull-requests-limit: 3
+
+  # 基础镜像（debian / bun / cargo-chef）的版本跟进：不跟就会一直跑在带 CVE 的旧镜像上。
+  # 镜像按标签引用而不是 digest，正是为了让这条更新有意义。
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 2
