@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/hexgu/iyuu-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.6-blue.svg)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![Vue](https://img.shields.io/badge/vue-3-42b883.svg)](web/package.json)
 [![GHCR](https://img.shields.io/badge/ghcr.io-hexgu%2Fiyuu--rust-2496ed?logo=docker&logoColor=white)](https://github.com/hexgu/iyuu-rust/pkgs/container/iyuu-rust)
@@ -150,9 +150,9 @@ docker run -d \
   ghcr.io/hexgu/iyuu-rust:latest
 ```
 
-> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `0.4.5` / `0.4`（版本标签不带 `v` 前缀）。
+> 镜像地址 `ghcr.io/hexgu/iyuu-rust`，可用标签 `latest` / `0.4.6` / `0.4`（版本标签不带 `v` 前缀）。
 > 镜像只在发版时构建：推 `v*.*.*` tag 会同时产出多架构镜像与 GitHub Release。
-> 生产环境建议锁到具体版本（例如 `0.4.5`）而不是 `latest`，升级时再改标签。
+> 生产环境建议锁到具体版本（例如 `0.4.6`）而不是 `latest`，升级时再改标签。
 > GHCR 在部分网络下需要登录：`echo $GITHUB_TOKEN | docker login ghcr.io -u <用户名> --password-stdin`。
 
 ### 首次配置
@@ -201,6 +201,9 @@ docker run -d \
   构造下载链接 → 取 .torrent → 校验 info_hash 一致
       │
       ▼
+  预检：候选的文件布局 vs 本地源种子（不一致就不加）
+      │
+      ▼
   以「暂停」加入下载器，复用原种 save_path，关闭自动分类（autoTMM）
       │ 记录落库 state=added
       ▼
@@ -219,6 +222,15 @@ docker run -d \
 - **save_path 一律复用原种子**，并强制 `autoTMM=false`。否则 qB 会把辅种挪到分类目录，原文件对不上就变成「文件缺失」。
 - **info_hash 按原始字节计算**，不是重新序列化后的 bencode；任何重编码都会让 hash 对不上。
 - **.torrent 必须校验**：拿到 HTML 登录页或 hash 不符时直接判失败，不把坏文件塞给下载器。
+- **加完立刻主动要一次校验**：qB 5.x 把「暂停」种子加进去不一定真的跑校验，
+  实测会停在 0% 的已停止状态；不主动要，就会把「没校验」误判成「校验不过」。
+  校验循环还会每轮补催，但补催只是兜底，不是主要手段。
+- **加入前预检**：IYUU 返回的候选是**另一个站点的另一个种子**（info_hash 必然不同），
+  它只能按自己抓到的索引猜两份数据是同一份，而下载器按 piece hash 做绝对判断。
+  两者的粒度差就是「文件名大小都对、校验却不过」的来源。所以加进去之前先比一次
+  文件布局（顶层目录名、文件集合、每个文件的大小），对不上的候选落库
+  `verify_failed` 直接跳过，不在下载器里留半成品。预检比的是元信息，内容不同的
+  跨站重发仍要靠校验阶段兜底。
 - **`is_https=0` 的站点走 http**：给纯 http 站点发 https 会在 TLS 握手失败，看起来像站点挂了。
 
 ## 辅种状态机
@@ -231,7 +243,7 @@ docker run -d \
 | `added` | 已交给下载器，**尚未得出校验结果** | |
 | `verifying` | 下载器正在校验，继续轮询 | |
 | `seeding` | 校验通过、数据完整、正在做种 | ✓ |
-| `verify_failed` | 校验完成但数据不完整（多为保存路径不一致） | ✓ |
+| `verify_failed` | 校验完成但数据不完整（多为保存路径不一致），或加入前的布局预检就判定不匹配 | ✓ |
 | `missing_files` | 下载器报告文件缺失 | ✓ |
 | `fetch_failed` | 取 .torrent 失败 / 站点拒绝 | ✓ |
 | `add_failed` | 下载器拒绝添加 | ✓ |
@@ -239,6 +251,7 @@ docker run -d \
 
 非终态记录按退避策略轮询：5s → 10s → 20s → 30s → 60s → 120s → 300s，总上限 3 小时。
 `verify_failed` 不自动重试——反复重试只会污染日志和站点流控，修好路径后点「重新校验」即可。
+预检拦下的候选也记在这个状态里（它们**从未**进入下载器），所以不会被下一轮重新发现、重新打扰。
 
 ## IYUU 额度与会员类型
 
@@ -439,7 +452,7 @@ environment:
 
 ## 更新日志
 
-各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.4.5**。
+各版本改动见 [CHANGELOG.md](CHANGELOG.md)，当前版本 **0.4.6**。
 
 ## License
 
