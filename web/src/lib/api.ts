@@ -253,6 +253,8 @@ export interface ReseedConfig {
   /** 其它辅种工具留下的标签，用于识别「已经是副本」。 */
   aux_tags: string[]
   auto_start_after_verify: boolean
+  /** 加入下载器之前，先比对候选种子的文件布局和本地源种子。 */
+  prescreen: boolean
   fetch_concurrency: number
   verify_interval_secs: number
 }
@@ -477,6 +479,8 @@ export interface CleanupReport {
   delete_files: boolean
   groups: number
   missing_groups: number
+  /** 主种子还在下载器里、但数据已被证实不在盘上的组数。 */
+  empty_groups: number
   candidates: number
   deleted_groups: number
   deleted_torrents: number

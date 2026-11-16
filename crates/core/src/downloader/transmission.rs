@@ -16,7 +16,7 @@ use super::host_of;
 use crate::bencode;
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::{CoreError, Result};
-use crate::models::{DownloaderKind, TorrentInfo};
+use crate::models::{DownloaderKind, TorrentFile, TorrentInfo};
 use async_trait::async_trait;
 use base64::Engine;
 use chrono::{TimeZone, Utc};
@@ -102,6 +102,22 @@ struct TrTorrent {
 struct TrTracker {
     #[serde(default)]
     announce: String,
+}
+
+/// `torrent-get` 只要了 `files` 字段时的返回体形状。
+#[derive(Debug, Deserialize)]
+struct TrFileList {
+    #[serde(default)]
+    files: Vec<TrFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrFile {
+    /// 相对 download-dir 的完整路径，多文件种子含顶层目录名。
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    length: i64,
 }
 
 /// Transmission `tr_torrent_status` values we care about.
@@ -360,6 +376,30 @@ impl Downloader for TransmissionClient {
         // even though it echoes `hashString` in the case the torrent was added.
         let ids: Vec<String> = hashes.iter().map(|h| h.to_ascii_uppercase()).collect();
         self.get_torrents(Some(json!(ids))).await
+    }
+
+    async fn files(&self, hash: &str) -> Result<Vec<TorrentFile>> {
+        // 只要 `files`：字段投影接口下，多要一个字段就多一份传输，
+        // 而预检在热路径上（一个源种子的每个候选都会问一次，靠引擎缓存兜住）。
+        let args = json!({
+            "ids": [hash.to_ascii_uppercase()],
+            "fields": ["files"],
+        });
+        let out = self.rpc("torrent-get", args).await?;
+        let raw = out.get("torrents").cloned().unwrap_or_else(|| json!([]));
+        let list: Vec<TrFileList> =
+            serde_json::from_value(raw).map_err(|e| CoreError::Downloader {
+                client: self.name.clone(),
+                msg: format!("解析种子文件列表失败：{e}"),
+            })?;
+        Ok(list
+            .into_iter()
+            .flat_map(|t| t.files)
+            .map(|f| TorrentFile {
+                path: f.name,
+                size: f.length,
+            })
+            .collect())
     }
 
     async fn add_torrent(&self, torrent_bytes: &[u8], opts: &AddTorrentOptions) -> Result<String> {

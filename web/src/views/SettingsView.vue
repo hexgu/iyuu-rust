@@ -75,6 +75,7 @@ const form = reactive({
   reuseCategory: true,
   defaultCategory: '',
   autoStart: true,
+  prescreen: true,
   concurrency: '2',
   verifyInterval: '15',
   scheduleEnabled: false,
@@ -106,6 +107,7 @@ function seedForm(c: PublicConfig) {
   form.reuseCategory = c.reseed.reuse_category
   form.defaultCategory = c.reseed.default_category ?? ''
   form.autoStart = c.reseed.auto_start_after_verify
+  form.prescreen = c.reseed.prescreen ?? true
   form.concurrency = String(c.reseed.fetch_concurrency)
   form.verifyInterval = String(c.reseed.verify_interval_secs)
   form.scheduleEnabled = c.schedule.enabled
@@ -242,6 +244,7 @@ function reseedSection() {
     tags: splitList(form.tags),
     aux_tags: splitList(form.auxTags),
     auto_start_after_verify: form.autoStart,
+    prescreen: form.prescreen,
     fetch_concurrency: Number(form.concurrency) || 2,
     verify_interval_secs: Number(form.verifyInterval) || 15,
   }
@@ -877,6 +880,17 @@ const addedSiteCount = computed(() => Object.keys(cfg.value?.credentials ?? {}).
                 </p>
               </div>
               <Switch v-model="form.autoStart" />
+            </div>
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <Label class="cursor-pointer">加入前预检文件布局</Label>
+                <p class="text-muted-foreground text-[11px]">
+                  候选种子的文件集合、大小或顶层目录名和本地不一致时不加入下载器。
+                  IYUU 只能按文件列表猜两份数据是否相同，下载器按 piece 校验判定，
+                  这类候选加进去必然停在未完成状态。
+                </p>
+              </div>
+              <Switch v-model="form.prescreen" />
             </div>
           </div>
         </CardContent>

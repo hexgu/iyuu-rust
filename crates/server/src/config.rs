@@ -225,6 +225,9 @@ pub struct ReseedConfig {
     pub aux_tags: Vec<String>,
     #[serde(default = "default_true")]
     pub auto_start_after_verify: bool,
+    /// 加入下载器之前先比对候选 `.torrent` 的文件布局和本地源种子的文件列表。
+    #[serde(default = "default_true")]
+    pub prescreen: bool,
     #[serde(default = "default_fetch_concurrency")]
     pub fetch_concurrency: usize,
     /// Verification poll interval in seconds.
@@ -256,6 +259,7 @@ impl Default for ReseedConfig {
             tags: Vec::new(),
             aux_tags: default_aux_tags(),
             auto_start_after_verify: true,
+            prescreen: true,
             fetch_concurrency: 2,
             verify_interval_secs: 15,
         }
@@ -273,6 +277,7 @@ impl From<&ReseedConfig> for DiscoveryConfig {
             tags: c.tags.clone(),
             aux_tags: c.aux_tags.clone(),
             auto_start_after_verify: c.auto_start_after_verify,
+            prescreen: c.prescreen,
             fetch_concurrency: c.fetch_concurrency.clamp(1, 16),
             dry_run: false,
         }

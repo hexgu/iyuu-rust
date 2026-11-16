@@ -187,6 +187,7 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
         credentials: cfg.credential_map(),
         sites,
         blocked_hashes: blocked,
+        source_files: parking_lot::Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -308,7 +309,7 @@ pub async fn execute_discovery(state: &AppState, trigger: RunTrigger) -> Result<
             }
 
             state.push_log(format!(
-                "完成：新增 {}，已存在 {}，失败 {}（校验不通过 {}）",
+                "完成：新增 {}，已存在 {}，失败 {}（预检拦下 / 校验不通过 {}）",
                 run.stats.added,
                 run.stats.existed,
                 run.stats.fetch_failed + run.stats.add_failed,

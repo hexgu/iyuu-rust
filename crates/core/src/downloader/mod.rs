@@ -14,7 +14,7 @@
 //! rather than just "does the call return 200".
 
 use crate::error::Result;
-use crate::models::{DownloaderKind, TorrentInfo};
+use crate::models::{DownloaderKind, TorrentFile, TorrentInfo};
 use async_trait::async_trait;
 
 pub mod qbittorrent;
@@ -121,6 +121,14 @@ pub trait Downloader: Send + Sync {
             .into_iter()
             .next())
     }
+
+    /// 某个已有种子的文件列表，路径相对它的 save path。
+    ///
+    /// 加入前的布局预检靠它把本地数据和候选 `.torrent` 对齐。下载器是唯一知道
+    /// 「这份数据实际长什么样」的一方——容器里没有媒体目录，引擎自己读不了盘。
+    /// 种子不存在时返回空列表，不当成错误：调用方据此放行，而不是把「查不到」
+    /// 当成「不匹配」。
+    async fn files(&self, hash: &str) -> Result<Vec<TorrentFile>>;
 
     /// Add a .torrent, returning the resulting info-hash.
     ///

@@ -238,6 +238,17 @@ impl DownloaderKind {
     }
 }
 
+/// 下载器里某个种子的一份文件，路径相对该种子的 save path。
+///
+/// 这是「本地实际长什么样」的权威说法：引擎自己读不了盘（容器里没有媒体目录），
+/// 但下载器一定知道。加入前的布局预检就是拿它和候选 `.torrent` 对齐比较。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentFile {
+    /// 多文件种子含顶层目录名；单文件种子就是文件名。
+    pub path: String,
+    pub size: i64,
+}
+
 /// A torrent as seen in a downloader, normalized across clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentInfo {

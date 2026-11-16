@@ -6,6 +6,7 @@
 //!   `identity`   — 「这份数据是不是同一个资源」的跨站识别规则
 //!   `group`      — 按资源去重（IYUU 查询前每个资源只问一次）
 //!   `iyuu`       — IYUU `OpenAPI` client
+//!   `layout`     — 候选 `.torrent` 的文件布局，加入前预检用
 //!   `fetch`      — turn (site, `torrent_id`) into a validated .torrent
 //!   `downloader` — qBittorrent / Transmission adapters behind one trait
 //!   `engine`     — discovery + verification orchestration
@@ -21,6 +22,7 @@ pub mod fetch;
 pub mod group;
 pub mod identity;
 pub mod iyuu;
+pub mod layout;
 pub mod models;
 pub mod ratelimit;
 

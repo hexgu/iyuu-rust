@@ -21,7 +21,7 @@
 use crate::bencode;
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::{CoreError, Result};
-use crate::models::{DownloaderKind, TorrentInfo};
+use crate::models::{DownloaderKind, TorrentFile, TorrentInfo};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
@@ -123,6 +123,16 @@ struct QbTorrent {
     /// `torrents/info`.
     #[serde(default)]
     magnet_uri: Option<String>,
+}
+
+/// `torrents/files` 的一行。qB 还返回 progress/priority 等字段，预检只用得上
+/// 路径和大小——校验通过与否只取决于这两样加数据本身。
+#[derive(Debug, Deserialize)]
+struct QbFile {
+    /// 相对 save path 的完整路径，多文件种子含顶层目录名。
+    name: String,
+    #[serde(default)]
+    size: i64,
 }
 
 impl QBittorrentClient {
@@ -431,6 +441,59 @@ impl QBittorrentClient {
             msg: format!("解析种子列表失败：{e}"),
         })
     }
+
+    /// 读一个种子的文件列表。
+    ///
+    /// `allow_relogin` 只允许重登一次：qB 重启会让 `SID` 失效，补一次登录是必要的；
+    /// 但如果不加这个开关，一条永远 403 的路径（比如权限被收紧）会变成无限递归。
+    async fn fetch_files(&self, hash: &str, allow_relogin: bool) -> Result<Vec<TorrentFile>> {
+        let resp = self
+            .http
+            .get(self.api("torrents/files"))
+            .headers(self.auth.headers(&self.name)?)
+            .query(&[("hash", hash)])
+            .send()
+            .await
+            .map_err(|e| CoreError::Downloader {
+                client: self.name.clone(),
+                msg: format!("查询种子文件列表失败：{e}"),
+            })?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if self.auth.is_api_key() {
+                return Err(CoreError::DownloaderAuth {
+                    client: self.name.clone(),
+                    msg: api_key_rejection(status),
+                });
+            }
+            if allow_relogin {
+                self.login().await?;
+                return Box::pin(self.fetch_files(hash, false)).await;
+            }
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(CoreError::Downloader {
+                client: self.name.clone(),
+                msg: format!("查询种子文件列表 HTTP {status}：{}", body.trim()),
+            });
+        }
+
+        let entries: Vec<QbFile> =
+            serde_json::from_str(&body).map_err(|e| CoreError::Downloader {
+                client: self.name.clone(),
+                msg: format!("解析种子文件列表失败：{e}"),
+            })?;
+        Ok(entries
+            .into_iter()
+            .map(|f| TorrentFile {
+                path: f.name,
+                size: f.size,
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -504,6 +567,10 @@ impl Downloader for QBittorrentClient {
             .into_iter()
             .map(Self::map_torrent)
             .collect())
+    }
+
+    async fn files(&self, hash: &str) -> Result<Vec<TorrentFile>> {
+        self.fetch_files(hash, true).await
     }
 
     async fn add_torrent(&self, torrent_bytes: &[u8], opts: &AddTorrentOptions) -> Result<String> {

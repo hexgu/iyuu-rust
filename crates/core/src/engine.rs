@@ -20,14 +20,16 @@ use crate::bencode;
 use crate::downloader::{AUX_TAG, has_aux_tag};
 use crate::downloader::{AddTorrentOptions, Downloader};
 use crate::error::{CoreError, Result};
-use crate::fetch::fetch_torrent;
+use crate::fetch::{FetchedTorrent, fetch_torrent};
 use crate::group::primary_sources;
 use crate::iyuu::{HASH_CHUNK_SIZE, IyuuClient, SiteCredentials};
+use crate::layout::{self, TorrentLayout};
 use crate::models::{
-    IyuuSite, ReseedAttempt, ReseedState, RunStats, SeedCandidate, TorrentInfo, TorrentPhase,
+    IyuuSite, ReseedAttempt, ReseedState, RunStats, SeedCandidate, TorrentFile, TorrentInfo,
+    TorrentPhase,
 };
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,12 @@ use std::time::Duration;
 /// The flags are independent user-facing toggles persisted one-for-one in the
 /// settings file; grouping them into sub-structs would only add a layer between
 /// the JSON the UI writes and the code that reads it.
+// 四个相互独立的用户开关，一个字段一个意图。折成枚举反而要在设置页和 JSON 之间
+// 多做一层翻译，而这层翻译正是「界面上的勾和实际生效的规则不一致」的来源。
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per user-facing toggle; a state machine here would only add a translation layer"
+)]
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
     /// Minimum torrent size in GiB. 0 disables the filter.
@@ -58,6 +66,12 @@ pub struct DiscoveryConfig {
     /// Also start the torrent after verification completes. When false the
     /// torrent is left complete-but-stopped for the operator to inspect.
     pub auto_start_after_verify: bool,
+    /// 加入下载器之前，先比一遍候选 `.torrent` 的文件布局和本地源种子的文件列表。
+    ///
+    /// IYUU 返回的是「另一个站点的另一个种子」，它只能按自己抓到的索引猜两份数据
+    /// 是同一份；下载器按 piece hash 做绝对判断。两者的粒度差就是「文件名大小都
+    /// 对、校验却不过」的来源，所以明显对不上的候选不值得占一个下载器槽位。
+    pub prescreen: bool,
     /// Concurrency for the .torrent fetch step. Sites rate-limit, so this is
     /// deliberately small by default.
     pub fetch_concurrency: usize,
@@ -76,6 +90,7 @@ impl Default for DiscoveryConfig {
             tags: Vec::new(),
             aux_tags: vec!["辅种".to_string()],
             auto_start_after_verify: true,
+            prescreen: true,
             fetch_concurrency: 2,
             dry_run: false,
         }
@@ -103,6 +118,33 @@ pub struct EngineContext {
     /// Hashes that previously failed to fetch — skip them so a dead release
     /// doesn't get retried on every scheduled run.
     pub blocked_hashes: HashSet<String>,
+    /// 源种子的文件列表缓存。一个源种子往往对应多个候选，而文件列表对同一个
+    /// 源种子是不变的；不缓存的话，一次运行会对同一个 hash 反复打下载器接口。
+    /// 查询失败也记成 `None`，否则一个读不到文件列表的源种子会被每个候选各重试一遍。
+    pub source_files: parking_lot::Mutex<HashMap<String, Option<Arc<Vec<TorrentFile>>>>>,
+}
+
+impl EngineContext {
+    /// 源种子的文件列表，带进程内缓存；拿不到就是 `None`，调用方据此放行预检。
+    async fn local_files(&self, hash: &str) -> Option<Arc<Vec<TorrentFile>>> {
+        let key = bencode::normalize_hash(hash);
+
+        // 显式块：锁必须在 await 之前释放。
+        let cached = { self.source_files.lock().get(&key).cloned() };
+        if let Some(cached) = cached {
+            return cached;
+        }
+
+        let fetched = self
+            .downloader
+            .files(&key)
+            .await
+            .ok()
+            .filter(|files| !files.is_empty())
+            .map(Arc::new);
+        self.source_files.lock().insert(key, fetched.clone());
+        fetched
+    }
 }
 
 /// Persistence hooks. Implemented by the server over SQLite; the engine never
@@ -434,6 +476,9 @@ fn clone_ctx(ctx: &EngineContext) -> EngineContext {
         credentials: ctx.credentials.clone(),
         sites: ctx.sites.clone(),
         blocked_hashes: ctx.blocked_hashes.clone(),
+        // 不继承上一次运行的文件列表：磁盘上的数据可能已经变了，而且缓存的生命
+        // 周期就该等于一次运行，否则长期跑下去会一直涨。
+        source_files: parking_lot::Mutex::new(HashMap::new()),
     }
 }
 
@@ -598,6 +643,139 @@ fn category_for(source: &TorrentInfo, cfg: &DiscoveryConfig) -> Option<String> {
     }
 }
 
+/// 加入前预检的判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenVerdict {
+    /// 布局一致，或被放行交给下载器自己校验。
+    Accept,
+    /// 文件内容一致，但顶层目录名不同。下载器会去一个不存在的目录找文件，
+    /// 这类候选加进去只会变成「文件缺失」。
+    RootDiffers {
+        local_root: String,
+        candidate_root: String,
+    },
+    /// 文件列表本身就不一致。
+    FilesDiffer { reasons: Vec<String> },
+}
+
+/// 把本地文件列表和候选布局对齐后比较。
+///
+/// 本地一侧的路径带顶层目录（下载器就是这么报的），候选一侧在解析时已经剥掉了，
+/// 所以先把两边归一化到「相对顶层目录」，再按路径比大小。
+///
+/// 按 map 比而不是按列表位置比：piece 的排列顺序由种子里 `files` 的顺序决定，
+/// 但校验能不能通过只取决于每个路径上那份内容对不对，与顺序无关。
+#[must_use]
+pub fn screen_layout(
+    local_root: &str,
+    local: &[TorrentFile],
+    cand: &TorrentLayout,
+) -> ScreenVerdict {
+    let prefix = format!("{local_root}/");
+    let mut reasons: Vec<String> = Vec::new();
+    let mut local_map: BTreeMap<&str, i64> = BTreeMap::new();
+
+    for file in local {
+        if file.path == local_root {
+            local_map.insert("", file.size);
+        } else if let Some(rest) = file.path.strip_prefix(prefix.as_str()) {
+            local_map.insert(rest, file.size);
+        } else {
+            push_reason(&mut reasons, format!("本地路径不在源目录内：{}", file.path));
+        }
+    }
+    if local_map.is_empty() {
+        // 没有可比的信息。拦下来的代价是白丢一个候选，放行只是让下载器照常校验。
+        return ScreenVerdict::Accept;
+    }
+
+    let local_single = local_map.len() == 1 && local_map.contains_key("");
+    if local_single != cand.single_file {
+        return ScreenVerdict::FilesDiffer {
+            reasons: vec![format!(
+                "本地是{}种子，候选是{}种子",
+                if local_single {
+                    "单文件"
+                } else {
+                    "多文件"
+                },
+                if cand.single_file {
+                    "单文件"
+                } else {
+                    "多文件"
+                },
+            )],
+        };
+    }
+
+    let mut cand_map: BTreeMap<&str, i64> = BTreeMap::new();
+    for file in &cand.files {
+        cand_map.insert(file.path.as_str(), file.size);
+    }
+
+    for (path, size) in &local_map {
+        match cand_map.get(path) {
+            None => push_reason(
+                &mut reasons,
+                format!("候选缺少文件：{}", label(path, local_root)),
+            ),
+            Some(cand_size) if cand_size != size => push_reason(
+                &mut reasons,
+                format!(
+                    "大小不同：{} 本地 {size} 字节，候选 {cand_size} 字节",
+                    label(path, local_root)
+                ),
+            ),
+            Some(_) => {}
+        }
+    }
+    for path in cand_map.keys() {
+        if !local_map.contains_key(path) {
+            push_reason(
+                &mut reasons,
+                format!("候选多出文件：{}", label(path, &cand.root)),
+            );
+        }
+    }
+
+    if !reasons.is_empty() {
+        return ScreenVerdict::FilesDiffer { reasons };
+    }
+    if local_root != cand.root {
+        return ScreenVerdict::RootDiffers {
+            local_root: local_root.to_string(),
+            candidate_root: cand.root.clone(),
+        };
+    }
+    ScreenVerdict::Accept
+}
+
+/// 差异最多留 5 条：详情要放进 attempt.message，一条消息塞 68 个文件名没法看，
+/// 而前几条通常已经足够定位问题。
+fn push_reason(reasons: &mut Vec<String>, reason: String) {
+    const MAX_REASONS: usize = 5;
+    if reasons.len() < MAX_REASONS {
+        reasons.push(reason);
+    }
+}
+
+/// 空路径代表种子根目录本身（单文件种子的唯一那个文件）。
+fn label<'a>(path: &'a str, root: &'a str) -> &'a str {
+    if path.is_empty() { root } else { path }
+}
+
+/// 本地文件列表的顶层目录名。
+///
+/// 从下载器报的路径里推，而不是直接用 `TorrentInfo.name`：路径是下载器自己认的
+/// 顶层那一段，正是校验时真正用到的值。
+fn local_root_of(local: &[TorrentFile], fallback: &str) -> String {
+    local
+        .first()
+        .and_then(|f| f.path.split('/').next())
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| fallback.to_string(), str::to_string)
+}
+
 struct JobResult {
     attempt: Option<ReseedAttempt>,
     outcome: JobOutcome,
@@ -606,6 +784,8 @@ struct JobResult {
 
 enum JobOutcome {
     Added,
+    /// 预检判定候选与本地布局不一致，没有交给下载器。
+    ScreenFailed,
     FetchFailed,
     AddFailed,
     Skipped,
@@ -654,6 +834,19 @@ async fn process_job(
             }
         };
 
+    // 预检放在 dry-run 之前：dry-run 是「预览会加什么」，一个必然校验不过的
+    // 候选本来就不该被算进预览里。
+    if let Some((state, message)) = prescreen(ctx, job, &fetched, &target).await {
+        let mut attempt = new_attempt(job, &site, &target, run_id);
+        attempt.state = state;
+        attempt.message = Some(message.clone());
+        return JobResult {
+            attempt: Some(attempt),
+            outcome: JobOutcome::ScreenFailed,
+            message: Some(message),
+        };
+    }
+
     if ctx.config.dry_run {
         let mut attempt = new_attempt(job, &site, &target, run_id);
         attempt.state = ReseedState::Skipped;
@@ -683,6 +876,13 @@ async fn process_job(
 
     match ctx.downloader.add_torrent(&fetched.bytes, &opts).await {
         Ok(hash) => {
+            // 不赌下载器「加完就会校验」。qB 5.2.4 实测会把它加成一个停在 0% 的
+            // 已停止种子，一次校验都不跑；手动要一次校验后 30 秒就到 100%，数据
+            // 一直是好的。所以加完立刻自己要一次，校验循环再兜底（见下面的
+            // `VERIFY_NUDGE_LIMIT`）。
+            if let Err(e) = ctx.downloader.recheck(std::slice::from_ref(&hash)).await {
+                tracing::debug!(hash = %hash, error = %e, "加入后请求校验失败，交给校验循环重试");
+            }
             let mut attempt = new_attempt(job, &site, &hash, run_id);
             attempt.state = ReseedState::Added;
             attempt.added_at = Some(Utc::now());
@@ -727,6 +927,69 @@ fn new_attempt(job: &Job, site: &IyuuSite, target_hash: &str, run_id: &str) -> R
     }
 }
 
+/// 加入前的布局预检：返回 `Some((state, message))` 表示「别加」。
+///
+/// 三种情况一律放行，因为误拦的代价（白丢一个本来能用的辅种）比漏拦大：
+///  * 预检被关掉；
+///  * 候选 `info_hash` 与源种子相同——元信息一模一样，下载器拿它自己已有的那份
+///    数据校验，不存在失败的可能；
+///  * 拿不到本地文件列表，或候选布局解析不出来。这是「不知道」，不是「不匹配」。
+async fn prescreen(
+    ctx: &EngineContext,
+    job: &Job,
+    fetched: &FetchedTorrent,
+    target: &str,
+) -> Option<(ReseedState, String)> {
+    if !ctx.config.prescreen || target == bencode::normalize_hash(&job.source_hash) {
+        return None;
+    }
+
+    let local = ctx.local_files(&job.source_hash).await?;
+    let layout = match layout::parse(&fetched.bytes) {
+        Ok(layout) => layout,
+        Err(e) => {
+            tracing::debug!(source = %job.source_name, error = %e, "候选布局无法解析，跳过预检");
+            return None;
+        }
+    };
+    if layout.files.is_empty() {
+        return None;
+    }
+
+    let local_root = local_root_of(&local, &job.source_name);
+    match screen_layout(&local_root, &local, &layout) {
+        ScreenVerdict::Accept => None,
+        ScreenVerdict::RootDiffers {
+            local_root,
+            candidate_root,
+        } => {
+            tracing::warn!(
+                source = %job.source_name,
+                %local_root,
+                %candidate_root,
+                "预检不通过：顶层目录名不同，加入后会去错误的目录找文件"
+            );
+            Some((
+                ReseedState::VerifyFailed,
+                format!(
+                    "预检不通过：候选顶层目录是「{candidate_root}」，本地是「{local_root}」，加入后会去错误的目录找文件"
+                ),
+            ))
+        }
+        ScreenVerdict::FilesDiffer { reasons } => {
+            tracing::warn!(
+                source = %job.source_name,
+                reasons = ?reasons,
+                "预检不通过：文件布局与本地不同"
+            );
+            Some((
+                ReseedState::VerifyFailed,
+                format!("预检不通过：{}（共 {} 处差异）", reasons[0], reasons.len()),
+            ))
+        }
+    }
+}
+
 /// Record a per-job failure in the run's warning list, deduplicated and capped.
 ///
 /// A systemic failure (every site down, expired cookie) otherwise produces one
@@ -762,6 +1025,21 @@ async fn apply_job_result(
         // A dry run reports what it would have added, so both count as added.
         JobOutcome::Added | JobOutcome::DryRun => {
             stats.added += 1;
+        }
+        JobOutcome::ScreenFailed => {
+            stats.verify_failed += 1;
+            if let Some(msg) = &result.message {
+                tracing::warn!(source = %job.source_name, %msg, "预检不通过，未加入下载器");
+                // 明细留在 attempt.message 里；运行日志只留一条可聚合的摘要，
+                // 否则一次运行会被几十个文件名淹没。
+                push_failure_warning(
+                    out,
+                    &format!(
+                        "预检不通过（{}）：文件布局与本地不同",
+                        job.site.display_name()
+                    ),
+                );
+            }
         }
         JobOutcome::FetchFailed => {
             stats.fetch_failed += 1;
@@ -923,11 +1201,12 @@ async fn advance_attempt(
         }
         TorrentPhase::MissingFiles => {
             out.failed += 1;
+            suspect_source(ctx, attempt, info).await;
             mark(
                 store,
                 attempt,
                 ReseedState::MissingFiles,
-                "下载器报告文件缺失：保存路径与原种不一致",
+                "下载器报告文件缺失：保存路径与原种不一致，或源种子的数据已经不在磁盘上",
             )
             .await?;
         }
@@ -962,6 +1241,43 @@ async fn advance_attempt(
     }
 
     Ok(())
+}
+
+/// 辅种一份数据都没匹配上（进度为 0）时，最可疑的不是候选种子，而是**源种子**。
+///
+/// 依据：加入前的元信息预检已经通过了——顶层目录、文件集合、每个文件的大小都对得上，
+/// 同一批字节躺在同一个 save path 下，下载器却连一块都对不上。那就不是「这个站的
+/// 资源不一样」，而是「这批字节已经不在磁盘上了」。
+///
+/// 而下载器自己永远不会发现：它的 100% 只是 `.fastresume` 里的一张 piece 位图，它不
+/// 监听文件系统，也没有「多个种子共用同一批文件」的概念。删掉一个种子的数据，其余
+/// 副本会继续宣称 100%，直到有人让它们校验。
+///
+/// 所以这里做的是**取证**：让源种子自己校验一次。它掉下来，分组就会变成 `degraded`，
+/// 自动清理才有得可收；它还是 100%，那就是候选种子的问题，跟源种子无关。
+async fn suspect_source(ctx: &EngineContext, attempt: &ReseedAttempt, info: &TorrentInfo) {
+    if info.progress > 0.0 {
+        return;
+    }
+    if attempt.source_hash.is_empty()
+        || bencode::normalize_hash(&attempt.source_hash) == attempt.target_info_hash
+    {
+        return;
+    }
+    // 同一个源种子可能挂着多个失败的副本，这里不做去重：一次 recheck 请求的代价
+    // 远小于读盘，而且下载器对「已经在校验」的重复请求是幂等的。
+    match ctx
+        .downloader
+        .recheck(std::slice::from_ref(&attempt.source_hash))
+        .await
+    {
+        Ok(()) => tracing::warn!(
+            source = %attempt.source_name,
+            aux = %attempt.target_info_hash,
+            "辅种一份数据都没匹配上，已让源种子重新校验：它的数据很可能已经不在磁盘上了"
+        ),
+        Err(e) => tracing::debug!(error = %e, "请源种子校验失败"),
+    }
 }
 
 /// Persist a new state plus its explanatory note, always bumping the check
@@ -1011,14 +1327,15 @@ async fn handle_incomplete(
     let verify_not_started =
         lower.contains("paused") || lower.contains("stopped") || lower.contains("queued");
 
-    if verify_not_started && attempt.check_count <= 3 {
-        // Give it a nudge: without this, a qB that ignored the recheck request
-        // sits at 0% forever.
-        if attempt.check_count == 0
-            && let Err(e) = ctx
-                .downloader
-                .recheck(std::slice::from_ref(&attempt.target_info_hash))
-                .await
+    if verify_not_started && attempt.check_count < VERIFY_NUDGE_LIMIT {
+        // 每次都催，不是只催第一次。旧逻辑只在 `check_count == 0` 时发一次
+        // recheck，而第一次观测到的状态常常是 `checkingResumeData`（走上面的
+        // Checking 分支，计数已经 +1），于是这次唯一的催请求永远不会发出——
+        // 种子就停在那里，「校验后仍不完整」其实是「根本没校验」。
+        if let Err(e) = ctx
+            .downloader
+            .recheck(std::slice::from_ref(&attempt.target_info_hash))
+            .await
         {
             tracing::debug!(error = %e, "补发校验失败");
         }
@@ -1026,15 +1343,32 @@ async fn handle_incomplete(
         return mark(store, attempt, ReseedState::Verifying, "等待校验开始").await;
     }
 
-    // Verification had its chance and found the data incomplete. This is the
-    // failure the user must see.
+    if verify_not_started {
+        // 要了这么多次，下载器一次都没跑起来。这个结论和「校验过但不完整」
+        // 完全不同，必须分开说，否则用户会去查磁盘路径——而问题在别处。
+        out.failed += 1;
+        suspect_source(ctx, attempt, info).await;
+        let note = format!(
+            "已请求校验 {VERIFY_NUDGE_LIMIT} 次，下载器始终没有开始校验；请在下载器里手动重校验确认数据"
+        );
+        return mark(store, attempt, ReseedState::VerifyFailed, &note).await;
+    }
+
+    // 状态已经离开 paused/stopped/queued：下载器确实看过数据，结论是数据不完整。
     out.failed += 1;
+    suspect_source(ctx, attempt, info).await;
     let note = format!(
         "校验后仍不完整（进度 {:.1}%）：保存路径与原种不一致，或该站资源与本地不同",
         info.progress * 100.0
     );
     mark(store, attempt, ReseedState::VerifyFailed, &note).await
 }
+
+/// 在判定「校验不通过」之前，最多向下载器要几次校验。
+///
+/// 8 次 × 15s 的轮询间隔 ≈ 2 分钟：足够让一次排队的校验真正跑起来（实测 20GB
+/// 约 30~90 秒），又不至于让状态机无限等一个根本不打算校验的下载器。
+pub const VERIFY_NUDGE_LIMIT: i32 = 8;
 
 /// Sleep helper matching the engine's polling cadence.
 #[must_use]
@@ -1338,5 +1672,122 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains('7'), "{err}");
+    }
+    /// 本地一侧：下载器报的路径带顶层目录。
+    fn local(files: &[(&str, i64)]) -> Vec<TorrentFile> {
+        files
+            .iter()
+            .map(|(path, size)| TorrentFile {
+                path: (*path).to_string(),
+                size: *size,
+            })
+            .collect()
+    }
+
+    /// 候选一侧：解析出来的路径已经剥掉了顶层目录。
+    fn candidate(root: &str, files: &[(&str, i64)]) -> TorrentLayout {
+        TorrentLayout {
+            root: root.to_string(),
+            piece_length: 262_144,
+            single_file: files.len() == 1 && files[0].0.is_empty(),
+            files: files
+                .iter()
+                .map(|(path, size)| crate::layout::LayoutFile {
+                    path: (*path).to_string(),
+                    size: *size,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn screen_accepts_an_identical_layout() {
+        let l = local(&[("Root/a.mkv", 100), ("Root/Subs/b.ass", 20)]);
+        let c = candidate("Root", &[("a.mkv", 100), ("Subs/b.ass", 20)]);
+        assert_eq!(screen_layout("Root", &l, &c), ScreenVerdict::Accept);
+    }
+
+    #[test]
+    fn screen_accepts_any_file_order() {
+        // 顺序只影响 piece 的排列，不影响每个路径上的内容对不对。
+        let l = local(&[("Root/a.mkv", 100), ("Root/b.nfo", 5)]);
+        let c = candidate("Root", &[("b.nfo", 5), ("a.mkv", 100)]);
+        assert_eq!(screen_layout("Root", &l, &c), ScreenVerdict::Accept);
+    }
+
+    #[test]
+    fn screen_flags_a_different_root_that_shares_the_contents() {
+        let l = local(&[("Local.Name/a.mkv", 100)]);
+        let c = candidate("Site.Name", &[("a.mkv", 100)]);
+        assert_eq!(
+            screen_layout("Local.Name", &l, &c),
+            ScreenVerdict::RootDiffers {
+                local_root: "Local.Name".into(),
+                candidate_root: "Site.Name".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn screen_flags_missing_and_extra_files() {
+        let l = local(&[("Root/a.mkv", 100), ("Root/b.nfo", 5)]);
+        let c = candidate("Root", &[("a.mkv", 100), ("Subs/c.ass", 9)]);
+        let ScreenVerdict::FilesDiffer { reasons } = screen_layout("Root", &l, &c) else {
+            panic!("expected FilesDiffer");
+        };
+        assert!(
+            reasons.iter().any(|r| r.contains("候选缺少文件：b.nfo")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("候选多出文件：Subs/c.ass")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn screen_flags_a_size_mismatch() {
+        let l = local(&[("Root/a.mkv", 100)]);
+        let c = candidate("Root", &[("a.mkv", 101)]);
+        let ScreenVerdict::FilesDiffer { reasons } = screen_layout("Root", &l, &c) else {
+            panic!("expected FilesDiffer");
+        };
+        assert!(reasons[0].contains("大小不同"), "{reasons:?}");
+    }
+
+    #[test]
+    fn screen_flags_single_file_against_multi_file() {
+        let l = local(&[("movie.mkv", 100)]);
+        let c = candidate("movie.mkv", &[("", 100), ("Subs/a.ass", 5)]);
+        let ScreenVerdict::FilesDiffer { reasons } = screen_layout("movie.mkv", &l, &c) else {
+            panic!("expected FilesDiffer");
+        };
+        assert!(reasons[0].contains("单文件"), "{reasons:?}");
+        assert!(reasons[0].contains("多文件"), "{reasons:?}");
+    }
+
+    #[test]
+    fn screen_caps_the_reason_list() {
+        let l: Vec<TorrentFile> = (0..20)
+            .map(|i| TorrentFile {
+                path: format!("Root/missing{i}.bin"),
+                size: 1,
+            })
+            .collect();
+        let c = candidate("Root", &[]);
+        let ScreenVerdict::FilesDiffer { reasons } = screen_layout("Root", &l, &c) else {
+            panic!("expected FilesDiffer");
+        };
+        assert_eq!(reasons.len(), 5);
+    }
+
+    #[test]
+    fn screen_passes_when_the_local_list_is_unusable() {
+        // 拿不到可比的信息时放行：预检不能变成新的失败源。
+        let l = local(&[("elsewhere/a.mkv", 100)]);
+        let c = candidate("Root", &[("a.mkv", 100)]);
+        assert_eq!(screen_layout("Root", &l, &c), ScreenVerdict::Accept);
     }
 }
