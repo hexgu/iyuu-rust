@@ -3,6 +3,18 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.5] - 2026-11-16
+
+### 修复
+
+- **馒头取种第二步仍然失败：`error sending request for url
+  (https://api.m-team.cc/api/rss/dlv2&sign=...)`**。`download_and_validate` 与
+  `get_page` 只在用户配置了 User-Agent 时才发这个头，没配就一个都不发；馒头前面挡着
+  Cloudflare，空 UA 的请求会被直接丢弃连接，客户端只看到 `client error (Connect) →
+  operation timed out`，像是站点挂了。现在两处统一走 `site_user_agent()`：用户配了
+  用用户的，没配默认 `iyuu-reseed/<版本>`。实测同一签名地址不带 UA 3/3 连接超时，
+  带 UA 3/3 正常返回种子文件。
+
 ## [0.4.4] - 2026-11-16
 
 ### 修复
@@ -278,6 +290,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.4.5]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.5
 [0.4.4]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.4
 [0.4.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.3
 [0.4.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.2
