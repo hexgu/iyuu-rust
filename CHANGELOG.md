@@ -3,6 +3,16 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.4] - 2026-11-16
+
+### 修复
+
+- **馒头（M-Team）取种全部失败：`error sending request for url
+  (https://api.api.m-team.cc/...)`**。`fetch_mteam` 用无条件的 `replace("m-team",
+  "api.m-team")` 推导 API 域名，而 IYUU 下发的 `base_url` 本来就是 `api.m-team.cc`，
+  替换后变成 `api.api.m-team.cc`，DNS 直接解析不了。现在改为按主机名归一化
+  （`kp.` / `www.` 前缀换成 `api.`，已是 `api.` 就保留，带端口也不丢），并加了回归测试。
+
 ## [0.4.3] - 2026-11-14
 
 ### 修复
@@ -268,6 +278,7 @@
 - 新增 `dev.sh` 交互式本地开发控制台，统一后端 / 前端启动与端口覆盖。
 - 构建走官方源，不再在仓库内预设镜像站或代理。
 
+[0.4.4]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.4
 [0.4.3]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.3
 [0.4.2]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.2
 [0.4.1]: https://github.com/hexgu/iyuu-rust/releases/tag/v0.4.1
