@@ -167,6 +167,19 @@ fn join_url(site: &IyuuSite, path: &str) -> String {
     }
 }
 
+/// User-Agent to send with tracker requests.
+///
+/// Always send *something*: M-Team sits behind Cloudflare, which drops the
+/// connection outright when the header is missing — the client only sees a
+/// connect timeout, so it reads like an outage instead of a rejected request.
+fn site_user_agent(creds: &SiteCredentials) -> &str {
+    creds
+        .user_agent
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or(concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")))
+}
+
 async fn download_and_validate(
     http: &reqwest::Client,
     url: &str,
@@ -178,9 +191,7 @@ async fn download_and_validate(
     if let Some(cookie) = creds.cookie.as_deref().filter(|c| !c.is_empty()) {
         req = req.header(reqwest::header::COOKIE, cookie);
     }
-    if let Some(ua) = creds.user_agent.as_deref().filter(|u| !u.is_empty()) {
-        req = req.header(reqwest::header::USER_AGENT, ua);
-    }
+    req = req.header(reqwest::header::USER_AGENT, site_user_agent(creds));
 
     let resp = req.send().await.map_err(|e| CoreError::TorrentFetch {
         site: site.display_name().to_string(),
@@ -271,9 +282,7 @@ async fn get_page(
     if let Some(cookie) = creds.cookie.as_deref().filter(|c| !c.is_empty()) {
         req = req.header(reqwest::header::COOKIE, cookie);
     }
-    if let Some(ua) = creds.user_agent.as_deref().filter(|u| !u.is_empty()) {
-        req = req.header(reqwest::header::USER_AGENT, ua);
-    }
+    req = req.header(reqwest::header::USER_AGENT, site_user_agent(creds));
     let resp = req.send().await.map_err(|e| CoreError::TorrentFetch {
         site: site.display_name().to_string(),
         msg: format!("详情页请求失败：{e}"),
@@ -472,11 +481,7 @@ async fn fetch_mteam(
     let scheme = site_scheme(site);
     let url = format!("{scheme}://{api_host}/api/torrent/genDlToken");
 
-    let ua = creds
-        .user_agent
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .unwrap_or(concat!("iyuu-reseed/", env!("CARGO_PKG_VERSION")));
+    let ua = site_user_agent(creds);
 
     let resp = http
         .post(&url)
@@ -564,6 +569,18 @@ mod tests {
             is_https: 1,
             cookie_required: 0,
         }
+    }
+
+    #[test]
+    fn always_sends_a_user_agent() {
+        // Cloudflare (M-Team) kills connections with no UA, so the default
+        // must never be empty — and a configured one must win.
+        let mut creds = SiteCredentials::default();
+        assert!(site_user_agent(&creds).starts_with("iyuu-reseed/"));
+        creds.user_agent = Some(String::new());
+        assert!(site_user_agent(&creds).starts_with("iyuu-reseed/"));
+        creds.user_agent = Some("custom/1.0".into());
+        assert_eq!(site_user_agent(&creds), "custom/1.0");
     }
 
     #[test]
