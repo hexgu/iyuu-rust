@@ -411,6 +411,47 @@ fn extract_from_script(html: &str, site: &IyuuSite) -> Option<String> {
     Some(absolutize(site, &cleaned))
 }
 
+/// Derive M-Team's API host from whatever base URL the row carries.
+///
+/// IYUU hands out `m-team.cc`, `kp.m-team.cc` and sometimes an already-correct
+/// `api.m-team.cc`. The API only lives on the `api.` subdomain, so normalise
+/// instead of blind string-replacing — replacing `m-team` unconditionally turns
+/// `api.m-team.cc` into `api.api.m-team.cc` and every request dies on DNS.
+#[must_use]
+fn mteam_api_host(base: &str) -> String {
+    // `host()` strips the scheme but may leave a path or trailing slash behind.
+    let authority = base
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let (hostname, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    };
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.is_empty() {
+        return "api.m-team.cc".to_string();
+    }
+    // Drop the subdomain IYUU likes to carry, keep an existing `api.`.
+    let stripped = hostname
+        .strip_prefix("kp.")
+        .or_else(|| hostname.strip_prefix("www."))
+        .unwrap_or(&hostname);
+    let api = if stripped.starts_with("api.") {
+        stripped.to_string()
+    } else {
+        format!("api.{stripped}")
+    };
+    match port {
+        Some(p) => format!("{api}:{p}"),
+        None => api,
+    }
+}
+
 /// M-Team: mint a download token via the API, then GET the redirect URL.
 async fn fetch_mteam(
     http: &reqwest::Client,
@@ -427,10 +468,7 @@ async fn fetch_mteam(
             msg: "M-Team 需要配置 API Key".into(),
         })?;
 
-    let host = site.host();
-    let api_host = host
-        .replace("kp.m-team", "api.m-team")
-        .replace("m-team", "api.m-team");
+    let api_host = mteam_api_host(site.host());
     let scheme = site_scheme(site);
     let url = format!("{scheme}://{api_host}/api/torrent/genDlToken");
 
@@ -526,6 +564,18 @@ mod tests {
             is_https: 1,
             cookie_required: 0,
         }
+    }
+
+    #[test]
+    fn mteam_api_host_is_idempotent() {
+        // The row's base_url is already the API host; blindly replacing
+        // "m-team" used to produce api.api.m-team.cc.
+        assert_eq!(mteam_api_host("api.m-team.cc"), "api.m-team.cc");
+        assert_eq!(mteam_api_host("https://api.m-team.cc/"), "api.m-team.cc");
+        assert_eq!(mteam_api_host("kp.m-team.cc"), "api.m-team.cc");
+        assert_eq!(mteam_api_host("m-team.cc"), "api.m-team.cc");
+        assert_eq!(mteam_api_host("www.m-team.cc"), "api.m-team.cc");
+        assert_eq!(mteam_api_host(""), "api.m-team.cc");
     }
 
     #[test]
