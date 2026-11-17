@@ -136,7 +136,7 @@ impl From<iyuu_core::CoreError> for ServerError {
             // the same hint for either.
             C::IyuuInactive(m) => ServerError::IyuuInactive(m),
             C::SidSha1Expired(m) | C::IyuuToken(m) => ServerError::IyuuAuth(m),
-            C::TorrentFetch { site, msg } => {
+            C::TorrentFetch { site, msg } | C::TorrentGone { site, msg } => {
                 ServerError::Downloader(format!("获取种子失败（{site}）：{msg}"))
             }
             other => ServerError::Internal(other.to_string()),

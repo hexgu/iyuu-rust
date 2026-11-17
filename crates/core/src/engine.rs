@@ -826,8 +826,17 @@ async fn process_job(
         match fetch_torrent(&ctx.http, &site, cand.torrent_id, &creds, Some(&target)).await {
             Ok(f) => f,
             Err(e) => {
+                // 「这个种子已经不存在」是永久状态：落一条记录，下一次运行会从
+                // `blocked_hashes` 里看到它并直接跳过。网络抖动、临时 5xx 之类不落库，
+                // 下一轮该重试就重试——把可恢复的失败也永久记住，才是真的丢东西。
+                let attempt = matches!(&e, CoreError::TorrentGone { .. }).then(|| {
+                    let mut a = new_attempt(job, &site, &target, run_id);
+                    a.state = ReseedState::FetchFailed;
+                    a.message = Some(e.to_string());
+                    a
+                });
                 return JobResult {
-                    attempt: None,
+                    attempt,
                     outcome: JobOutcome::FetchFailed,
                     message: Some(format!("{}: {e}", site.display_name())),
                 };

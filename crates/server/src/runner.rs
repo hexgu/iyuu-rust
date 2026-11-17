@@ -163,8 +163,12 @@ pub async fn build_engine(state: &AppState) -> Result<EngineContext> {
         // re-checks during discovery, but seeding this set up front keeps the
         // candidate list honest in the log.
         let mut set = std::collections::HashSet::new();
-        for a in state.db.list_attempts(Some("verify_failed"), 500, 0)? {
-            set.insert(a.target_info_hash);
+        // 「校验不通过」和「站点说这个种子已经不存在」都是终局：前者重试只会污染
+        // 日志和站点流控，后者再试一万次也还是不存在。
+        for state_name in ["verify_failed", "fetch_failed"] {
+            for a in state.db.list_attempts(Some(state_name), 500, 0)? {
+                set.insert(a.target_info_hash);
+            }
         }
         set
     };

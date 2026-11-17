@@ -205,6 +205,12 @@ async fn download_and_validate(
             msg: format!("HTTP {status}，cookie/passkey 可能已失效"),
         });
     }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(CoreError::TorrentGone {
+            site: site.display_name().to_string(),
+            msg: "HTTP 404".into(),
+        });
+    }
     if !status.is_success() {
         return Err(CoreError::TorrentFetch {
             site: site.display_name().to_string(),
@@ -244,6 +250,26 @@ async fn download_and_validate(
             msg: "响应为空".into(),
         });
     }
+    // 站点用 JSON 报错的情况（M-Team 的下载链接就是这样：签名过期、种子已被删除、
+    // 账号等级不够，都返回 `{"message":"…","code":…}`）。只交给 bencode 的话，用户
+    // 看到的是 `invalid type byte 0x7b`——0x7b 就是 `{`，等于什么都没说。
+    // 这里把站点自己的那句话读出来，日志才能指向真正的原因。
+    if is_json_body(&content_type, &bytes) {
+        let site_name = site.display_name().to_string();
+        let hint = json_hint(&bytes);
+        return Err(if json_says_gone(&bytes) {
+            // 「种子未找到」是永久状态，不能每轮重试。
+            CoreError::TorrentGone {
+                site: site_name,
+                msg: hint,
+            }
+        } else {
+            CoreError::TorrentFetch {
+                site: site_name,
+                msg: format!("站点返回 JSON 而非种子：{hint}"),
+            }
+        });
+    }
 
     // The real gate: the bytes must parse as bencode AND hash to the hash IYUU
     // told us to expect. Non-matching means we grabbed the wrong release.
@@ -269,6 +295,84 @@ async fn download_and_validate(
         info_hash: hex_hash,
         url: url.to_string(),
     })
+}
+
+/// 响应是不是 JSON。Content-Type 经常不可信（有的站点一律 `application/octet-stream`），
+/// 所以两条都看：声明了 JSON，或者正文第一个非空白字节是 `{` / `[`。
+fn is_json_body(content_type: &str, bytes: &[u8]) -> bool {
+    if content_type.to_ascii_lowercase().contains("json") {
+        return true;
+    }
+    matches!(
+        bytes.iter().find(|b| !b.is_ascii_whitespace()).copied(),
+        Some(b'{' | b'[')
+    )
+}
+
+/// 从站点的 JSON 错误体里挖出人能看懂的那句话。
+///
+/// 认 `message` / `msg` / `error` 三个常见字段，附上 `code`；都认不出来就退化成
+/// 一段截断的原文——宁可难看，也不要再出现「0x7b」这种等于没说的报错。
+fn json_hint(bytes: &[u8]) -> String {
+    const MAX_CHARS: usize = 240;
+
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let message = ["message", "msg", "error", "errorMessage"]
+            .iter()
+            .find_map(|key| value.get(key).and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if !message.is_empty() {
+            // `code` 有时是数字、有时是字符串（M-Team 是字符串）。统一按原文显示，
+            // 免得日志里出现 `code "1"` 这种带引号的四不像。
+            return match value.get("code").or_else(|| value.get("status")) {
+                Some(code) => {
+                    let shown = code
+                        .as_str()
+                        .map_or_else(|| code.to_string(), str::to_string);
+                    format!("{message}（code {shown}）")
+                }
+                None => message.to_string(),
+            };
+        }
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    let head: String = text.chars().take(MAX_CHARS).collect();
+    if text.chars().count() > MAX_CHARS {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// 站点的 JSON 错误体是不是在说「这个种子不存在了」。
+///
+/// 只看文案不看 `code`：M-Team 用 `code: "1"` 表示「种子未找到」，这个数字没有任何
+/// 通用约定（同一个 `1` 在别的站点可能是「参数错误」）；而这句话本身是稳定的。
+fn json_says_gone(bytes: &[u8]) -> bool {
+    // 刻意不含「种/種」这两个字：馒头是台湾站点，回的是繁体「種子未找到」，
+    // 按整词匹配会在简繁之间翻车——这是实测踩到的第一个坑。只认后半句。
+    const GONE_MARKERS: [&str; 6] = [
+        "未找到",
+        "不存在",
+        "找不到",
+        "not found",
+        "does not exist",
+        "no such torrent",
+    ];
+
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let message = ["message", "msg", "error", "errorMessage"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_lowercase();
+    GONE_MARKERS
+        .iter()
+        .any(|marker| message.contains(&marker.to_lowercase()))
 }
 
 /// Authenticated GET returning the page body.
@@ -673,5 +777,54 @@ mod tests {
         let url = extract_download_link(html, &site("hdchina.org"), 5).unwrap();
         assert!(url.contains("action=download"));
         assert!(url.starts_with("https://hdchina.org/"));
+    }
+
+    // ---- JSON 错误体 -----------------------------------------------------
+    //
+    // 真实数据：馒头的下载链接对一个已删除的种子返回 HTTP 200 + 这段 JSON。
+    // 修复前它会被丢给 bencode，报 `invalid type byte 0x7b`（0x7b 就是 `{`）。
+
+    const MTEAM_GONE: &[u8] =
+        br#"{"code":"1","data":null,"message":"\u7a2e\u5b50\u672a\u627e\u5230"}"#;
+
+    #[test]
+    fn recognises_a_json_error_body() {
+        assert!(is_json_body("application/json", MTEAM_GONE));
+        // 站点把 content-type 谎报成八位字节流时，只能看正文的第一个字节。
+        assert!(is_json_body("application/octet-stream", MTEAM_GONE));
+        assert!(is_json_body("", b"  \n{\"a\":1}"));
+        assert!(is_json_body("", b"[1,2]"));
+        assert!(!is_json_body("application/x-bittorrent", b"d8:announce"));
+    }
+
+    #[test]
+    fn extracts_the_site_message_and_code() {
+        assert_eq!(json_hint(MTEAM_GONE), "種子未找到（code 1）");
+        assert_eq!(json_hint(br#"{"msg":"boom"}"#), "boom");
+        // 不是 JSON 就没得挖，退化成截断原文——难看也比「0x7b」强。
+        assert_eq!(json_hint(b"plain text"), "plain text");
+    }
+
+    #[test]
+    fn treats_torrent_not_found_as_permanent() {
+        // 实测的繁体原文（馒头是台湾站点）。
+        assert!(json_says_gone(MTEAM_GONE));
+        // 简体站点说同一句话，也得认出来。
+        assert!(json_says_gone(
+            br#"{"message":"\u79cd\u5b50\u672a\u627e\u5230"}"#
+        ));
+        assert!(json_says_gone(br#"{"message":"Torrent not found"}"#));
+        assert!(!json_says_gone(
+            br#"{"message":"\u989d\u5ea6\u4e0d\u8db3"}"#
+        ));
+        assert!(!json_says_gone(b"not json at all"));
+    }
+
+    #[test]
+    fn a_temporary_json_error_is_not_permanent() {
+        // 限流也能返回 JSON，但它必须留在可重试的那条路上。
+        let limited = br#"{"message":"\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41"}"#;
+        assert!(is_json_body("application/json", limited));
+        assert!(!json_says_gone(limited));
     }
 }

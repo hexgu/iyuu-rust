@@ -64,6 +64,14 @@ pub enum CoreError {
     #[error("获取种子失败（{site}）：{msg}")]
     TorrentFetch { site: String, msg: String },
 
+    /// 站点明确说「这个种子不存在了」——HTTP 404，或者 JSON 错误体里写着「种子未找到」。
+    ///
+    /// 和 [`Self::TorrentFetch`] 分开，是因为处置方式相反：网络抖动、限流、临时 5xx
+    /// 下一轮该重试；而一个已经被删掉的种子，重试一万次也还是不存在，只会在日志里
+    /// 反复刷同一条警告。引擎据此把它记进 `blocked_hashes`，下次直接跳过。
+    #[error("种子已不存在（{site}）：{msg}")]
+    TorrentGone { site: String, msg: String },
+
     #[error("bencode 解析失败：{0}")]
     Bencode(#[from] crate::bencode::BencodeError),
 
