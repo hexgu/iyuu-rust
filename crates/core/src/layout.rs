@@ -74,16 +74,17 @@ pub fn parse(bytes: &[u8]) -> Result<TorrentLayout> {
                 .get("length")
                 .and_then(Value::as_int)
                 .unwrap_or_default();
-            let mut path = entry
-                .get("path")
-                .and_then(Value::as_list)
-                .map(|segs| {
-                    segs.iter()
-                        .filter_map(Value::as_str_lossy)
-                        .collect::<Vec<_>>()
-                        .join("/")
-                })
-                .unwrap_or_default();
+            // 不用 `.map(..).unwrap_or_default()`：clippy 1.100 会要求换成
+            // `map_or_default`。写成 match 是让「路径缺失」这个分支显式地留在
+            // 代码里，而不是被一个默认值吞掉。
+            let mut path = match entry.get("path").and_then(Value::as_list) {
+                Some(segs) => segs
+                    .iter()
+                    .filter_map(Value::as_str_lossy)
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                None => String::new(),
+            };
             if let Some(rest) = path.strip_prefix("./") {
                 path = rest.to_string();
             }
