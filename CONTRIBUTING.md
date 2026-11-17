@@ -184,7 +184,7 @@ registry = "https://<你的 npm 镜像>/"
 docker build --network=host -t iyuu-reseed .
 ```
 
-基础镜像（`rust:1-slim`、`oven/bun:1-alpine`、`debian:bookworm-slim`）来自 Docker Hub，网络受限时建议先手动 `docker pull` 一次。
+基础镜像（`rust:1-slim`、`oven/bun:1-alpine`、`debian:trixie-slim`）来自 Docker Hub，网络受限时建议先手动 `docker pull` 一次。
 
 ### 为什么 cargo 编译慢
 
