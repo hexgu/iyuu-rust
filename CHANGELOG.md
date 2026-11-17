@@ -3,6 +3,39 @@
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，变更分类参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.4.7] - 2026-11-17
+
+### 变更
+
+- **运行时基础镜像从 `debian:bookworm-slim` 升到 `debian:trixie-slim`（Debian 12 →
+  13，glibc 2.36 → 2.41）。** 这次不是随手跟版本，是拆一颗已经上膛的枪：构建阶段用的
+  `rust:1-slim` 和 `cargo-chef:latest-rust-1-slim` 早就迁到 trixie 了，也就是说之前
+  的镜像是「在 glibc 2.41 上编译、在 2.36 上运行」。Rust 现在还没用到 2.38+ 的符号，
+  所以侥幸能跑；等哪天依赖换了实现，就是启动即 `GLIBC_2.38 not found`。运行时跟着
+  构建阶段走同代，这个隐患才算消掉。
+
+- **补装 `tzdata-legacy`。** Debian 13 把 `PRC` / `Hongkong` / `Japan` / `ROK` /
+  `US/Pacific` 这些历史时区别名从 `tzdata` 里拆了出去。老部署的 compose 如果写着
+  `TZ: PRC`，升级后会匹配不到时区文件，glibc 转而按 POSIX 串解析、**静默退回 UTC**，
+  定时任务整体偏 8 小时且没有任何报错。装上这个 1254 KB 的包，别名行为和 0.4.6 一致。
+
+- 其余运行时依赖不受影响：`util-linux`（`setpriv` 降权）、`passwd`（`useradd`）、
+  `bash`（healthcheck 的 `/dev/tcp`）在 trixie 里都还在原路径；SQLite 是 bundled
+  静态编进二进制的，没有系统库版本问题；apt 3.x 下 `apt-get install
+  --no-install-recommends` 依然是老行为。
+
+### 升级说明
+
+直接改镜像标签即可，**不需要动数据卷、不需要手工改 `/data` 属主**：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+`./data` 里的 SQLite 库、uid/gid 10001 的属主关系、`read_only` + `cap_drop: ALL`
+的启动方式在 trixie 上都已验证照旧：入口脚本仍然先修属主再 `setpriv` 降权，应用
+进程仍以 10001 运行，`IYUU_DATA_DIR` / `IYUU_LISTEN` 等环境变量含义不变。
+
 ## [0.4.6] - 2026-11-16
 
 ### 修复
