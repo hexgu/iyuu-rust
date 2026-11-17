@@ -60,10 +60,20 @@ RUN cargo build --release --locked && \
 # ---------------------------------------------------------------------------
 # 刻意不用 rust:1-slim 当运行时：它 1.2 GB，而这里只需要 glibc + CA 证书 +
 # 时区数据 + setpriv（util-linux，用来降权）。
-FROM debian:bookworm-slim
+#
+# 版本必须跟着构建阶段走：`rust:1-slim` / `cargo-chef` 已经是 Debian 13（trixie，
+# glibc 2.41），运行时留在 bookworm（glibc 2.36）就是「在 2.41 上编、在 2.36 上跑」，
+# 一旦上游用上 2.38+ 才有的符号就是启动即崩。两边同代，这条隐形的脚枪才拆得掉。
+FROM debian:trixie-slim
 
+# tzdata-legacy 是 Debian 13 的兼容补丁：trixie 把 `PRC` / `Hongkong` / `Japan`
+# / `ROK` / `US/Pacific` 这些历史别名从 `tzdata` 里拆了出去，而老部署的 compose
+# 里很可能就写着 `TZ: PRC`。缺了它，glibc 匹配不到文件、把 TZ 当 POSIX 串解析，
+# 最后**静默退回 UTC**——定时任务整体偏 8 小时，且没有任何报错。1254 KB 换掉这个
+# 隐患很划算。
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates tzdata util-linux && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates tzdata tzdata-legacy util-linux && \
     rm -rf /var/lib/apt/lists/*
 
 # 应用用户：固定的 uid/gid 10001，便于宿主机上给 ./data 设属主。
